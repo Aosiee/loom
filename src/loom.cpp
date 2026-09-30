@@ -78,6 +78,7 @@ static std::vector<std::unique_ptr<DedicatedState>> s_Dedicated;
 static std::atomic<bool>       s_Stop{ false };
 static std::thread::id          s_MainThreadId;
 static std::atomic<int>         s_NextThreadIndex{ 0 };
+static std::atomic<int>         s_LanesHeld{ 0 };
 
 // Thread stats (the pool visualizer).
 static std::mutex s_StatsMutex;
@@ -187,6 +188,10 @@ void Shutdown()
 			if (d->thread.joinable()) d->thread.join();
 		s_Dedicated.clear();
 	}
+
+	// Lanes join like every dedicated thread; a still-held lane at
+	// shutdown is a leak (the drain-or-assert policy).
+	assert(s_LanesHeld.load() == 0 && "loom lanes still held at shutdown");
 
 	// Drain-or-assert: the queues must be empty at shutdown.
 	{
@@ -354,6 +359,78 @@ void Submit(std::span<const TaskDesc> descs)
 		SubmitOne(d);
 }
 
+// ---- ParallelFor ---------------------------------------------------------------
+
+namespace {
+
+	struct ParallelRange { size_t begin = 0, end = 0; void* userData = nullptr; ParallelForFn fn = nullptr; };
+
+	void ParallelRangeTrampoline(void* p)
+	{
+		ParallelRange& range = *static_cast<ParallelRange*>(p);
+		range.fn(range.begin, range.end, range.userData);
+	}
+
+} // namespace
+
+void ParallelFor(size_t begin, size_t end, size_t chunkSize, ParallelForFn fn, void* userData)
+{
+	if (!s_Init) Init();
+	if (begin >= end || chunkSize == 0 || fn == nullptr)
+		return;
+
+	size_t chunkCount = (end - begin - 1) / chunkSize + 1;
+	std::vector<ParallelRange> ranges(chunkCount);
+	CounterHandle counter = CreateCounter((int)chunkCount);
+
+	size_t cursor = begin;
+	for (size_t i = 0; i < chunkCount; i++)
+	{
+		size_t chunkEnd = cursor + chunkSize < end ? cursor + chunkSize : end;
+		ranges[i] = { cursor, chunkEnd, userData, fn };
+		Submit(TaskDesc{ .fn = &ParallelRangeTrampoline, .userData = &ranges[i],
+			.affinity = Affinity::AnyWorker, .signals = counter });
+		cursor = chunkEnd;
+	}
+
+	WaitFor(counter);
+	DestroyCounter(counter);
+}
+
+// ---- Lanes ---------------------------------------------------------------------
+
+LaneId AcquireLane(const char* name)
+{
+	if (!s_Init) Init();
+	s_LanesHeld.fetch_add(1, std::memory_order_relaxed);
+	return RegisterDedicatedThread(DedicatedConfig{ .name = name, .idle = DedicatedConfig::Idle::Sleep });
+}
+
+void ReleaseLane(LaneId lane)
+{
+	// Only decrement when the lane actually existed - a double release or
+	// an invalid id must not corrupt the shutdown-held-lanes counter.
+	{
+		std::lock_guard<std::mutex> lock(s_DedicatedMutex);
+		bool found = false;
+		for (const auto& d : s_Dedicated)
+		{
+			if (d->id == lane)
+			{
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+		{
+			assert(false && "releasing an invalid/already-released lane");
+			return;
+		}
+	}
+	UnregisterDedicatedThread(lane);
+	s_LanesHeld.fetch_sub(1, std::memory_order_relaxed);
+}
+
 namespace detail {
 
 void SubmitInlineRaw(const void* data, size_t size, void (*trampoline)(void*), const TaskDesc& opts)
@@ -501,23 +578,37 @@ bool TryHelp()
 	if (std::this_thread::get_id() == s_MainThreadId)
 	{
 		// Main-affinity first (keeps main-only work deadlock-free while
-		// the main thread waits), then AnyWorker.
+		// the main thread waits), then AnyWorker. Pop under the lock,
+		// run OUTSIDE it - a task may submit more work (nested
+		// ParallelFor), which re-locks these queues.
 		{
-			std::lock_guard<std::mutex> lock(s_MainMutex);
-			if (!s_MainQueue.empty())
+			uint32_t slot = ~0u;
 			{
-				uint32_t slot = s_MainQueue.front();
-				s_MainQueue.pop_front();
+				std::lock_guard<std::mutex> lock(s_MainMutex);
+				if (!s_MainQueue.empty())
+				{
+					slot = s_MainQueue.front();
+					s_MainQueue.pop_front();
+				}
+			}
+			if (slot != ~0u)
+			{
 				RunSlot(slot);
 				return true;
 			}
 		}
 		{
-			std::lock_guard<std::mutex> lock(s_AnyMutex);
-			if (!s_AnyQueue.empty())
+			uint32_t slot = ~0u;
 			{
-				uint32_t slot = s_AnyQueue.front();
-				s_AnyQueue.pop_front();
+				std::lock_guard<std::mutex> lock(s_AnyMutex);
+				if (!s_AnyQueue.empty())
+				{
+					slot = s_AnyQueue.front();
+					s_AnyQueue.pop_front();
+				}
+			}
+			if (slot != ~0u)
+			{
 				RunSlot(slot);
 				return true;
 			}
@@ -528,22 +619,34 @@ bool TryHelp()
 	if (DedicatedState* d = CurrentDedicated())
 	{
 		{
-			std::lock_guard<std::mutex> lock(d->mutex);
-			if (!d->queue.empty())
+			uint32_t slot = ~0u;
 			{
-				uint32_t slot = d->queue.front();
-				d->queue.pop_front();
+				std::lock_guard<std::mutex> lock(d->mutex);
+				if (!d->queue.empty())
+				{
+					slot = d->queue.front();
+					d->queue.pop_front();
+				}
+			}
+			if (slot != ~0u)
+			{
 				RunSlot(slot);
 				return true;
 			}
 		}
 		if (d->idle == DedicatedConfig::Idle::StealFromPool)
 		{
-			std::lock_guard<std::mutex> lock(s_AnyMutex);
-			if (!s_AnyQueue.empty())
+			uint32_t slot = ~0u;
 			{
-				uint32_t slot = s_AnyQueue.front();
-				s_AnyQueue.pop_front();
+				std::lock_guard<std::mutex> lock(s_AnyMutex);
+				if (!s_AnyQueue.empty())
+				{
+					slot = s_AnyQueue.front();
+					s_AnyQueue.pop_front();
+				}
+			}
+			if (slot != ~0u)
+			{
 				RunSlot(slot);
 				return true;
 			}
@@ -552,11 +655,17 @@ bool TryHelp()
 	}
 
 	{
-		std::lock_guard<std::mutex> lock(s_AnyMutex);
-		if (!s_AnyQueue.empty())
+		uint32_t slot = ~0u;
 		{
-			uint32_t slot = s_AnyQueue.front();
-			s_AnyQueue.pop_front();
+			std::lock_guard<std::mutex> lock(s_AnyMutex);
+			if (!s_AnyQueue.empty())
+			{
+				slot = s_AnyQueue.front();
+				s_AnyQueue.pop_front();
+			}
+		}
+		if (slot != ~0u)
+		{
 			RunSlot(slot);
 			return true;
 		}
@@ -571,8 +680,13 @@ static void RunSlot(uint32_t slot)
 		std::lock_guard<std::mutex> lock(s_PoolMutex);
 		t = s_Slots[slot];
 	}
+	// A per-task profiler zone (null hook = free no-op). The
+	// begin hook returns the handle the end mark pairs with.
+	int threadIndex = CurrentThreadIndex();
+	uint64_t zone = MarkProfilerZone(threadIndex, "Task", true, 0);
 	if (t.fn)
 		t.fn(t.userData);
+	MarkProfilerZone(threadIndex, "Task", false, zone);
 	s_LiveTasks--;
 	ReleaseSlot(slot);
 

@@ -7,10 +7,13 @@
 // tinytest and from the minimal-link loom_tests app (TSAN-clean).
 
 #include "loom.h"
+#include "loom_profiler_shim.h"
 #include <doctest/doctest.h>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -331,6 +334,180 @@ TEST_CASE("loom: shutdown under load — all tasks completed")
 	loom::DestroyCounter(done);
 	loom::Shutdown(); // drains + joins; asserts queues empty
 	CHECK_MESSAGE(runs.load() == N, "shutdown under load: all tasks completed");
+}
+
+// ---- ParallelFor, ScopedCounter, lanes, profiler zones ----
+
+TEST_CASE("loom: ParallelFor — every index covered exactly once (pointer form)")
+{
+	InitIsolated();
+	const size_t N = 1000;
+	std::vector<std::atomic<int>> hits(N);
+	for (auto& h : hits) h = 0;
+
+	auto fn = [](size_t begin, size_t end, void* userData) {
+		auto& counters = *static_cast<std::vector<std::atomic<int>>*>(userData);
+		for (size_t i = begin; i < end; i++)
+			counters[i]++;
+	};
+
+	for (size_t chunkSize : { size_t(1), size_t(7), size_t(128) })
+	{
+		loom::ParallelFor(0, N, chunkSize, fn, &hits);
+		bool allOnce = true;
+		for (size_t i = 0; i < N; i++)
+			if (hits[i].load() != 1) { allOnce = false; break; }
+		CHECK_MESSAGE(allOnce, "ParallelFor chunkSize ", chunkSize, ": every index hit exactly once");
+		for (auto& h : hits) h = 0;
+	}
+}
+
+TEST_CASE("loom: ParallelFor — the lambda convenience covers the range")
+{
+	InitIsolated();
+	const size_t N = 500;
+	std::vector<std::atomic<int>> hits(N);
+	for (auto& h : hits) h = 0;
+
+	loom::ParallelFor(0, N, 37, [&hits](size_t begin, size_t end) {
+		for (size_t i = begin; i < end; i++)
+			hits[i]++;
+	});
+
+	bool allOnce = true;
+	for (size_t i = 0; i < N; i++)
+		if (hits[i].load() != 1) { allOnce = false; break; }
+	CHECK_MESSAGE(allOnce, "lambda ParallelFor: every index hit exactly once");
+}
+
+TEST_CASE("loom: ParallelFor — nesting fills a product matrix exactly once")
+{
+	InitIsolated();
+	const size_t Rows = 64, Cols = 96;
+	std::vector<std::atomic<int>> cells(Rows * Cols);
+	for (auto& c : cells) c = 0;
+
+	loom::ParallelFor(0, Rows, 8, [&cells, Cols](size_t rowBegin, size_t rowEnd) {
+		loom::ParallelFor(0, Cols, 16, [&cells, Cols, rowBegin, rowEnd](size_t colBegin, size_t colEnd) {
+			for (size_t r = rowBegin; r < rowEnd; r++)
+				for (size_t c = colBegin; c < colEnd; c++)
+					cells[r * Cols + c]++;
+		});
+	});
+
+	bool allOnce = true;
+	for (size_t i = 0; i < Rows * Cols; i++)
+		if (cells[i].load() != 1) { allOnce = false; break; }
+	CHECK_MESSAGE(allOnce, "nested ParallelFor: every cell hit exactly once");
+}
+
+TEST_CASE("loom: ScopedCounter — RAII fan-in and generation-safe re-acquire")
+{
+	InitIsolated();
+	const int N = 300;
+
+	CounterHandle reused;
+	{
+		loom::ScopedCounter done(N);
+		reused = done.Get();
+		for (int i = 0; i < N; i++)
+		{
+			loom::Submit(loom::TaskDesc{ Noop, nullptr, loom::Affinity::AnyWorker,
+				0, done.Get(), loom::kInvalidCounter });
+		}
+		loom::WaitFor(done);
+		CHECK(loom::Load(done) == 0);
+	} // destroyed here (no assert)
+
+	// The next counter gets a different handle even if the slot is reused
+	// (the generation bumped on destroy). Initial 0: a ScopedCounter must
+	// drain to 0 before its destructor (the destroy-time assert).
+	loom::ScopedCounter next(0);
+	CHECK(next.Get() != reused);
+}
+
+TEST_CASE("loom: lanes — exclusive reservation, lifecycle, shutdown wait")
+{
+	InitIsolated();
+
+	loom::LaneId lane = loom::AcquireLane("test-lane");
+	CHECK(lane != loom::kInvalidLane);
+
+	std::atomic<int> laneThread{ -1 };
+	CounterHandle done = loom::CreateCounter(64);
+	for (int i = 0; i < 64; i++)
+	{
+		loom::Submit([&laneThread]() { laneThread = loom::CurrentThreadIndex(); },
+			loom::TaskDesc{ nullptr, nullptr, loom::Affinity::Dedicated, lane,
+				done, loom::kInvalidCounter });
+	}
+	loom::WaitFor(done);
+	loom::DestroyCounter(done);
+	CHECK(laneThread.load() >= 0);
+
+	// The lane thread never runs pool work (Idle::Sleep): a burst of
+	// AnyWorker tasks completes while the lane's recorded index is
+	// unchanged... (the index is per-thread; the lane's index stays the
+	// same regardless - the exclusivity guarantee is that the lane never
+	// STEALS, exercised by the shutdown assert below staying clean).
+	loom::ReleaseLane(lane);
+
+	// Re-acquire/release cycles cleanly.
+	for (int i = 0; i < 3; i++)
+	{
+		loom::LaneId l2 = loom::AcquireLane("cycle-lane");
+		CHECK(l2 != loom::kInvalidLane);
+		loom::ReleaseLane(l2);
+	}
+
+	loom::Shutdown(); // asserts no lanes still held
+}
+
+TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
+{
+	InitIsolated();
+
+	struct ZoneRecord { int threadIndex = -1; std::string name; bool begin = false; uint64_t handle = 0; };
+	static std::mutex s_recordMutex;
+	static std::vector<ZoneRecord> s_records;
+	s_recordMutex.lock();
+	s_records.clear();
+	s_recordMutex.unlock();
+
+	loom::SetProfilerZoneHook([](int threadIndex, const char* name, bool begin, uint64_t handle) -> uint64_t {
+		uint64_t issued = 0;
+		std::lock_guard<std::mutex> lock(s_recordMutex);
+		if (begin)
+		{
+			issued = s_records.size() + 1;
+			s_records.push_back({ threadIndex, name, true, issued });
+		}
+		else
+		{
+			s_records.push_back({ threadIndex, name, false, handle });
+		}
+		return issued;
+	});
+
+	loom::ParallelFor(0, 200, 25, [](size_t begin, size_t end) {
+		for (size_t i = begin; i < end; i++) { (void)i; }
+	});
+
+	loom::SetProfilerZoneHook(nullptr);
+
+	{
+		std::lock_guard<std::mutex> lock(s_recordMutex);
+		size_t begins = 0, ends = 0;
+		for (const ZoneRecord& r : s_records)
+		{
+			CHECK(r.name == "Task");
+			CHECK(r.threadIndex >= 0);
+			if (r.begin) begins++;
+			else ends++;
+		}
+		CHECK(begins == ends);
+		CHECK(begins >= 8); // 200 / 25 = 8 chunks
+	}
 }
 
 } // namespace

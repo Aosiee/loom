@@ -113,6 +113,91 @@ int            Load(CounterHandle);
 void           WaitFor(CounterHandle, Help help = Help::WhileWaiting);
 bool           TryHelp(); // run at most one eligible task; true if one ran
 
+// RAII wrapper over a counter handle: destroys on scope exit; non-copyable.
+class ScopedCounter
+{
+public:
+	ScopedCounter() = default;
+	explicit ScopedCounter(int initial) : m_Handle(CreateCounter(initial)) {}
+	~ScopedCounter() { if (m_Handle != kInvalidCounter) DestroyCounter(m_Handle); }
+	ScopedCounter(const ScopedCounter&) = delete;
+	ScopedCounter& operator=(const ScopedCounter&) = delete;
+
+	CounterHandle Get() const { return m_Handle; }
+	operator CounterHandle() const { return m_Handle; }
+
+private:
+	CounterHandle m_Handle = kInvalidCounter;
+};
+
+// ---- ParallelFor ------------------------------------------------------------
+// Splits [begin, end) into ceil((end-begin)/chunkSize) contiguous chunks -
+// each task processes AT MOST chunkSize indices (the last chunk takes the
+// remainder) - fans each out as an AnyWorker task signalling one counter,
+// and waits for all of them. `fn` is invoked as fn(chunkBegin, chunkEnd,
+// userData). The zero-alloc pointer form stores its chunk records on the
+// caller's stack (alive until the wait returns). The lambda convenience
+// makes ONE heap copy of the callable per call (never per task). Pick
+// chunkSize so there are a small multiple of WorkerCount() chunks, each
+// with enough work to dwarf the per-task tax (see bench/loom_bench.cpp).
+using ParallelForFn = void (*)(size_t begin, size_t end, void* userData);
+
+void ParallelFor(size_t begin, size_t end, size_t chunkSize, ParallelForFn fn, void* userData);
+
+namespace detail {
+
+	template <typename G>
+	struct ParallelLambdaRange { size_t begin = 0, end = 0; G* fn = nullptr; };
+
+	template <typename G>
+	void ParallelForLambdaTrampoline(void* p)
+	{
+		auto& range = *static_cast<ParallelLambdaRange<G>*>(p);
+		(*range.fn)(range.begin, range.end);
+	}
+
+} // namespace detail
+
+template <typename F> requires std::is_invocable_v<std::decay_t<F>&, size_t, size_t>
+void ParallelFor(size_t begin, size_t end, size_t chunkSize, F&& fn)
+{
+	using G = std::decay_t<F>;
+	G* copy = new G(std::forward<F>(fn));
+
+	if (begin < end && chunkSize > 0)
+	{
+		// Overflow-free chunk count: (end - begin - 1) / chunkSize + 1.
+		size_t chunkCount = (end - begin - 1) / chunkSize + 1;
+		std::vector<detail::ParallelLambdaRange<G>> ranges(chunkCount);
+		CounterHandle counter = CreateCounter((int)chunkCount);
+
+		size_t cursor = begin;
+		for (size_t i = 0; i < chunkCount; i++)
+		{
+			size_t chunkEnd = cursor + chunkSize < end ? cursor + chunkSize : end;
+			ranges[i] = { cursor, chunkEnd, copy };
+			Submit(TaskDesc{ .fn = &detail::ParallelForLambdaTrampoline<G>,
+				.userData = &ranges[i], .affinity = Affinity::AnyWorker, .signals = counter });
+			cursor = chunkEnd;
+		}
+
+		WaitFor(counter);
+		DestroyCounter(counter);
+	}
+
+	delete copy;
+}
+
+// ---- Lanes ------------------------------------------------------------------
+// A lane is a long-lived worker reserved for ONE owner (e.g. a simulation
+// tick) — implemented as a dedicated thread that never steals. Shutdown
+// joins lanes like every dedicated thread and asserts none are still held.
+using LaneId = uint32_t;
+inline constexpr LaneId kInvalidLane = ~0u;
+
+LaneId AcquireLane(const char* name);
+void   ReleaseLane(LaneId lane);
+
 // ---- Main thread -----------------------------------------------------------
 // Call once per frame from the engine loop: a bounded drain of the
 // main-affinity queue (WaitFor on the main thread pumps it too).
