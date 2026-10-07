@@ -40,7 +40,11 @@ namespace loom {
 	// marks a "Task" zone around each task's execution. The app hook
 	// pairs the profiler's ZoneBegin/ZoneEnd: the BEGIN call returns the
 	// handle the matching END must pass back. Null hook = free no-op.
-	using ProfilerZoneFn = uint64_t (*)(int threadIndex, const char* name, bool begin, uint64_t handle);
+	// The task's interned name id
+	// (0 = unnamed - the hook falls back to the generic name) and the
+	// window tag ride alongside, so named, multi-window tasks stay
+	// distinguishable in the timeline.
+	using ProfilerZoneFn = uint64_t (*)(int threadIndex, uint32_t nameId, uint8_t window, const char* name, bool begin, uint64_t handle);
 
 	inline std::atomic<ProfilerZoneFn>& GetProfilerZoneHook()
 	{
@@ -53,10 +57,10 @@ namespace loom {
 		GetProfilerZoneHook().store(fn, std::memory_order_release);
 	}
 
-	inline uint64_t MarkProfilerZone(int threadIndex, const char* name, bool begin, uint64_t handle)
+	inline uint64_t MarkProfilerZone(int threadIndex, uint32_t nameId, uint8_t window, const char* name, bool begin, uint64_t handle)
 	{
 		if (ProfilerZoneFn fn = GetProfilerZoneHook().load(std::memory_order_acquire))
-			return fn(threadIndex, name, begin, handle);
+			return fn(threadIndex, nameId, window, name, begin, handle);
 		return 0;
 	}
 

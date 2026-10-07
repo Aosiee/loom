@@ -474,7 +474,7 @@ TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thre
 	s_records.clear();
 	s_recordMutex.unlock();
 
-	loom::SetProfilerZoneHook([](int threadIndex, const char* name, bool begin, uint64_t handle) -> uint64_t {
+	loom::SetProfilerZoneHook([](int threadIndex, uint32_t, uint8_t, const char* name, bool begin, uint64_t handle) -> uint64_t {
 		uint64_t issued = 0;
 		std::lock_guard<std::mutex> lock(s_recordMutex);
 		if (begin)

@@ -28,6 +28,8 @@ struct TaskSlot
 	DedicatedId   thread   = 0;
 	CounterHandle signals  = kInvalidCounter;
 	CounterHandle waitsFor = kInvalidCounter;
+	uint32_t      nameId   = 0;
+	uint8_t       window   = 0;
 	alignas(16) uint8_t inlineData[48]; // the Submit(F) convenience
 	uint32_t nextFree = ~0u;            // freelist link (unused, kept for M2)
 };
@@ -328,6 +330,8 @@ static void SubmitOne(const TaskDesc& desc)
 	t.thread = desc.thread;
 	t.signals = desc.signals;
 	t.waitsFor = desc.waitsFor;
+	t.nameId = desc.nameId;
+	t.window = desc.window;
 	s_LiveTasks++;
 
 	// waitsFor: park on the counter while nonzero, else runnable now.
@@ -681,12 +685,13 @@ static void RunSlot(uint32_t slot)
 		t = s_Slots[slot];
 	}
 	// A per-task profiler zone (null hook = free no-op). The
-	// begin hook returns the handle the end mark pairs with.
+	// begin hook returns the handle the end mark pairs with; the task's
+	// interned name id + the window tag ride alongside (0 = unnamed).
 	int threadIndex = CurrentThreadIndex();
-	uint64_t zone = MarkProfilerZone(threadIndex, "Task", true, 0);
+	uint64_t zone = MarkProfilerZone(threadIndex, t.nameId, t.window, "Task", true, 0);
 	if (t.fn)
 		t.fn(t.userData);
-	MarkProfilerZone(threadIndex, "Task", false, zone);
+	MarkProfilerZone(threadIndex, t.nameId, t.window, "Task", false, zone);
 	s_LiveTasks--;
 	ReleaseSlot(slot);
 
@@ -730,15 +735,24 @@ static void WorkerLoop()
 		uint32_t slot = ~0u;
 		{
 			if (stats) stats->state = ThreadState::Idle;
+			MarkProfilerState(index, 0); // waiting (the idle sleep)
 			std::unique_lock<std::mutex> lock(s_AnyMutex);
 			s_AnyCV.wait(lock, [&] { return !s_AnyQueue.empty() || s_Stop; });
-			if (s_AnyQueue.empty())
+			if (!s_AnyQueue.empty())
+			{
+				slot = s_AnyQueue.front();
+				s_AnyQueue.pop_front();
+			}
+			lock.unlock();
+			// The app hook (the profiler's thread registration) locks the
+			// pool snapshot mutexes - it must never run while this thread
+			// still holds s_AnyMutex (the self-deadlock).
+			MarkProfilerState(index, 2); // wait over
+			if (slot == ~0u)
 			{
 				if (s_Stop) break;
 				continue;
 			}
-			slot = s_AnyQueue.front();
-			s_AnyQueue.pop_front();
 		}
 		if (stats) { stats->state = ThreadState::Running; }
 		RunSlot(slot);
@@ -828,21 +842,24 @@ static void DedicatedLoop(DedicatedState& d)
 	{
 		uint32_t slot = ~0u;
 		{
+			MarkProfilerState(index, 0); // waiting (the idle sleep)
 			std::unique_lock<std::mutex> lock(d.mutex);
 			d.cv.wait(lock, [&] { return !d.queue.empty() || d.stop; });
-			if (d.queue.empty())
+			if (!d.queue.empty())
+			{
+				slot = d.queue.front();
+				d.queue.pop_front();
+			}
+			lock.unlock();
+			// The app hook must not run while this thread holds d.mutex.
+			MarkProfilerState(index, 2); // wait over
+			if (slot == ~0u)
 			{
 				if (d.stop) break;
 				if (d.idle == DedicatedConfig::Idle::StealFromPool)
-				{
-					lock.unlock();
 					TryHelp();
-					lock.lock();
-				}
 				continue;
 			}
-			slot = d.queue.front();
-			d.queue.pop_front();
 		}
 		if (stats) { stats->state = ThreadState::Running; }
 		RunSlot(slot);

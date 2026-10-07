@@ -66,6 +66,11 @@ struct TaskDesc
 	DedicatedId   thread   = {};        // required iff Dedicated
 	CounterHandle signals  = kInvalidCounter; // decremented by 1 on completion
 	CounterHandle waitsFor = kInvalidCounter; // runnable when it hits 0
+	// The app-supplied task metadata,
+	// forwarded verbatim to the profiler zone hook (loom never interprets
+	// it) - the interned name id (0 = unnamed) + the window-slot tag.
+	uint32_t      nameId   = 0;
+	uint8_t       window   = 0;
 };
 
 struct LoomConfig
