@@ -63,7 +63,7 @@ struct DedicatedState
 // ---- Globals ------------------------------------------------------------------
 
 static std::mutex              s_PoolMutex;
-static std::vector<TaskSlot>   s_Slots;
+static std::deque<TaskSlot>    s_Slots; // a deque: its elements keep stable addresses across the growth (the vector's resize moved the slots under the submit/run threads' live references)
 static std::vector<uint32_t>   s_FreeSlots;
 static std::deque<CounterState> s_Counters;
 static bool                    s_Init = false;
@@ -141,17 +141,24 @@ void Init(const LoomConfig& config)
 	s_Init = true;
 	s_Stop = false;
 	s_MainThreadId = std::this_thread::get_id(); // the initializing thread is "main"
-	s_NextThreadIndex = 0;
+	// The initializing thread claims index 0 (the
+	// per-thread records' owner - the command pools, the debug_draw
+	// chunks) BEFORE the workers spawn; the counter is monotonic across
+	// re-inits (the dead workers' indices stay claimed, never reused -
+	// a re-init resetting it to 0 would hand a fresh worker the main
+	// thread's 0).
+	(void)CurrentThreadIndex();
 
 	{
 		std::lock_guard<std::mutex> lock(s_PoolMutex);
 		uint32_t n = std::max(1u, config.maxTasks);
-		s_Slots.resize(n);
+		s_Slots.clear();
 		s_FreeSlots.clear();
 		s_FreeSlots.reserve(n);
 		for (uint32_t i = 0; i < n; i++)
 		{
-			s_Slots[i].fn = nullptr;
+			s_Slots.emplace_back();
+			s_Slots.back().fn = nullptr;
 			s_FreeSlots.push_back(n - 1 - i);
 		}
 		s_Counters.clear();
@@ -261,9 +268,11 @@ static uint32_t AllocateSlot()
 		s_FreeSlots.pop_back();
 		return s;
 	}
-	// Grow with a warning (the plan's exhaustion policy).
+	// Grow with a warning. The deque's push_backs never move the live
+	// slots.
 	uint32_t s = (uint32_t)s_Slots.size();
-	s_Slots.resize(s_Slots.size() + 1024);
+	for (int i = 0; i < 1024; i++)
+		s_Slots.emplace_back();
 	std::fprintf(stderr, "loom: task pool grown to %zu slots\n", s_Slots.size());
 	s_Slots[s].fn = nullptr;
 	return s;
