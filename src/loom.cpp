@@ -42,8 +42,12 @@ struct CounterState
 	std::mutex            mutex;
 	std::condition_variable cv;
 	std::vector<uint32_t> pending; // slot indices parked on this counter
-	uint32_t              generation = 0;
-	bool                  alive = false;
+	// alive/generation are read lock-free by
+	// ResolveCounter from the worker threads (Signal/Load/WaitFor) while
+	// CreateCounter/DestroyCounter write them on the submitting thread -
+	// the old plain fields were the data race the dev-tsan suite caught.
+	std::atomic<bool>     alive{ false };
+	std::atomic<uint32_t> generation{ 0 };
 };
 
 // ---- Dedicated threads --------------------------------------------------------
@@ -106,7 +110,7 @@ static CounterState* ResolveCounter(CounterHandle h)
 	uint32_t idx = CounterIndex(h);
 	if (idx >= s_Counters.size()) return nullptr;
 	CounterState& c = s_Counters[idx];
-	if (!c.alive || CounterGeneration(h) != c.generation) return nullptr;
+	if (!c.alive.load(std::memory_order_relaxed) || CounterGeneration(h) != c.generation.load(std::memory_order_relaxed)) return nullptr;
 	return &c;
 }
 
@@ -178,8 +182,16 @@ void Shutdown()
 	if (!s_Init) return;
 	s_Init = false;
 
-	s_Stop = true;
-	s_AnyCV.notify_all();
+	// The stop flag + the notify
+	// must happen under the SAME mutex the waiters pair with their
+	// predicate check (the old flag-set-then-notify outside the lock
+	// lost the wakeup when the notify landed between the check and the
+	// wait - the worker slept forever and join() blocked).
+	{
+		std::lock_guard<std::mutex> lock(s_AnyMutex);
+		s_Stop = true;
+		s_AnyCV.notify_all();
+	}
 
 	for (auto& w : s_Workers)
 		if (w.joinable()) w.join();
@@ -190,12 +202,27 @@ void Shutdown()
 		std::lock_guard<std::mutex> lock(s_DedicatedMutex);
 		for (auto& d : s_Dedicated)
 		{
-			d->stop = true;
-			d->cv.notify_all();
+			// The dedicated waiter pairs d->cv with d->mutex - the stop
+			// flag and the notify go under THAT mutex (the registry lock
+			// alone left the same lost-wakeup window).
+			{
+				std::lock_guard<std::mutex> dlock(d->mutex);
+				d->stop = true;
+				d->cv.notify_all();
+			}
 		}
 		for (auto& d : s_Dedicated)
 			if (d->thread.joinable()) d->thread.join();
 		s_Dedicated.clear();
+	}
+
+	// The counter waiters' predicates also test s_Stop - wake every
+	// counter's cv under its own mutex so a worker parked in
+	// WaitFor(BlockOnly) can't strand the join (the same window).
+	for (auto& c : s_Counters)
+	{
+		std::lock_guard<std::mutex> lock(c.mutex);
+		c.cv.notify_all();
 	}
 
 	// Lanes join like every dedicated thread; a still-held lane at
@@ -493,16 +520,23 @@ CounterHandle CreateCounter(int initial)
 	for (uint32_t i = 0; i < s_Counters.size(); i++)
 	{
 		CounterState& c = s_Counters[i];
-		if (!c.alive)
+		if (!c.alive.load(std::memory_order_relaxed))
 		{
-			c.alive = true;
-			c.count = initial;
-			c.pending.clear();
+			c.alive.store(true, std::memory_order_relaxed);
+			c.count.store(initial, std::memory_order_relaxed);
+			// The reused counter has no waiters by contract (Destroy
+			// asserts it), but a stale in-flight Signal could still touch
+			// the vector - clear under the counter's own mutex (the same
+			// lock Signal holds).
+			{
+				std::lock_guard<std::mutex> lock(c.mutex);
+				c.pending.clear();
+			}
 			// No generation bump here: the DESTROY path invalidates stale
 			// handles. Bumping on create too doubled the churn and
 			// overflowed the packed generation field under per-frame
 			// create/destroy cycles.
-			return PackCounter(i, c.generation);
+			return PackCounter(i, c.generation.load(std::memory_order_relaxed));
 		}
 	}
 	assert(false && "counter pool exhausted");
@@ -515,14 +549,14 @@ void DestroyCounter(CounterHandle h)
 	assert(c && "destroying an invalid/destroyed counter");
 	assert(c->count.load() == 0 && "destroying a counter with nonzero count");
 	assert(c->pending.empty() && "destroying a counter with parked waiters");
-	c->alive = false;
+	c->alive.store(false, std::memory_order_relaxed);
 	// Wrap the packed generation explicitly: the 12-bit field must never
 	// exceed 0xFFF or the (gen << 20) pack overflows into the index bits
 	// (the sandbox's per-frame counter churn hit this at ~4096 lifecycles).
 	// A wrapped generation is safe: no stale handle survives 4096
 	// lifecycles of its slot.
-	c->generation = (c->generation + 1) & 0xFFF;
-	if (c->generation == 0) c->generation = 1;
+	uint32_t next = (c->generation.load(std::memory_order_relaxed) + 1) & 0xFFF;
+	c->generation.store(next == 0 ? 1 : next, std::memory_order_relaxed);
 }
 
 void Signal(CounterHandle h, int n)
@@ -918,8 +952,14 @@ void UnregisterDedicatedThread(DedicatedId id)
 		}
 	}
 	if (!d) return;
-	d->stop = true;
-	d->cv.notify_all();
+	// The stop flag + the notify
+	// under the waiter's own mutex (the old bare flag-set-then-notify
+	// lost the wakeup - the same window Shutdown's worker loop had).
+	{
+		std::lock_guard<std::mutex> lock(d->mutex);
+		d->stop = true;
+		d->cv.notify_all();
+	}
 	if (d->thread.joinable()) d->thread.join();
 }
 
