@@ -549,6 +549,10 @@ void DestroyCounter(CounterHandle h)
 	assert(c && "destroying an invalid/destroyed counter");
 	assert(c->count.load() == 0 && "destroying a counter with nonzero count");
 	assert(c->pending.empty() && "destroying a counter with parked waiters");
+	// The pool lock CreateCounter holds: a create seeing alive == false before
+	// the bump below would claim the slot with the old generation, and the bump
+	// would then invalidate that live handle (the first Signal/WaitFor asserts).
+	std::lock_guard<std::mutex> lock(s_PoolMutex);
 	c->alive.store(false, std::memory_order_relaxed);
 	// Wrap the packed generation explicitly: the 12-bit field must never
 	// exceed 0xFFF or the (gen << 20) pack overflows into the index bits

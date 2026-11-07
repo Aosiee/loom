@@ -426,6 +426,35 @@ TEST_CASE("loom: ScopedCounter — RAII fan-in and generation-safe re-acquire")
 	CHECK(next.Get() != reused);
 }
 
+TEST_CASE("loom: counters — a concurrent create never gets a handle the destroy invalidates")
+{
+	// The sandbox's 1/2000 abort: DestroyCounter cleared `alive`, then bumped
+	// the generation, unlocked. A create landing between the two claimed the
+	// slot with the OLD generation, so the bump killed the fresh handle and
+	// the first Signal/WaitFor asserted on a live counter.
+	InitIsolated();
+	const int Threads = 4;
+	const int Iterations = 200000;
+	std::atomic<int> completed{ 0 };
+	std::vector<std::thread> threads;
+	for (int t = 0; t < Threads; t++)
+	{
+		threads.emplace_back([&]
+		{
+			for (int i = 0; i < Iterations; i++)
+			{
+				const CounterHandle handle = loom::CreateCounter(1);
+				loom::Signal(handle, 1); // asserts on a stale handle
+				loom::DestroyCounter(handle);
+				completed.fetch_add(1, std::memory_order_relaxed);
+			}
+		});
+	}
+	for (std::thread& thread : threads)
+		thread.join();
+	CHECK(completed.load() == Threads * Iterations);
+}
+
 TEST_CASE("loom: lanes — exclusive reservation, lifecycle, shutdown wait")
 {
 	InitIsolated();
