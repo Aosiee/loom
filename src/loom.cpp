@@ -121,6 +121,7 @@ static void     ReleaseSlot(uint32_t slot);
 static void     EnqueueSlot(uint32_t slot);
 static void     RunSlot(uint32_t slot);
 static void     WorkerLoop();
+static void (*s_OnThreadStart)() = nullptr;
 static void     DedicatedLoop(DedicatedState& d);
 static DedicatedState* CurrentDedicated();
 static ThreadStats* RegisterThreadStats(int index, const char* name);
@@ -170,6 +171,7 @@ void Init(const LoomConfig& config)
 			s_Counters.emplace_back();
 	}
 
+	s_OnThreadStart = config.onThreadStart;
 	s_WorkerCount = config.workerCount >= 0
 		? config.workerCount
 		: std::max(1, (int)std::thread::hardware_concurrency() - 1);
@@ -768,6 +770,8 @@ void PumpMainThreadTasks()
 
 static void WorkerLoop()
 {
+	if (s_OnThreadStart)
+		s_OnThreadStart();
 	int index = CurrentThreadIndex(); // reserve this worker's index
 	// A unique per-worker name (the pool visualizer keys its per-thread
 	// history on it, and the profiler's lane names benefit too).
@@ -876,6 +880,8 @@ static DedicatedState* CurrentDedicated() { return t_CurrentDedicated; }
 
 static void DedicatedLoop(DedicatedState& d)
 {
+	if (s_OnThreadStart)
+		s_OnThreadStart();
 	t_CurrentDedicated = &d;
 	int index = CurrentThreadIndex(); // reserve this thread's index
 	ThreadStats* stats = RegisterThreadStats(index, d.name.empty() ? "loom-dedicated" : d.name.c_str());

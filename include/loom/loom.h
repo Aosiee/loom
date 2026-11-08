@@ -78,6 +78,9 @@ struct LoomConfig
 	int      workerCount = -1;   // default max(1, hw_concurrency - 1)
 	uint32_t maxTasks    = 4096; // task-slot pool size (grows with a warning)
 	uint32_t maxCounters = 2048;
+	// Runs first on every worker and dedicated thread (the engine's crash
+	// handler gives each its alternate signal stack here). Optional.
+	void (*onThreadStart)() = nullptr;
 };
 
 // ---- Lifecycle -------------------------------------------------------------
