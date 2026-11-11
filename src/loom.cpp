@@ -64,34 +64,84 @@ struct DedicatedState
 	DedicatedId            id = 0;
 };
 
-// ---- Globals ------------------------------------------------------------------
+// ---- The pool state --------------------------------------------------------------
+// Every former loom.cpp static, owned by one Pool (the engine's LoomPool
+// subsystem owns the app's; the standalone suites own theirs). Internal
+// functions take the pool explicitly - the workers and the dedicated threads
+// receive their own at spawn; the public free functions resolve the active
+// pool.
 
-static std::mutex              s_PoolMutex;
-static std::deque<TaskSlot>    s_Slots; // a deque: its elements keep stable addresses across the growth (the vector's resize moved the slots under the submit/run threads' live references)
-static std::vector<uint32_t>   s_FreeSlots;
-static std::deque<CounterState> s_Counters;
-static bool                    s_Init = false;
+struct PoolState
+{
+	std::mutex              poolMutex;
+	std::deque<TaskSlot>    slots; // a deque: its elements keep stable addresses across the growth (the vector's resize moved the slots under the submit/run threads' live references)
+	std::vector<uint32_t>   freeSlots;
+	std::deque<CounterState> counters;
+	// The old s_Init: false from the first instruction of Shutdown (TryHelp/
+	// PumpMainThreadTasks/IsInitialised then report the pool as down while it
+	// drains). Atomic: the workers read it.
+	std::atomic<bool>       running{ false };
 
-static std::deque<uint32_t>    s_AnyQueue;   // MPMC run queue (M1: mutex)
-static std::mutex              s_AnyMutex;
-static std::condition_variable s_AnyCV;
-static std::deque<uint32_t>    s_MainQueue;  // MPSC
-static std::mutex              s_MainMutex;
+	std::deque<uint32_t>    anyQueue;   // MPMC run queue (M1: mutex)
+	std::mutex              anyMutex;
+	std::condition_variable anyCV;
+	std::deque<uint32_t>    mainQueue;  // MPSC
+	std::mutex              mainMutex;
 
-static std::mutex              s_DedicatedMutex;
-static std::vector<std::unique_ptr<DedicatedState>> s_Dedicated;
+	std::mutex              dedicatedMutex;
+	std::vector<std::unique_ptr<DedicatedState>> dedicated;
 
-static std::atomic<bool>       s_Stop{ false };
-static std::thread::id          s_MainThreadId;
+	std::atomic<bool>       stop{ false };
+	std::thread::id         mainThreadId;
+	std::atomic<int>        lanesHeld{ 0 };
+
+	// Thread stats (the pool visualizer).
+	std::mutex              statsMutex;
+	std::vector<std::unique_ptr<ThreadStats>> threadStats;
+	std::vector<std::thread> workers;
+	int                     workerCount = 0;
+	std::atomic<uint64_t>   liveTasks{ 0 };
+
+	// Runs first on every pool thread.
+	void (*onThreadStart)() = nullptr;
+
+	// The profiler shim's hooks (loom_profiler_shim.h; the old function-local
+	// statics). Atomic: the owner unhooks while the workers are still alive.
+	std::atomic<ProfilerStateFn> profilerStateHook{ nullptr };
+	std::atomic<ProfilerZoneFn>  profilerZoneHook{ nullptr };
+};
+
+// The two process-scope values:
+// - the active pool, a NON-owning access root for the free API (the role
+//   Application::s_Instance plays for the engine): installed by the Pool
+//   constructor, cleared at the end of its Shutdown. No lazy auto-init - a
+//   call with no active pool is a bug (asserted).
+// - the thread-identity allocator behind CurrentThreadIndex(): the index is a
+//   thread_local that outlives any one pool, so its allocator must too (a
+//   per-pool counter restarting at 0 would hand a fresh
+//   worker the main thread's 0 after a re-init).
+static std::atomic<PoolState*> s_ActivePool{ nullptr };
 static std::atomic<int>         s_NextThreadIndex{ 0 };
-static std::atomic<int>         s_LanesHeld{ 0 };
 
-// Thread stats (the pool visualizer).
-static std::mutex s_StatsMutex;
-static std::vector<std::unique_ptr<ThreadStats>> s_ThreadStats;
-static std::vector<std::thread> s_Workers;
-static int                     s_WorkerCount = 0;
-static std::atomic<uint64_t>   s_LiveTasks{ 0 };
+static PoolState& ActivePool()
+{
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	assert(pool && "loom: no active pool - the engine's LoomPool (or an explicit loom::Pool) is the only init");
+	return *pool;
+}
+
+static void MarkProfilerState(PoolState& P, int threadIndex, uint8_t state)
+{
+	if (ProfilerStateFn fn = P.profilerStateHook.load(std::memory_order_acquire))
+		fn(threadIndex, state);
+}
+
+static uint64_t MarkProfilerZone(PoolState& P, int threadIndex, uint32_t nameId, uint8_t window, const char* name, bool begin, uint64_t handle)
+{
+	if (ProfilerZoneFn fn = P.profilerZoneHook.load(std::memory_order_acquire))
+		return fn(threadIndex, nameId, window, name, begin, handle);
+	return 0;
+}
 
 // Counter handle packing: generation in the high bits, index low.
 static constexpr uint32_t kCounterGenBits = 20;
@@ -104,48 +154,47 @@ static CounterHandle PackCounter(uint32_t index, uint32_t generation)
 static uint32_t CounterIndex(CounterHandle h) { return h & kCounterIndexMask; }
 static uint32_t CounterGeneration(CounterHandle h) { return h >> kCounterGenBits; }
 
-static CounterState* ResolveCounter(CounterHandle h)
+static CounterState* ResolveCounter(PoolState& P, CounterHandle h)
 {
 	if (h == kInvalidCounter) return nullptr;
 	uint32_t idx = CounterIndex(h);
-	if (idx >= s_Counters.size()) return nullptr;
-	CounterState& c = s_Counters[idx];
+	if (idx >= P.counters.size()) return nullptr;
+	CounterState& c = P.counters[idx];
 	if (!c.alive.load(std::memory_order_relaxed) || CounterGeneration(h) != c.generation.load(std::memory_order_relaxed)) return nullptr;
 	return &c;
 }
 
 // ---- Forward decls --------------------------------------------------------------
 
-static uint32_t AllocateSlot();
-static void     ReleaseSlot(uint32_t slot);
-static void     EnqueueSlot(uint32_t slot);
-static void     RunSlot(uint32_t slot);
-static void     WorkerLoop();
-static void (*s_OnThreadStart)() = nullptr;
-static void     DedicatedLoop(DedicatedState& d);
+static uint32_t AllocateSlot(PoolState& P);
+static void     ReleaseSlot(PoolState& P, uint32_t slot);
+static void     EnqueueSlot(PoolState& P, uint32_t slot);
+static void     RunSlot(PoolState& P, uint32_t slot);
+static void     SignalCounter(PoolState& P, CounterHandle h, int n);
+static bool     TryHelpIn(PoolState& P);
+static void     WorkerLoop(PoolState& P);
+static void     DedicatedLoop(PoolState& P, DedicatedState& d);
 static DedicatedState* CurrentDedicated();
-static ThreadStats* RegisterThreadStats(int index, const char* name);
+static ThreadStats* RegisterThreadStats(PoolState& P, int index, const char* name);
 
 // ---- Lifecycle -------------------------------------------------------------------
 
-void Init(const LoomConfig& config)
+Pool::Pool(const LoomConfig& config)
+	: m_State(std::make_unique<PoolState>())
 {
-	if (s_Init) return;
-	// The workers MUST be joined before main returns or the std::thread
-	// destructors std::terminate (the editor's exit hang). Registering the
-	// idempotent shutdown with atexit covers every teardown path, including
-	// ones that never reach an app layer's OnDetach.
-	{
-		static bool registered = false;
-		if (!registered)
-		{
-			registered = true;
-			std::atexit([]() { Shutdown(); });
-		}
-	}
-	s_Init = true;
-	s_Stop = false;
-	s_MainThreadId = std::this_thread::get_id(); // the initializing thread is "main"
+	// One pool at a time: the free API resolves the single active pool.
+	PoolState* expected = nullptr;
+	const bool installed = s_ActivePool.compare_exchange_strong(expected, m_State.get(), std::memory_order_acq_rel);
+	assert(installed && "loom: a pool is already active (one loom::Pool at a time)");
+	(void)installed;
+
+	PoolState& P = *m_State;
+	// The old atexit(Shutdown) is gone: the workers are joined by the owner's
+	// Shutdown/destructor (the engine's LoomPool, a suite's local Pool), and
+	// the owned std::thread objects only destruct there.
+	P.running = true;
+	P.stop = false;
+	P.mainThreadId = std::this_thread::get_id(); // the initializing thread is "main"
 	// The initializing thread claims index 0 (the
 	// per-thread records' owner - the command pools, the debug_draw
 	// chunks) BEFORE the workers spawn; the counter is monotonic across
@@ -155,34 +204,37 @@ void Init(const LoomConfig& config)
 	(void)CurrentThreadIndex();
 
 	{
-		std::lock_guard<std::mutex> lock(s_PoolMutex);
+		std::lock_guard<std::mutex> lock(P.poolMutex);
 		uint32_t n = std::max(1u, config.maxTasks);
-		s_Slots.clear();
-		s_FreeSlots.clear();
-		s_FreeSlots.reserve(n);
+		P.freeSlots.reserve(n);
 		for (uint32_t i = 0; i < n; i++)
 		{
-			s_Slots.emplace_back();
-			s_Slots.back().fn = nullptr;
-			s_FreeSlots.push_back(n - 1 - i);
+			P.slots.emplace_back();
+			P.slots.back().fn = nullptr;
+			P.freeSlots.push_back(n - 1 - i);
 		}
-		s_Counters.clear();
 		for (uint32_t i = 0; i < std::max(1u, config.maxCounters); i++)
-			s_Counters.emplace_back();
+			P.counters.emplace_back();
 	}
 
-	s_OnThreadStart = config.onThreadStart;
-	s_WorkerCount = config.workerCount >= 0
+	P.onThreadStart = config.onThreadStart;
+	P.workerCount = config.workerCount >= 0
 		? config.workerCount
 		: std::max(1, (int)std::thread::hardware_concurrency() - 1);
-	for (int i = 0; i < s_WorkerCount; i++)
-		s_Workers.emplace_back(WorkerLoop);
+	for (int i = 0; i < P.workerCount; i++)
+		P.workers.emplace_back(WorkerLoop, std::ref(P));
 }
 
-void Shutdown()
+Pool::~Pool()
 {
-	if (!s_Init) return;
-	s_Init = false;
+	Shutdown();
+}
+
+void Pool::Shutdown()
+{
+	PoolState& P = *m_State;
+	if (!P.running) return;
+	P.running = false;
 
 	// The stop flag + the notify
 	// must happen under the SAME mutex the waiters pair with their
@@ -190,19 +242,19 @@ void Shutdown()
 	// lost the wakeup when the notify landed between the check and the
 	// wait - the worker slept forever and join() blocked).
 	{
-		std::lock_guard<std::mutex> lock(s_AnyMutex);
-		s_Stop = true;
-		s_AnyCV.notify_all();
+		std::lock_guard<std::mutex> lock(P.anyMutex);
+		P.stop = true;
+		P.anyCV.notify_all();
 	}
 
-	for (auto& w : s_Workers)
+	for (auto& w : P.workers)
 		if (w.joinable()) w.join();
-	s_Workers.clear();
+	P.workers.clear();
 
 	// Dedicated threads last.
 	{
-		std::lock_guard<std::mutex> lock(s_DedicatedMutex);
-		for (auto& d : s_Dedicated)
+		std::lock_guard<std::mutex> lock(P.dedicatedMutex);
+		for (auto& d : P.dedicated)
 		{
 			// The dedicated waiter pairs d->cv with d->mutex - the stop
 			// flag and the notify go under THAT mutex (the registry lock
@@ -213,15 +265,15 @@ void Shutdown()
 				d->cv.notify_all();
 			}
 		}
-		for (auto& d : s_Dedicated)
+		for (auto& d : P.dedicated)
 			if (d->thread.joinable()) d->thread.join();
-		s_Dedicated.clear();
+		P.dedicated.clear();
 	}
 
-	// The counter waiters' predicates also test s_Stop - wake every
+	// The counter waiters' predicates also test P.stop - wake every
 	// counter's cv under its own mutex so a worker parked in
 	// WaitFor(BlockOnly) can't strand the join (the same window).
-	for (auto& c : s_Counters)
+	for (auto& c : P.counters)
 	{
 		std::lock_guard<std::mutex> lock(c.mutex);
 		c.cv.notify_all();
@@ -229,32 +281,48 @@ void Shutdown()
 
 	// Lanes join like every dedicated thread; a still-held lane at
 	// shutdown is a leak (the drain-or-assert policy).
-	assert(s_LanesHeld.load() == 0 && "loom lanes still held at shutdown");
+	assert(P.lanesHeld.load() == 0 && "loom lanes still held at shutdown");
 
 	// Drain-or-assert: the queues must be empty at shutdown.
 	{
-		std::lock_guard<std::mutex> lock(s_AnyMutex);
-		assert(s_AnyQueue.empty() && "AnyWorker tasks abandoned at shutdown");
+		std::lock_guard<std::mutex> lock(P.anyMutex);
+		assert(P.anyQueue.empty() && "AnyWorker tasks abandoned at shutdown");
 	}
 	{
-		std::lock_guard<std::mutex> lock(s_MainMutex);
-		assert(s_MainQueue.empty() && "MainThread tasks abandoned at shutdown");
+		std::lock_guard<std::mutex> lock(P.mainMutex);
+		assert(P.mainQueue.empty() && "MainThread tasks abandoned at shutdown");
 	}
-	assert(s_LiveTasks == 0 && "tasks still live at shutdown");
+	assert(P.liveTasks == 0 && "tasks still live at shutdown");
 
-	std::lock_guard<std::mutex> lock(s_PoolMutex);
-	s_Slots.clear();
-	s_FreeSlots.clear();
-	s_Counters.clear();
-	s_Stop = false;
 	{
-		std::lock_guard<std::mutex> slock(s_StatsMutex);
-		s_ThreadStats.clear();
+		std::lock_guard<std::mutex> lock(P.poolMutex);
+		P.slots.clear();
+		P.freeSlots.clear();
+		P.counters.clear();
+		P.stop = false;
+		{
+			std::lock_guard<std::mutex> slock(P.statsMutex);
+			P.threadStats.clear();
+		}
 	}
+
+	// Uninstalled only now: a task still running on a draining worker
+	// resolves this pool, not none.
+	PoolState* expected = &P;
+	s_ActivePool.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
 }
 
-bool IsInitialised() { return s_Init; }
-int  WorkerCount()   { return s_WorkerCount; }
+bool IsInitialised()
+{
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	return pool && pool->running;
+}
+
+int WorkerCount()
+{
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	return pool ? pool->workerCount : 0;
+}
 
 int CurrentThreadIndex()
 {
@@ -264,21 +332,25 @@ int CurrentThreadIndex()
 	t_index = s_NextThreadIndex.fetch_add(1);
 	return t_index;
 }
-int  LiveTaskCount() { return (int)s_LiveTasks.load(); }
+int LiveTaskCount()
+{
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	return pool ? (int)pool->liveTasks.load() : 0;
+}
 
-int PendingTaskCount()
+static int PendingTaskCountIn(PoolState& P)
 {
 	int n = 0;
 	{
-		std::lock_guard<std::mutex> lock(s_AnyMutex);
-		n += (int)s_AnyQueue.size();
+		std::lock_guard<std::mutex> lock(P.anyMutex);
+		n += (int)P.anyQueue.size();
 	}
 	{
-		std::lock_guard<std::mutex> lock(s_MainMutex);
-		n += (int)s_MainQueue.size();
+		std::lock_guard<std::mutex> lock(P.mainMutex);
+		n += (int)P.mainQueue.size();
 	}
-	std::lock_guard<std::mutex> lock(s_DedicatedMutex);
-	for (auto& d : s_Dedicated)
+	std::lock_guard<std::mutex> lock(P.dedicatedMutex);
+	for (auto& d : P.dedicated)
 	{
 		std::lock_guard<std::mutex> dl(d->mutex);
 		n += (int)d->queue.size();
@@ -286,61 +358,67 @@ int PendingTaskCount()
 	return n;
 }
 
+int PendingTaskCount()
+{
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	return pool ? PendingTaskCountIn(*pool) : 0;
+}
+
 // ---- Submission -------------------------------------------------------------------
 
-static uint32_t AllocateSlot()
+static uint32_t AllocateSlot(PoolState& P)
 {
-	std::lock_guard<std::mutex> lock(s_PoolMutex);
-	if (!s_FreeSlots.empty())
+	std::lock_guard<std::mutex> lock(P.poolMutex);
+	if (!P.freeSlots.empty())
 	{
-		uint32_t s = s_FreeSlots.back();
-		s_FreeSlots.pop_back();
+		uint32_t s = P.freeSlots.back();
+		P.freeSlots.pop_back();
 		return s;
 	}
 	// Grow with a warning. The deque's push_backs never move the live
 	// slots.
-	uint32_t s = (uint32_t)s_Slots.size();
+	uint32_t s = (uint32_t)P.slots.size();
 	for (int i = 0; i < 1024; i++)
-		s_Slots.emplace_back();
-	std::fprintf(stderr, "loom: task pool grown to %zu slots\n", s_Slots.size());
-	s_Slots[s].fn = nullptr;
+		P.slots.emplace_back();
+	std::fprintf(stderr, "loom: task pool grown to %zu slots\n", P.slots.size());
+	P.slots[s].fn = nullptr;
 	return s;
 }
 
-static void ReleaseSlot(uint32_t slot)
+static void ReleaseSlot(PoolState& P, uint32_t slot)
 {
-	std::lock_guard<std::mutex> lock(s_PoolMutex);
-	s_Slots[slot].fn = nullptr;
-	s_Slots[slot].userData = nullptr;
-	s_Slots[slot].signals = kInvalidCounter;
-	s_Slots[slot].waitsFor = kInvalidCounter;
-	s_FreeSlots.push_back(slot);
+	std::lock_guard<std::mutex> lock(P.poolMutex);
+	P.slots[slot].fn = nullptr;
+	P.slots[slot].userData = nullptr;
+	P.slots[slot].signals = kInvalidCounter;
+	P.slots[slot].waitsFor = kInvalidCounter;
+	P.freeSlots.push_back(slot);
 }
 
-static void EnqueueSlot(uint32_t slot)
+static void EnqueueSlot(PoolState& P, uint32_t slot)
 {
-	TaskSlot& t = s_Slots[slot];
+	TaskSlot& t = P.slots[slot];
 	switch (t.affinity)
 	{
 	case Affinity::AnyWorker:
 	{
-		std::lock_guard<std::mutex> lock(s_AnyMutex);
-		s_AnyQueue.push_back(slot);
+		std::lock_guard<std::mutex> lock(P.anyMutex);
+		P.anyQueue.push_back(slot);
 	}
-	s_AnyCV.notify_one();
+	P.anyCV.notify_one();
 	break;
 	case Affinity::MainThread:
 	{
-		std::lock_guard<std::mutex> lock(s_MainMutex);
-		s_MainQueue.push_back(slot);
+		std::lock_guard<std::mutex> lock(P.mainMutex);
+		P.mainQueue.push_back(slot);
 	}
 	break;
 	case Affinity::Dedicated:
 	{
 		DedicatedState* d = nullptr;
 		{
-			std::lock_guard<std::mutex> lock(s_DedicatedMutex);
-			for (auto& dd : s_Dedicated)
+			std::lock_guard<std::mutex> lock(P.dedicatedMutex);
+			for (auto& dd : P.dedicated)
 				if (dd->id == t.thread) { d = dd.get(); break; }
 		}
 		assert(d && "Dedicated task submitted to an unregistered thread");
@@ -354,14 +432,13 @@ static void EnqueueSlot(uint32_t slot)
 	}
 }
 
-static void SubmitOne(const TaskDesc& desc)
+static void SubmitOne(PoolState& P, const TaskDesc& desc)
 {
-	if (!s_Init) Init();
 	assert(desc.fn && "task without a function");
 	assert((desc.affinity != Affinity::Dedicated) || desc.thread != kInvalidDedicated);
 
-	uint32_t slot = AllocateSlot();
-	TaskSlot& t = s_Slots[slot];
+	uint32_t slot = AllocateSlot(P);
+	TaskSlot& t = P.slots[slot];
 	t.fn = desc.fn;
 	t.userData = desc.userData;
 	t.affinity = desc.affinity;
@@ -370,12 +447,12 @@ static void SubmitOne(const TaskDesc& desc)
 	t.waitsFor = desc.waitsFor;
 	t.nameId = desc.nameId;
 	t.window = desc.window;
-	s_LiveTasks++;
+	P.liveTasks++;
 
 	// waitsFor: park on the counter while nonzero, else runnable now.
 	if (desc.waitsFor != kInvalidCounter)
 	{
-		CounterState* c = ResolveCounter(desc.waitsFor);
+		CounterState* c = ResolveCounter(P, desc.waitsFor);
 		assert(c && "task waits on an invalid/destroyed counter");
 		bool runnable = false;
 		{
@@ -386,19 +463,19 @@ static void SubmitOne(const TaskDesc& desc)
 				runnable = true;
 		}
 		if (runnable)
-			EnqueueSlot(slot);
+			EnqueueSlot(P, slot);
 		return;
 	}
-	EnqueueSlot(slot);
+	EnqueueSlot(P, slot);
 }
 
-void Submit(const TaskDesc& desc) { SubmitOne(desc); }
+void Submit(const TaskDesc& desc) { SubmitOne(ActivePool(), desc); }
 
 void Submit(std::span<const TaskDesc> descs)
 {
-	if (!s_Init) Init();
+	PoolState& P = ActivePool();
 	for (const TaskDesc& d : descs)
-		SubmitOne(d);
+		SubmitOne(P, d);
 }
 
 // ---- ParallelFor ---------------------------------------------------------------
@@ -417,7 +494,7 @@ namespace {
 
 void ParallelFor(size_t begin, size_t end, size_t chunkSize, ParallelForFn fn, void* userData)
 {
-	if (!s_Init) Init();
+	(void)ActivePool(); // the no-pool assert (the old lazy auto-init) even for an empty range
 	if (begin >= end || chunkSize == 0 || fn == nullptr)
 		return;
 
@@ -443,19 +520,19 @@ void ParallelFor(size_t begin, size_t end, size_t chunkSize, ParallelForFn fn, v
 
 LaneId AcquireLane(const char* name)
 {
-	if (!s_Init) Init();
-	s_LanesHeld.fetch_add(1, std::memory_order_relaxed);
+	ActivePool().lanesHeld.fetch_add(1, std::memory_order_relaxed);
 	return RegisterDedicatedThread(DedicatedConfig{ .name = name, .idle = DedicatedConfig::Idle::Sleep });
 }
 
 void ReleaseLane(LaneId lane)
 {
+	PoolState& P = ActivePool();
 	// Only decrement when the lane actually existed - a double release or
 	// an invalid id must not corrupt the shutdown-held-lanes counter.
 	{
-		std::lock_guard<std::mutex> lock(s_DedicatedMutex);
+		std::lock_guard<std::mutex> lock(P.dedicatedMutex);
 		bool found = false;
-		for (const auto& d : s_Dedicated)
+		for (const auto& d : P.dedicated)
 		{
 			if (d->id == lane)
 			{
@@ -470,19 +547,19 @@ void ReleaseLane(LaneId lane)
 		}
 	}
 	UnregisterDedicatedThread(lane);
-	s_LanesHeld.fetch_sub(1, std::memory_order_relaxed);
+	P.lanesHeld.fetch_sub(1, std::memory_order_relaxed);
 }
 
 namespace detail {
 
 void SubmitInlineRaw(const void* data, size_t size, void (*trampoline)(void*), const TaskDesc& opts)
 {
-	if (!s_Init) Init();
+	PoolState& P = ActivePool();
 	assert(opts.fn == nullptr && "Submit(F) and TaskDesc::fn are mutually exclusive");
 	assert(size <= 48);
 
-	uint32_t slot = AllocateSlot();
-	TaskSlot& t = s_Slots[slot];
+	uint32_t slot = AllocateSlot(P);
+	TaskSlot& t = P.slots[slot];
 	std::memcpy(t.inlineData, data, size);
 	t.fn = trampoline;
 	t.userData = t.inlineData;
@@ -490,11 +567,11 @@ void SubmitInlineRaw(const void* data, size_t size, void (*trampoline)(void*), c
 	t.thread = opts.thread;
 	t.signals = opts.signals;
 	t.waitsFor = opts.waitsFor;
-	s_LiveTasks++;
+	P.liveTasks++;
 
 	if (opts.waitsFor != kInvalidCounter)
 	{
-		CounterState* c = ResolveCounter(opts.waitsFor);
+		CounterState* c = ResolveCounter(P, opts.waitsFor);
 		assert(c && "task waits on an invalid/destroyed counter");
 		bool runnable = false;
 		{
@@ -505,10 +582,10 @@ void SubmitInlineRaw(const void* data, size_t size, void (*trampoline)(void*), c
 				runnable = true;
 		}
 		if (runnable)
-			EnqueueSlot(slot);
+			EnqueueSlot(P, slot);
 		return;
 	}
-	EnqueueSlot(slot);
+	EnqueueSlot(P, slot);
 }
 
 } // namespace detail
@@ -517,11 +594,11 @@ void SubmitInlineRaw(const void* data, size_t size, void (*trampoline)(void*), c
 
 CounterHandle CreateCounter(int initial)
 {
-	if (!s_Init) Init();
-	std::lock_guard<std::mutex> lock(s_PoolMutex);
-	for (uint32_t i = 0; i < s_Counters.size(); i++)
+	PoolState& P = ActivePool();
+	std::lock_guard<std::mutex> lock(P.poolMutex);
+	for (uint32_t i = 0; i < P.counters.size(); i++)
 	{
-		CounterState& c = s_Counters[i];
+		CounterState& c = P.counters[i];
 		if (!c.alive.load(std::memory_order_relaxed))
 		{
 			c.alive.store(true, std::memory_order_relaxed);
@@ -547,14 +624,15 @@ CounterHandle CreateCounter(int initial)
 
 void DestroyCounter(CounterHandle h)
 {
-	CounterState* c = ResolveCounter(h);
+	PoolState& P = ActivePool();
+	CounterState* c = ResolveCounter(P, h);
 	assert(c && "destroying an invalid/destroyed counter");
 	assert(c->count.load() == 0 && "destroying a counter with nonzero count");
 	assert(c->pending.empty() && "destroying a counter with parked waiters");
 	// The pool lock CreateCounter holds: a create seeing alive == false before
 	// the bump below would claim the slot with the old generation, and the bump
 	// would then invalidate that live handle (the first Signal/WaitFor asserts).
-	std::lock_guard<std::mutex> lock(s_PoolMutex);
+	std::lock_guard<std::mutex> lock(P.poolMutex);
 	c->alive.store(false, std::memory_order_relaxed);
 	// Wrap the packed generation explicitly: the 12-bit field must never
 	// exceed 0xFFF or the (gen << 20) pack overflows into the index bits
@@ -567,7 +645,12 @@ void DestroyCounter(CounterHandle h)
 
 void Signal(CounterHandle h, int n)
 {
-	CounterState* c = ResolveCounter(h);
+	SignalCounter(ActivePool(), h, n);
+}
+
+static void SignalCounter(PoolState& P, CounterHandle h, int n)
+{
+	CounterState* c = ResolveCounter(P, h);
 	assert(c && "signalling an invalid/destroyed counter");
 	bool hitZero = false;
 	{
@@ -578,7 +661,7 @@ void Signal(CounterHandle h, int n)
 		{
 			hitZero = true;
 			for (uint32_t slot : c->pending)
-				EnqueueSlot(slot);
+				EnqueueSlot(P, slot);
 			c->pending.clear();
 		}
 	}
@@ -588,47 +671,54 @@ void Signal(CounterHandle h, int n)
 
 int Load(CounterHandle h)
 {
-	CounterState* c = ResolveCounter(h);
+	CounterState* c = ResolveCounter(ActivePool(), h);
 	assert(c && "loading an invalid/destroyed counter");
 	return c->count.load();
 }
 
 void WaitFor(CounterHandle h, Help help)
 {
-	CounterState* c = ResolveCounter(h);
+	PoolState& P = ActivePool();
+	CounterState* c = ResolveCounter(P, h);
 	assert(c && "waiting on an invalid/destroyed counter");
 
 	if (help == Help::BlockOnly)
 	{
-		MarkProfilerState(CurrentThreadIndex(), 0); // waiting
+		MarkProfilerState(P, CurrentThreadIndex(), 0); // waiting
 		std::unique_lock<std::mutex> lock(c->mutex);
-		c->cv.wait(lock, [&] { return c->count.load() == 0 || s_Stop; });
-		MarkProfilerState(CurrentThreadIndex(), 2);
+		c->cv.wait(lock, [&] { return c->count.load() == 0 || P.stop; });
+		MarkProfilerState(P, CurrentThreadIndex(), 2);
 		return;
 	}
 
 	// Help-while-waiting: run eligible tasks while the counter is nonzero.
-	MarkProfilerState(CurrentThreadIndex(), 0); // waiting
-	while (c->count.load() > 0 && !s_Stop)
+	MarkProfilerState(P, CurrentThreadIndex(), 0); // waiting
+	while (c->count.load() > 0 && !P.stop)
 	{
-		if (!TryHelp())
+		if (!TryHelpIn(P))
 		{
 			std::unique_lock<std::mutex> lock(c->mutex);
 			c->cv.wait_for(lock, std::chrono::milliseconds(1),
-				[&] { return c->count.load() == 0 || s_Stop; });
+				[&] { return c->count.load() == 0 || P.stop; });
 		}
 		else
-			MarkProfilerState(CurrentThreadIndex(), 1); // helping
+			MarkProfilerState(P, CurrentThreadIndex(), 1); // helping
 	}
-	MarkProfilerState(CurrentThreadIndex(), 2); // wait over
+	MarkProfilerState(P, CurrentThreadIndex(), 2); // wait over
 }
 
 // Run at most one eligible task on the CALLING thread.
 bool TryHelp()
 {
-	if (!s_Init) return false;
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	return pool && TryHelpIn(*pool);
+}
 
-	if (std::this_thread::get_id() == s_MainThreadId)
+static bool TryHelpIn(PoolState& P)
+{
+	if (!P.running) return false;
+
+	if (std::this_thread::get_id() == P.mainThreadId)
 	{
 		// Main-affinity first (keeps main-only work deadlock-free while
 		// the main thread waits), then AnyWorker. Pop under the lock,
@@ -637,32 +727,32 @@ bool TryHelp()
 		{
 			uint32_t slot = ~0u;
 			{
-				std::lock_guard<std::mutex> lock(s_MainMutex);
-				if (!s_MainQueue.empty())
+				std::lock_guard<std::mutex> lock(P.mainMutex);
+				if (!P.mainQueue.empty())
 				{
-					slot = s_MainQueue.front();
-					s_MainQueue.pop_front();
+					slot = P.mainQueue.front();
+					P.mainQueue.pop_front();
 				}
 			}
 			if (slot != ~0u)
 			{
-				RunSlot(slot);
+				RunSlot(P, slot);
 				return true;
 			}
 		}
 		{
 			uint32_t slot = ~0u;
 			{
-				std::lock_guard<std::mutex> lock(s_AnyMutex);
-				if (!s_AnyQueue.empty())
+				std::lock_guard<std::mutex> lock(P.anyMutex);
+				if (!P.anyQueue.empty())
 				{
-					slot = s_AnyQueue.front();
-					s_AnyQueue.pop_front();
+					slot = P.anyQueue.front();
+					P.anyQueue.pop_front();
 				}
 			}
 			if (slot != ~0u)
 			{
-				RunSlot(slot);
+				RunSlot(P, slot);
 				return true;
 			}
 		}
@@ -683,7 +773,7 @@ bool TryHelp()
 			}
 			if (slot != ~0u)
 			{
-				RunSlot(slot);
+				RunSlot(P, slot);
 				return true;
 			}
 		}
@@ -691,16 +781,16 @@ bool TryHelp()
 		{
 			uint32_t slot = ~0u;
 			{
-				std::lock_guard<std::mutex> lock(s_AnyMutex);
-				if (!s_AnyQueue.empty())
+				std::lock_guard<std::mutex> lock(P.anyMutex);
+				if (!P.anyQueue.empty())
 				{
-					slot = s_AnyQueue.front();
-					s_AnyQueue.pop_front();
+					slot = P.anyQueue.front();
+					P.anyQueue.pop_front();
 				}
 			}
 			if (slot != ~0u)
 			{
-				RunSlot(slot);
+				RunSlot(P, slot);
 				return true;
 			}
 		}
@@ -710,74 +800,76 @@ bool TryHelp()
 	{
 		uint32_t slot = ~0u;
 		{
-			std::lock_guard<std::mutex> lock(s_AnyMutex);
-			if (!s_AnyQueue.empty())
+			std::lock_guard<std::mutex> lock(P.anyMutex);
+			if (!P.anyQueue.empty())
 			{
-				slot = s_AnyQueue.front();
-				s_AnyQueue.pop_front();
+				slot = P.anyQueue.front();
+				P.anyQueue.pop_front();
 			}
 		}
 		if (slot != ~0u)
 		{
-			RunSlot(slot);
+			RunSlot(P, slot);
 			return true;
 		}
 	}
 	return false;
 }
 
-static void RunSlot(uint32_t slot)
+static void RunSlot(PoolState& P, uint32_t slot)
 {
 	TaskSlot t;
 	{
-		std::lock_guard<std::mutex> lock(s_PoolMutex);
-		t = s_Slots[slot];
+		std::lock_guard<std::mutex> lock(P.poolMutex);
+		t = P.slots[slot];
 	}
 	// A per-task profiler zone (null hook = free no-op). The
 	// begin hook returns the handle the end mark pairs with; the task's
 	// interned name id + the window tag ride alongside (0 = unnamed).
 	int threadIndex = CurrentThreadIndex();
-	uint64_t zone = MarkProfilerZone(threadIndex, t.nameId, t.window, "Task", true, 0);
+	uint64_t zone = MarkProfilerZone(P, threadIndex, t.nameId, t.window, "Task", true, 0);
 	if (t.fn)
 		t.fn(t.userData);
-	MarkProfilerZone(threadIndex, t.nameId, t.window, "Task", false, zone);
-	s_LiveTasks--;
-	ReleaseSlot(slot);
+	MarkProfilerZone(P, threadIndex, t.nameId, t.window, "Task", false, zone);
+	P.liveTasks--;
+	ReleaseSlot(P, slot);
 
 	if (t.signals != kInvalidCounter)
-		Signal(t.signals, 1);
+		SignalCounter(P, t.signals, 1);
 }
 
 // ---- Main thread ---------------------------------------------------------------------
 
 void PumpMainThreadTasks()
 {
-	if (!s_Init) return;
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	if (!pool || !pool->running) return;
+	PoolState& P = *pool;
 	for (int guard = 0; guard < 1000000; guard++)
 	{
 		uint32_t slot = ~0u;
 		{
-			std::lock_guard<std::mutex> lock(s_MainMutex);
-			if (s_MainQueue.empty()) break;
-			slot = s_MainQueue.front();
-			s_MainQueue.pop_front();
+			std::lock_guard<std::mutex> lock(P.mainMutex);
+			if (P.mainQueue.empty()) break;
+			slot = P.mainQueue.front();
+			P.mainQueue.pop_front();
 		}
-		RunSlot(slot);
+		RunSlot(P, slot);
 	}
 }
 
 // ---- Workers --------------------------------------------------------------------------
 
-static void WorkerLoop()
+static void WorkerLoop(PoolState& P)
 {
-	if (s_OnThreadStart)
-		s_OnThreadStart();
+	if (P.onThreadStart)
+		P.onThreadStart();
 	int index = CurrentThreadIndex(); // reserve this worker's index
 	// A unique per-worker name (the pool visualizer keys its per-thread
 	// history on it, and the profiler's lane names benefit too).
 	static thread_local char t_name[32];
 	std::snprintf(t_name, sizeof(t_name), "loom-worker-%d", index);
-	ThreadStats* stats = RegisterThreadStats(index, t_name);
+	ThreadStats* stats = RegisterThreadStats(P, index, t_name);
 #if defined(__linux__)
 	if (stats) pthread_setname_np(pthread_self(), stats->name);
 #endif
@@ -786,53 +878,57 @@ static void WorkerLoop()
 		uint32_t slot = ~0u;
 		{
 			if (stats) stats->state = ThreadState::Idle;
-			MarkProfilerState(index, 0); // waiting (the idle sleep)
-			std::unique_lock<std::mutex> lock(s_AnyMutex);
-			s_AnyCV.wait(lock, [&] { return !s_AnyQueue.empty() || s_Stop; });
-			if (!s_AnyQueue.empty())
+			MarkProfilerState(P, index, 0); // waiting (the idle sleep)
+			std::unique_lock<std::mutex> lock(P.anyMutex);
+			P.anyCV.wait(lock, [&] { return !P.anyQueue.empty() || P.stop; });
+			if (!P.anyQueue.empty())
 			{
-				slot = s_AnyQueue.front();
-				s_AnyQueue.pop_front();
+				slot = P.anyQueue.front();
+				P.anyQueue.pop_front();
 			}
 			lock.unlock();
 			// The app hook (the profiler's thread registration) locks the
 			// pool snapshot mutexes - it must never run while this thread
-			// still holds s_AnyMutex (the self-deadlock).
-			MarkProfilerState(index, 2); // wait over
+			// still holds P.anyMutex (the self-deadlock).
+			MarkProfilerState(P, index, 2); // wait over
 			if (slot == ~0u)
 			{
-				if (s_Stop) break;
+				if (P.stop) break;
 				continue;
 			}
 		}
 		if (stats) { stats->state = ThreadState::Running; }
-		RunSlot(slot);
+		RunSlot(P, slot);
 		if (stats) { stats->tasksRun++; }
 	}
 }
 
 // ---- Thread stats (the pool visualizer) ------------------------------------------------
 
-static ThreadStats* RegisterThreadStats(int index, const char* name)
+static ThreadStats* RegisterThreadStats(PoolState& P, int index, const char* name)
 {
-	std::lock_guard<std::mutex> lock(s_StatsMutex);
-	for (auto& t : s_ThreadStats)
+	std::lock_guard<std::mutex> lock(P.statsMutex);
+	for (auto& t : P.threadStats)
 		if (t->index == index)
 			return t.get();
 	auto stats = std::make_unique<ThreadStats>();
 	stats->index = index;
 	stats->name = name;
 	ThreadStats* raw = stats.get();
-	s_ThreadStats.push_back(std::move(stats));
+	P.threadStats.push_back(std::move(stats));
 	return raw;
 }
 
 PoolSnapshot SnapshotThreadStats()
 {
 	PoolSnapshot snap;
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	if (!pool)
+		return snap;
+	PoolState& P = *pool;
 	{
-		std::lock_guard<std::mutex> lock(s_StatsMutex);
-		for (auto& t : s_ThreadStats)
+		std::lock_guard<std::mutex> lock(P.statsMutex);
+		for (auto& t : P.threadStats)
 		{
 			ThreadStatsView view;
 			view.index = t->index;
@@ -845,16 +941,16 @@ PoolSnapshot SnapshotThreadStats()
 		}
 	}
 	{
-		std::lock_guard<std::mutex> lock(s_AnyMutex);
-		snap.anyQueueDepth = (int)s_AnyQueue.size();
+		std::lock_guard<std::mutex> lock(P.anyMutex);
+		snap.anyQueueDepth = (int)P.anyQueue.size();
 	}
 	{
-		std::lock_guard<std::mutex> lock(s_MainMutex);
-		snap.mainQueueDepth = (int)s_MainQueue.size();
+		std::lock_guard<std::mutex> lock(P.mainMutex);
+		snap.mainQueueDepth = (int)P.mainQueue.size();
 	}
 	{
-		std::lock_guard<std::mutex> lock(s_DedicatedMutex);
-		for (auto& d : s_Dedicated)
+		std::lock_guard<std::mutex> lock(P.dedicatedMutex);
+		for (auto& d : P.dedicated)
 		{
 			int depth = 0;
 			{
@@ -867,8 +963,8 @@ PoolSnapshot SnapshotThreadStats()
 					t.queueDepth = depth;
 		}
 	}
-	snap.liveTasks = (int)s_LiveTasks.load();
-	snap.pendingTasks = PendingTaskCount();
+	snap.liveTasks = (int)P.liveTasks.load();
+	snap.pendingTasks = PendingTaskCountIn(P);
 	return snap;
 }
 
@@ -878,13 +974,13 @@ static thread_local DedicatedState* t_CurrentDedicated = nullptr;
 
 static DedicatedState* CurrentDedicated() { return t_CurrentDedicated; }
 
-static void DedicatedLoop(DedicatedState& d)
+static void DedicatedLoop(PoolState& P, DedicatedState& d)
 {
-	if (s_OnThreadStart)
-		s_OnThreadStart();
+	if (P.onThreadStart)
+		P.onThreadStart();
 	t_CurrentDedicated = &d;
 	int index = CurrentThreadIndex(); // reserve this thread's index
-	ThreadStats* stats = RegisterThreadStats(index, d.name.empty() ? "loom-dedicated" : d.name.c_str());
+	ThreadStats* stats = RegisterThreadStats(P, index, d.name.empty() ? "loom-dedicated" : d.name.c_str());
 	if (!d.name.empty())
 	{
 #if defined(__linux__)
@@ -895,7 +991,7 @@ static void DedicatedLoop(DedicatedState& d)
 	{
 		uint32_t slot = ~0u;
 		{
-			MarkProfilerState(index, 0); // waiting (the idle sleep)
+			MarkProfilerState(P, index, 0); // waiting (the idle sleep)
 			std::unique_lock<std::mutex> lock(d.mutex);
 			d.cv.wait(lock, [&] { return !d.queue.empty() || d.stop; });
 			if (!d.queue.empty())
@@ -905,17 +1001,17 @@ static void DedicatedLoop(DedicatedState& d)
 			}
 			lock.unlock();
 			// The app hook must not run while this thread holds d.mutex.
-			MarkProfilerState(index, 2); // wait over
+			MarkProfilerState(P, index, 2); // wait over
 			if (slot == ~0u)
 			{
 				if (d.stop) break;
 				if (d.idle == DedicatedConfig::Idle::StealFromPool)
-					TryHelp();
+					TryHelpIn(P);
 				continue;
 			}
 		}
 		if (stats) { stats->state = ThreadState::Running; }
-		RunSlot(slot);
+		RunSlot(P, slot);
 		if (stats) { stats->tasksRun++; }
 		if (stats) { stats->state = ThreadState::Idle; }
 	}
@@ -924,13 +1020,13 @@ static void DedicatedLoop(DedicatedState& d)
 
 DedicatedId RegisterDedicatedThread(const DedicatedConfig& config)
 {
-	if (!s_Init) Init();
-	std::lock_guard<std::mutex> lock(s_DedicatedMutex);
+	PoolState& P = ActivePool();
+	std::lock_guard<std::mutex> lock(P.dedicatedMutex);
 	uint32_t id = 0;
 	for (;;)
 	{
 		bool taken = false;
-		for (auto& d : s_Dedicated)
+		for (auto& d : P.dedicated)
 			if (d->id == id) { taken = true; break; }
 		if (!taken) break;
 		id++;
@@ -941,22 +1037,23 @@ DedicatedId RegisterDedicatedThread(const DedicatedConfig& config)
 	d->idle = config.idle;
 	d->stop = false;
 	DedicatedId handle = id;
-	d->thread = std::thread(DedicatedLoop, std::ref(*d));
-	s_Dedicated.push_back(std::move(d));
+	d->thread = std::thread(DedicatedLoop, std::ref(P), std::ref(*d));
+	P.dedicated.push_back(std::move(d));
 	return handle;
 }
 
 void UnregisterDedicatedThread(DedicatedId id)
 {
+	PoolState& P = ActivePool();
 	std::unique_ptr<DedicatedState> d;
 	{
-		std::lock_guard<std::mutex> lock(s_DedicatedMutex);
-		for (auto it = s_Dedicated.begin(); it != s_Dedicated.end(); ++it)
+		std::lock_guard<std::mutex> lock(P.dedicatedMutex);
+		for (auto it = P.dedicated.begin(); it != P.dedicated.end(); ++it)
 		{
 			if ((*it)->id == id)
 			{
 				d = std::move(*it);
-				s_Dedicated.erase(it);
+				P.dedicated.erase(it);
 				break;
 			}
 		}
@@ -971,6 +1068,24 @@ void UnregisterDedicatedThread(DedicatedId id)
 		d->cv.notify_all();
 	}
 	if (d->thread.joinable()) d->thread.join();
+}
+
+// ---- The profiler shim's hooks (loom_profiler_shim.h) ----------------------------
+
+void SetProfilerStateHook(ProfilerStateFn fn)
+{
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	assert((pool || fn == nullptr) && "loom: a profiler hook installed with no active pool");
+	if (pool)
+		pool->profilerStateHook.store(fn, std::memory_order_release);
+}
+
+void SetProfilerZoneHook(ProfilerZoneFn fn)
+{
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	assert((pool || fn == nullptr) && "loom: a profiler hook installed with no active pool");
+	if (pool)
+		pool->profilerZoneHook.store(fn, std::memory_order_release);
 }
 
 } // namespace loom

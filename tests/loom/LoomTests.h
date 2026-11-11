@@ -2,8 +2,8 @@
 
 // Loom's headless suite: seeded stress, DAGs, affinity pinning,
 // help-while-waiting, dedicated lifecycle, shutdown under load. One doctest
-// TEST_CASE per named check; every case init/shuts down its own loom
-// instance. Runs from
+// TEST_CASE per named check; every case owns its own loom::Pool (no lazy
+// auto-init - the pool is created explicitly). Runs from
 // tinytest and from the minimal-link loom_tests app (TSAN-clean).
 
 #include "loom.h"
@@ -20,12 +20,6 @@
 namespace loom { namespace tests {
 
 namespace {
-
-void InitIsolated()
-{
-	loom::Shutdown();
-	loom::Init();
-}
 
 void SpinUntil(int target, CounterHandle c, int timeoutMs)
 {
@@ -53,7 +47,7 @@ struct BasicResults
 BasicResults RunBasicScenario()
 {
 	BasicResults r;
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 	const int N = 1000;
 	std::atomic<int> runs{ 0 };
 	CounterHandle done = loom::CreateCounter(N);
@@ -66,7 +60,7 @@ BasicResults RunBasicScenario()
 	r.exactlyOnce = (runs.load() == N);
 	r.drained = (loom::Load(done) == 0);
 	loom::DestroyCounter(done);
-	loom::Shutdown();
+	pool.Shutdown();
 	r.quiesced = !loom::IsInitialised();
 	return r;
 }
@@ -90,7 +84,7 @@ TEST_CASE("loom: shutdown quiesced")
 
 TEST_CASE("loom: stress — 10k tasks ran exactly once")
 {
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 	const int N = 10000;
 	std::atomic<int> runs{ 0 };
 	CounterHandle done = loom::CreateCounter(N);
@@ -107,7 +101,7 @@ TEST_CASE("loom: stress — 10k tasks ran exactly once")
 	loom::WaitFor(done);
 	CHECK_MESSAGE(runs.load() == N, "stress: 10k tasks ran exactly once");
 	loom::DestroyCounter(done);
-	loom::Shutdown();
+	pool.Shutdown();
 }
 
 // ---- 3. Random DAG: fan-in/fan-out via counters ----
@@ -121,7 +115,7 @@ struct DagResults
 DagResults RunDagScenario()
 {
 	DagResults r;
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 	std::mt19937 rng(999);
 	const int N = 2000;
 	std::vector<CounterHandle> counters;
@@ -147,7 +141,7 @@ DagResults RunDagScenario()
 	r.leafZero = (loom::Load(leaf) == 0);
 	for (CounterHandle c : counters) loom::DestroyCounter(c);
 	loom::DestroyCounter(leaf);
-	loom::Shutdown();
+	pool.Shutdown();
 	return r;
 }
 
@@ -172,7 +166,7 @@ struct AffinityResults
 AffinityResults RunAffinityScenario()
 {
 	AffinityResults r;
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 	std::thread::id mainId = std::this_thread::get_id();
 	CounterHandle mainDone = loom::CreateCounter(2);
 	std::atomic<bool> mainOnMain{ true }, mainRan{ false };
@@ -218,7 +212,7 @@ AffinityResults RunAffinityScenario()
 	loom::UnregisterDedicatedThread(ded);
 	loom::DestroyCounter(mainDone);
 	loom::DestroyCounter(dedDone);
-	loom::Shutdown();
+	pool.Shutdown();
 	return r;
 }
 
@@ -244,7 +238,7 @@ struct HelpResults
 HelpResults RunHelpScenario()
 {
 	HelpResults r;
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 	std::thread::id mainId = std::this_thread::get_id();
 	CounterHandle gate = loom::CreateCounter(1);
 	std::atomic<bool> mainTaskRan{ false }, onMain{ true };
@@ -263,7 +257,7 @@ HelpResults RunHelpScenario()
 	r.mainTaskRan = mainTaskRan;
 	r.ranOnMain = onMain;
 	loom::DestroyCounter(gate);
-	loom::Shutdown();
+	pool.Shutdown();
 	return r;
 }
 
@@ -281,7 +275,7 @@ TEST_CASE("loom: help — it ran on the main thread")
 
 TEST_CASE("loom: dedicated — 5 register/unregister rounds under load")
 {
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 	for (int round = 0; round < 5; round++)
 	{
 		loom::DedicatedConfig dc;
@@ -297,14 +291,14 @@ TEST_CASE("loom: dedicated — 5 register/unregister rounds under load")
 		loom::DestroyCounter(done);
 		loom::UnregisterDedicatedThread(ded);
 	}
-	loom::Shutdown();
+	pool.Shutdown();
 }
 
 // ---- 7. Inline Submit(F) + BlockOnly wait ----
 
 TEST_CASE("loom: inline Submit(F) ran via a BlockOnly wait")
 {
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 	std::atomic<int> n{ 0 };
 	CounterHandle done = loom::CreateCounter(2);
 	loom::Submit([&n]() { n += 5; },
@@ -314,14 +308,14 @@ TEST_CASE("loom: inline Submit(F) ran via a BlockOnly wait")
 	loom::WaitFor(done, loom::Help::BlockOnly);
 	CHECK_MESSAGE(n.load() == 12, "inline Submit(F) ran via a BlockOnly wait");
 	loom::DestroyCounter(done);
-	loom::Shutdown();
+	pool.Shutdown();
 }
 
 // ---- 8. Shutdown under load (drain-or-assert) ----
 
 TEST_CASE("loom: shutdown under load — all tasks completed")
 {
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 	const int N = 5000;
 	std::atomic<int> runs{ 0 };
 	CounterHandle done = loom::CreateCounter(N);
@@ -332,7 +326,7 @@ TEST_CASE("loom: shutdown under load — all tasks completed")
 	}
 	loom::WaitFor(done);
 	loom::DestroyCounter(done);
-	loom::Shutdown(); // drains + joins; asserts queues empty
+	pool.Shutdown(); // drains + joins; asserts queues empty
 	CHECK_MESSAGE(runs.load() == N, "shutdown under load: all tasks completed");
 }
 
@@ -340,7 +334,7 @@ TEST_CASE("loom: shutdown under load — all tasks completed")
 
 TEST_CASE("loom: ParallelFor — every index covered exactly once (pointer form)")
 {
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 	const size_t N = 1000;
 	std::vector<std::atomic<int>> hits(N);
 	for (auto& h : hits) h = 0;
@@ -364,7 +358,7 @@ TEST_CASE("loom: ParallelFor — every index covered exactly once (pointer form)
 
 TEST_CASE("loom: ParallelFor — the lambda convenience covers the range")
 {
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 	const size_t N = 500;
 	std::vector<std::atomic<int>> hits(N);
 	for (auto& h : hits) h = 0;
@@ -382,7 +376,7 @@ TEST_CASE("loom: ParallelFor — the lambda convenience covers the range")
 
 TEST_CASE("loom: ParallelFor — nesting fills a product matrix exactly once")
 {
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 	const size_t Rows = 64, Cols = 96;
 	std::vector<std::atomic<int>> cells(Rows * Cols);
 	for (auto& c : cells) c = 0;
@@ -403,7 +397,7 @@ TEST_CASE("loom: ParallelFor — nesting fills a product matrix exactly once")
 
 TEST_CASE("loom: ScopedCounter — RAII fan-in and generation-safe re-acquire")
 {
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 	const int N = 300;
 
 	CounterHandle reused;
@@ -432,7 +426,7 @@ TEST_CASE("loom: counters — a concurrent create never gets a handle the destro
 	// the generation, unlocked. A create landing between the two claimed the
 	// slot with the OLD generation, so the bump killed the fresh handle and
 	// the first Signal/WaitFor asserted on a live counter.
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 	const int Threads = 4;
 	const int Iterations = 200000;
 	std::atomic<int> completed{ 0 };
@@ -457,7 +451,7 @@ TEST_CASE("loom: counters — a concurrent create never gets a handle the destro
 
 TEST_CASE("loom: lanes — exclusive reservation, lifecycle, shutdown wait")
 {
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 
 	loom::LaneId lane = loom::AcquireLane("test-lane");
 	CHECK(lane != loom::kInvalidLane);
@@ -489,12 +483,12 @@ TEST_CASE("loom: lanes — exclusive reservation, lifecycle, shutdown wait")
 		loom::ReleaseLane(l2);
 	}
 
-	loom::Shutdown(); // asserts no lanes still held
+	pool.Shutdown(); // asserts no lanes still held
 }
 
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
-	InitIsolated();
+	loom::Pool pool; // the suite owns its pool explicitly
 
 	struct ZoneRecord { int threadIndex = -1; std::string name; bool begin = false; uint64_t handle = 0; };
 	static std::mutex s_recordMutex;

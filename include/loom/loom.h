@@ -29,6 +29,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <new>
 #include <span>
 #include <string>
@@ -84,8 +85,32 @@ struct LoomConfig
 };
 
 // ---- Lifecycle -------------------------------------------------------------
-void Init(const LoomConfig& config = {});
-void Shutdown(); // idempotent; drains workers + dedicated threads, joins all
+// The pool's whole state (task slots,
+// queues, counters, workers, dedicated threads, stats, the profiler hooks)
+// is one PoolState owned by a Pool. The engine's LoomPool subsystem owns the
+// app's (its Init is the only init in an app); a standalone user - the
+// loom/debug_draw suites - owns one explicitly. Constructing a Pool installs
+// it as the ACTIVE pool every free function below resolves and spawns its
+// threads; there is no lazy auto-init (a call with no active pool asserts).
+// One pool at a time.
+struct PoolState;
+
+class Pool
+{
+public:
+	explicit Pool(const LoomConfig& config = {});
+	~Pool(); // Shutdown(), then frees the state
+	Pool(const Pool&) = delete;
+	Pool& operator=(const Pool&) = delete;
+
+	// Idempotent; drains workers + dedicated threads, joins all, then
+	// uninstalls the pool (drain-or-assert: abandoned tasks, held lanes and
+	// live tasks assert).
+	void Shutdown();
+
+private:
+	std::unique_ptr<PoolState> m_State;
+};
 
 // ---- Submission ------------------------------------------------------------
 void Submit(const TaskDesc&);
@@ -268,6 +293,7 @@ struct PoolSnapshot
 PoolSnapshot SnapshotThreadStats();
 
 // ---- Introspection (tests / debug) -----------------------------------------
+// All four answer for the active pool (0/false with none).
 int  WorkerCount();
 bool IsInitialised();
 int  LiveTaskCount();   // allocated slots not yet completed
