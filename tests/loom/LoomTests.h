@@ -381,8 +381,8 @@ TEST_CASE("loom: ParallelFor — nesting fills a product matrix exactly once")
 	std::vector<std::atomic<int>> cells(Rows * Cols);
 	for (auto& c : cells) c = 0;
 
-	loom::ParallelFor(0, Rows, 8, [&cells, Cols](size_t rowBegin, size_t rowEnd) {
-		loom::ParallelFor(0, Cols, 16, [&cells, Cols, rowBegin, rowEnd](size_t colBegin, size_t colEnd) {
+	loom::ParallelFor(0, Rows, 8, [&cells](size_t rowBegin, size_t rowEnd) {
+		loom::ParallelFor(0, Cols, 16, [&cells, rowBegin, rowEnd](size_t colBegin, size_t colEnd) {
 			for (size_t r = rowBegin; r < rowEnd; r++)
 				for (size_t c = colBegin; c < colEnd; c++)
 					cells[r * Cols + c]++;
