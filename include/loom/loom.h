@@ -292,6 +292,38 @@ struct PoolSnapshot
 
 PoolSnapshot SnapshotThreadStats();
 
+// ---- Parking ----------------------------------------------------------------
+// Stops every pool thread (the workers, the dedicated threads, the lanes) at
+// a known point: each finishes its current task, records its own stack and
+// blocks at its loop top until UnparkAll. Queued tasks stay queued; the
+// caller keeps running and must not be a pool thread. ParkAll returns false,
+// with every thread released again, when one did not park within
+// `timeoutMs` (a long task).
+struct ParkedThread
+{
+	int index = 0;
+	std::string name;
+	long osThreadId = 0;                    // the kernel tid (/proc/self/task/<tid>)
+	std::vector<uintptr_t> returnAddresses; // innermost first
+};
+bool ParkAll(uint32_t timeoutMs);
+void UnparkAll();
+// A thread outside the pool that runs engine code (the hot-reload listener,
+// the profiler writer) joins the park as a participant: ParkAll calls its
+// `wake` (from the requesting thread) so it reaches its known wait point,
+// where it calls ParkPoint. No-ops with no active pool.
+using ParkWakeFn = void (*)(void* user);
+int  RegisterParkParticipant(ParkWakeFn wake, void* user);
+void UnregisterParkParticipant(int id);
+bool ParkRequested();
+void ParkPoint(const char* name);
+// Valid between a successful ParkAll and UnparkAll.
+std::vector<ParkedThread> ParkedThreads();
+// The calling thread's return addresses, innermost first: a frame-pointer
+// walk bounded by the thread's stack (every dev TU keeps frame pointers).
+void CaptureReturnAddresses(std::vector<uintptr_t>& out, size_t max = 256);
+long CurrentOsThreadId();
+
 // ---- Introspection (tests / debug) -----------------------------------------
 // All four answer for the active pool (0/false with none).
 int  WorkerCount();

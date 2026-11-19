@@ -14,6 +14,8 @@
 
 #if defined(__linux__)
 #include <pthread.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace loom {
@@ -105,6 +107,17 @@ struct PoolState
 	// Runs first on every pool thread.
 	void (*onThreadStart)() = nullptr;
 
+	// The park. parkRequested is written under
+	// parkMutex (a thread checks it again there before it counts itself).
+	std::mutex              parkMutex;
+	std::condition_variable parkCV;    // the parked threads wait for the release
+	std::condition_variable parkedCV;  // ParkAll waits for the last arrival
+	std::atomic<bool>       parkRequested{ false };
+	std::vector<ParkedThread> parked;
+	struct ParkParticipant { int id; ParkWakeFn wake; void* user; };
+	std::vector<ParkParticipant> participants;
+	int nextParticipant = 1;
+
 	// The profiler shim's hooks (loom_profiler_shim.h; the old function-local
 	// statics). Atomic: the owner unhooks while the workers are still alive.
 	std::atomic<ProfilerStateFn> profilerStateHook{ nullptr };
@@ -172,6 +185,7 @@ static void     EnqueueSlot(PoolState& P, uint32_t slot);
 static void     RunSlot(PoolState& P, uint32_t slot);
 static void     SignalCounter(PoolState& P, CounterHandle h, int n);
 static bool     TryHelpIn(PoolState& P);
+static void     ParkHere(PoolState& P, int index, const char* name);
 static void     WorkerLoop(PoolState& P);
 static void     DedicatedLoop(PoolState& P, DedicatedState& d);
 static DedicatedState* CurrentDedicated();
@@ -880,7 +894,14 @@ static void WorkerLoop(PoolState& P)
 			if (stats) stats->state = ThreadState::Idle;
 			MarkProfilerState(P, index, 0); // waiting (the idle sleep)
 			std::unique_lock<std::mutex> lock(P.anyMutex);
-			P.anyCV.wait(lock, [&] { return !P.anyQueue.empty() || P.stop; });
+			P.anyCV.wait(lock, [&] { return !P.anyQueue.empty() || P.stop || P.parkRequested.load(); });
+			if (P.parkRequested.load() && !P.stop)
+			{
+				lock.unlock();
+				MarkProfilerState(P, index, 2);
+				ParkHere(P, index, stats ? stats->name : "loom-worker");
+				continue;
+			}
 			if (!P.anyQueue.empty())
 			{
 				slot = P.anyQueue.front();
@@ -993,7 +1014,14 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 		{
 			MarkProfilerState(P, index, 0); // waiting (the idle sleep)
 			std::unique_lock<std::mutex> lock(d.mutex);
-			d.cv.wait(lock, [&] { return !d.queue.empty() || d.stop; });
+			d.cv.wait(lock, [&] { return !d.queue.empty() || d.stop || P.parkRequested.load(); });
+			if (P.parkRequested.load() && !d.stop)
+			{
+				lock.unlock();
+				MarkProfilerState(P, index, 2);
+				ParkHere(P, index, d.name.empty() ? "loom-dedicated" : d.name.c_str());
+				continue;
+			}
 			if (!d.queue.empty())
 			{
 				slot = d.queue.front();
@@ -1068,6 +1096,152 @@ void UnregisterDedicatedThread(DedicatedId id)
 		d->cv.notify_all();
 	}
 	if (d->thread.joinable()) d->thread.join();
+}
+
+// ---- Parking -------------------------------------------------------------------
+
+long CurrentOsThreadId()
+{
+#if defined(__linux__)
+	return (long)syscall(SYS_gettid);
+#else
+	return 0;
+#endif
+}
+
+void CaptureReturnAddresses(std::vector<uintptr_t>& out, size_t max)
+{
+#if defined(__linux__)
+	pthread_attr_t attr;
+	if (pthread_getattr_np(pthread_self(), &attr) != 0)
+		return;
+	void* stackAddr = nullptr;
+	size_t stackSize = 0;
+	pthread_attr_getstack(&attr, &stackAddr, &stackSize);
+	pthread_attr_destroy(&attr);
+	const uintptr_t lo = (uintptr_t)stackAddr, hi = lo + stackSize;
+	const uintptr_t* fp = (const uintptr_t*)__builtin_frame_address(0);
+	while (fp && (uintptr_t)fp >= lo && (uintptr_t)fp + 2 * sizeof(uintptr_t) <= hi && out.size() < max)
+	{
+		const uintptr_t ret = fp[1];
+		if (ret == 0)
+			break;
+		out.push_back(ret);
+		const uintptr_t* next = (const uintptr_t*)fp[0];
+		if (next <= fp)
+			break; // a frame without a frame pointer ends the walk
+		fp = next;
+	}
+#else
+	(void)out;
+	(void)max;
+#endif
+}
+
+static void ParkHere(PoolState& P, int index, const char* name)
+{
+	ParkedThread self;
+	self.index = index;
+	self.name = name ? name : "";
+	self.osThreadId = CurrentOsThreadId();
+	CaptureReturnAddresses(self.returnAddresses);
+	std::unique_lock<std::mutex> lock(P.parkMutex);
+	if (!P.parkRequested.load())
+		return; // released before this thread arrived
+	P.parked.push_back(std::move(self));
+	P.parkedCV.notify_all();
+	P.parkCV.wait(lock, [&] { return !P.parkRequested.load(); });
+}
+
+bool ParkAll(uint32_t timeoutMs)
+{
+	PoolState& P = ActivePool();
+	size_t expected = 0;
+	{
+		std::lock_guard<std::mutex> lock(P.dedicatedMutex);
+		expected = P.workers.size() + P.dedicated.size();
+	}
+	std::vector<PoolState::ParkParticipant> participants;
+	{
+		std::lock_guard<std::mutex> lock(P.parkMutex);
+		P.parked.clear();
+		P.parkRequested = true;
+		participants = P.participants;
+	}
+	expected += participants.size();
+	for (auto& p : participants)
+		p.wake(p.user);
+	// Wake the idle ones under their waiters' own mutexes (the lost-wakeup
+	// rule Shutdown follows).
+	{
+		std::lock_guard<std::mutex> lock(P.anyMutex);
+		P.anyCV.notify_all();
+	}
+	{
+		std::lock_guard<std::mutex> lock(P.dedicatedMutex);
+		for (auto& d : P.dedicated)
+		{
+			std::lock_guard<std::mutex> dlock(d->mutex);
+			d->cv.notify_all();
+		}
+	}
+	bool all = false;
+	{
+		std::unique_lock<std::mutex> lock(P.parkMutex);
+		all = P.parkedCV.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&] { return P.parked.size() >= expected; });
+	}
+	if (!all)
+		UnparkAll();
+	return all;
+}
+
+void UnparkAll()
+{
+	PoolState& P = ActivePool();
+	std::lock_guard<std::mutex> lock(P.parkMutex);
+	P.parkRequested = false;
+	P.parked.clear();
+	P.parkCV.notify_all();
+}
+
+int RegisterParkParticipant(ParkWakeFn wake, void* user)
+{
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	if (!pool)
+		return 0;
+	std::lock_guard<std::mutex> lock(pool->parkMutex);
+	const int id = pool->nextParticipant++;
+	pool->participants.push_back({ id, wake, user });
+	return id;
+}
+
+void UnregisterParkParticipant(int id)
+{
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	if (!pool || id == 0)
+		return;
+	std::lock_guard<std::mutex> lock(pool->parkMutex);
+	std::erase_if(pool->participants, [id](const PoolState::ParkParticipant& p) { return p.id == id; });
+}
+
+bool ParkRequested()
+{
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	return pool && pool->parkRequested.load();
+}
+
+void ParkPoint(const char* name)
+{
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	if (pool && pool->parkRequested.load())
+		ParkHere(*pool, CurrentThreadIndex(), name);
+}
+
+std::vector<ParkedThread> ParkedThreads()
+{
+	PoolState& P = ActivePool();
+	std::lock_guard<std::mutex> lock(P.parkMutex);
+	return P.parked;
 }
 
 // ---- The profiler shim's hooks (loom_profiler_shim.h) ----------------------------

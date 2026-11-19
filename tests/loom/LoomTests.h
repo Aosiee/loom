@@ -11,6 +11,7 @@
 #include <doctest/doctest.h>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <random>
 #include <string>
@@ -484,6 +485,76 @@ TEST_CASE("loom: lanes — exclusive reservation, lifecycle, shutdown wait")
 	}
 
 	pool.Shutdown(); // asserts no lanes still held
+}
+
+// The park stops every pool thread (workers,
+// dedicated threads, lanes, participants) at its loop top; queued work waits.
+TEST_CASE("loom: park — every thread parks with its stack, queued work waits, unpark resumes")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 3 });
+	loom::LaneId lane = loom::AcquireLane("park-lane");
+
+	// A participant outside the pool: a thread that waits on its own cv.
+	struct Participant
+	{
+		std::mutex m;
+		std::condition_variable cv;
+		std::atomic<bool> stop{ false };
+		std::atomic<int> wakes{ 0 };
+	} part;
+	const int pid = loom::RegisterParkParticipant([](void* u) {
+		auto* p = static_cast<Participant*>(u);
+		std::lock_guard<std::mutex> lock(p->m);
+		p->wakes++;
+		p->cv.notify_all();
+	}, &part);
+	std::thread outsider([&part]() {
+		while (!part.stop.load())
+		{
+			{
+				std::unique_lock<std::mutex> lock(part.m);
+				part.cv.wait_for(lock, std::chrono::milliseconds(200), [&] { return part.stop.load() || loom::ParkRequested(); });
+			}
+			loom::ParkPoint("park-outsider");
+		}
+	});
+
+	REQUIRE(loom::ParkAll(2000));
+	const auto parked = loom::ParkedThreads();
+	CHECK(parked.size() == 3 + 1 + 1); // the workers, the lane, the participant
+	CHECK(part.wakes.load() >= 1);
+	for (const auto& t : parked)
+	{
+		CHECK(t.osThreadId != 0);
+		CHECK(!t.returnAddresses.empty());
+	}
+
+	std::atomic<int> ran{ 0 };
+	CounterHandle done = loom::CreateCounter(16);
+	for (int i = 0; i < 16; i++)
+		loom::Submit([&ran]() { ran++; }, loom::TaskDesc{ nullptr, nullptr, loom::Affinity::AnyWorker, 0, done, loom::kInvalidCounter });
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	CHECK(ran.load() == 0); // nothing runs while parked
+
+	loom::UnparkAll();
+	loom::WaitFor(done, loom::Help::BlockOnly);
+	CHECK(ran.load() == 16);
+	loom::DestroyCounter(done);
+
+	// A second park/unpark round works the same.
+	REQUIRE(loom::ParkAll(2000));
+	CHECK(loom::ParkedThreads().size() == 5);
+	loom::UnparkAll();
+
+	loom::UnregisterParkParticipant(pid);
+	part.stop = true;
+	{
+		std::lock_guard<std::mutex> lock(part.m);
+		part.cv.notify_all();
+	}
+	outsider.join();
+	loom::ReleaseLane(lane);
+	pool.Shutdown();
 }
 
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
