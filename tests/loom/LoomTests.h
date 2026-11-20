@@ -6,8 +6,8 @@
 // auto-init - the pool is created explicitly). Runs from
 // tinytest and from the minimal-link loom_tests app (TSAN-clean).
 
-#include "loom.h"
-#include "loom_profiler_shim.h"
+#include "loom/loom.h"
+#include "loom/loom_profiler_shim.h"
 #include <doctest/doctest.h>
 #include <atomic>
 #include <chrono>

@@ -1,5 +1,5 @@
-#include "loom.h"
-#include "loom_profiler_shim.h"
+#include "loom/loom.h"
+#include "loom/loom_profiler_shim.h"
 
 #include <algorithm>
 #include <cassert>
