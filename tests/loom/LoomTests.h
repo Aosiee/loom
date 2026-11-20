@@ -518,6 +518,25 @@ TEST_CASE("loom: park — every thread parks with its stack, queued work waits, 
 			loom::ParkPoint("park-outsider");
 		}
 	});
+	// A failed REQUIRE throws; the outsider must be joined on that path too
+	// (a joinable std::thread's destructor is std::terminate).
+	struct StopOutsider
+	{
+		Participant& part;
+		std::thread& thread;
+		~StopOutsider()
+		{
+			if (loom::ParkRequested())
+				loom::UnparkAll();
+			part.stop = true;
+			{
+				std::lock_guard<std::mutex> lock(part.m);
+				part.cv.notify_all();
+			}
+			if (thread.joinable())
+				thread.join();
+		}
+	} stopOutsider{ part, outsider };
 
 	REQUIRE(loom::ParkAll(2000));
 	const auto parked = loom::ParkedThreads();
@@ -553,6 +572,26 @@ TEST_CASE("loom: park — every thread parks with its stack, queued work waits, 
 		part.cv.notify_all();
 	}
 	outsider.join();
+	loom::ReleaseLane(lane);
+	pool.Shutdown();
+}
+
+// The back-to-back rounds: UnparkAll followed at once by ParkAll used to leave a
+// thread that had not yet woken from the first round asleep in it (it saw the
+// request set again), uncounted by the second - a 2 s timeout about 1 run in 40.
+TEST_CASE("loom: park — back-to-back park/unpark rounds never strand a thread")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 4 });
+	loom::LaneId lane = loom::AcquireLane("park-rounds-lane");
+	int failedRound = -1;
+	for (int round = 0; round < 500 && failedRound < 0; round++)
+	{
+		if (!loom::ParkAll(2000))
+			failedRound = round;
+		else
+			loom::UnparkAll();
+	}
+	CHECK(failedRound == -1);
 	loom::ReleaseLane(lane);
 	pool.Shutdown();
 }

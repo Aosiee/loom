@@ -113,6 +113,11 @@ struct PoolState
 	std::condition_variable parkCV;    // the parked threads wait for the release
 	std::condition_variable parkedCV;  // ParkAll waits for the last arrival
 	std::atomic<bool>       parkRequested{ false };
+	// Bumped by every UnparkAll. A parked thread waits for a release of ITS
+	// round, not for the request to clear: a ParkAll right after an UnparkAll
+	// sets the request again before a slow sleeper wakes, which left it asleep
+	// in the old round and uncounted by the new one (the park-round timeout).
+	uint64_t                parkReleases = 0;
 	std::vector<ParkedThread> parked;
 	struct ParkParticipant { int id; ParkWakeFn wake; void* user; };
 	std::vector<ParkParticipant> participants;
@@ -1148,9 +1153,10 @@ static void ParkHere(PoolState& P, int index, const char* name)
 	std::unique_lock<std::mutex> lock(P.parkMutex);
 	if (!P.parkRequested.load())
 		return; // released before this thread arrived
+	const uint64_t round = P.parkReleases;
 	P.parked.push_back(std::move(self));
 	P.parkedCV.notify_all();
-	P.parkCV.wait(lock, [&] { return !P.parkRequested.load(); });
+	P.parkCV.wait(lock, [&] { return P.parkReleases != round; });
 }
 
 bool ParkAll(uint32_t timeoutMs)
@@ -1200,6 +1206,7 @@ void UnparkAll()
 	PoolState& P = ActivePool();
 	std::lock_guard<std::mutex> lock(P.parkMutex);
 	P.parkRequested = false;
+	P.parkReleases++;
 	P.parked.clear();
 	P.parkCV.notify_all();
 }
