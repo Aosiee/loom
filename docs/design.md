@@ -74,6 +74,27 @@ never delays a zero, and a task that blocks (on anything) never blocks a
 counter it does not itself count toward. Dedicated threads and outside
 threads signal per task. `Signal` called by user code is always immediate.
 
+### Exceptions and cancellation
+
+A task's function runs inside a catch-all (when exceptions are on). The
+first exception from a task that signals a counter is kept on that counter,
+and the counter is marked cancelled; `WaitFor` rethrows it once the count is
+zero. Before running a task, its thread reads the cancelled flag of the
+counter it signals and skips the function if it is set (the task still
+signals). `Cancel` sets that flag. The flag lives on its own cache line with
+the counter's alive flag and generation, away from the count that every
+signal writes, so that check is a read of a line that is rarely written.
+
+### Several dependencies
+
+A task may wait for `waitsFor` and every counter in `waitsForAll`. Its slot
+then holds a count of unmet counters (in the group link, which only a
+runnable task uses). The submitter takes one count of its own, parks the
+slot on each counter that is not yet zero (adding one per counter), then
+drops its own count: the task becomes runnable at once if all were zero.
+Each counter that reaches zero decrements the count for the tasks parked on
+it, and the decrement that takes it to zero queues the task.
+
 ## Queues
 
 AnyWorker work lives in work-stealing deques, one per worker and one for the
@@ -112,6 +133,16 @@ per 32 tasks and spread the rest across the workers' own deques.
 (`PendingTaskCount`, `PoolSnapshot::anyQueueDepth`) count entries, so a
 queued group counts once.
 
+### Priorities
+
+Each deque owner has three deques (High, Normal, Low) and the injection
+queue has one per priority. A thread takes its own High work, then its own
+Normal work; a search takes High work anywhere, then Normal anywhere, then
+Low (its own first). Two pool-wide counts of queued High and Low entries let
+a search skip those queues while they are empty, so Normal work, the
+default, pays nothing for priorities. The main-thread and dedicated queues
+put a High task at the front. Groups are always Normal.
+
 ## Sleeping and waking
 
 Every sleep in loom goes through one `Waiter` per thread, a 32-bit word the
@@ -149,9 +180,39 @@ otherwise it takes one eligible task (main-thread work first on the main
 thread, then its own deque, then the injection queue and the other deques) and
 runs it on its own stack. Only when nothing is eligible does it sleep, as
 above. This is what makes fork-and-join from inside a task safe: the waiter
-never idles a thread while the work it waits for is queued. A helper takes
-any eligible task, not only its own subtree, so a wait can run unrelated
-work.
+never idles a thread while the work it waits for is queued. Outside an
+isolated region a helper takes any eligible task, not only its own subtree,
+so a wait can run unrelated work; inside one it runs only the region's (see
+Isolation).
+
+### Isolation
+
+`Isolated(fn)` gives the calling thread a fresh 16-bit region tag for the
+duration of `fn`. Every task records the tag of the thread that submitted
+it, and a thread running a task takes that task's tag, so a region's tasks
+and their descendants share it. A wait whose thread has a tag helps only
+with tasks of that tag, and only from its own queues: entries of other
+regions it pops are pushed to the injection queue for the other workers, and
+it never steals. It sleeps registered on its counter (and its main-thread or
+dedicated queue) but not as a helper for pool work, since none would be its
+own. Without workers a region does not isolate: no other thread could run
+the work it would set aside.
+
+## Parallel loops
+
+`ParallelFor` with a chunk size cuts the range into fixed chunks, one task
+each, pushed as one batch. With chunk size 0 it chunks automatically: one
+piece per thread to start with, each working through its range a grain
+(about 1/64 of its share) at a time and splitting off half of what is left
+whenever a worker is idle or searching. Completion is counted in items, by
+an explicit signal per grain, so a split needs no counter increment, and a
+cancelled count (a piece threw) makes the other pieces signal the rest and
+stop.
+
+`ParallelReduce` uses fixed chunks whose size depends only on the range (and
+the chunk size, if given), keeps one partial per chunk, and folds the
+partials in index order on the calling thread. Nothing about the result
+depends on timing or the number of workers.
 
 ## Thread identity
 
@@ -171,7 +232,10 @@ data no thread may be running, such as a live code patch.
 
 ## Shutdown
 
-`Shutdown` drains every queue (a worker exits only after a full search finds
-nothing), joins the workers and dedicated threads, and asserts nothing was
-abandoned. It is idempotent, and the `Pool` destructor
+`Shutdown` drains first: with every thread still running, the calling
+thread helps (main-thread work first) until no task is live, so work
+submitted while draining runs and every wait completes. If no task finishes
+for `shutdownTimeoutMs`, it reports how many are left and stops draining.
+Then it stops and joins the workers (each exits after a search finds
+nothing) and the dedicated threads, and asserts nothing was abandoned. It is idempotent, and the `Pool` destructor
 calls it.

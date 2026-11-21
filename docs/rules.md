@@ -31,15 +31,33 @@ state set by whoever ran before it. Pass context through the task's
 ## Determinism is about what, not when
 
 loom guarantees *what* completes (a counter reaches zero when its signallers
-have run). It never guarantees the order tasks run in. Results must not depend
-on scheduling order: give each task its own output slot and combine in a fixed
-order afterwards.
+have run). It never guarantees the order tasks run in, priorities included
+(they decide what is taken next, not when it finishes). Results must not
+depend on scheduling order: give each task its own output slot and combine in
+a fixed order afterwards, which is what `ParallelReduce` does.
 
 ## Shutdown is drain-or-assert
 
-Every submitted task must be able to run before the pool shuts down. Tasks
-still queued, lanes still held, or counters still waited on at `Shutdown()`
-are bugs, and assert.
+`Shutdown()` first runs everything that was submitted, including work those
+tasks submit while it drains, and every wait completes. So every submitted
+task must be able to run: a task waiting on a counter nobody will signal
+stops the drain (after `LoomConfig::shutdownTimeoutMs`), and what is left,
+along with lanes still held, asserts.
+
+## An exception needs a counter to go to
+
+A task's exception is kept on the counter it signals and rethrown by
+`WaitFor` on that counter; it also cancels the counter's tasks that have not
+started. A task that signals no counter has nowhere to send an exception: if
+it throws, the program ends. Give a task that may throw a counter, and wait
+on it.
+
+## An isolated region must not need outside work only it can run
+
+Inside `Isolated(...)`, a wait helps only with the region's own tasks and
+hands anything else to the other workers. If the region's work waits on
+work outside the region, the other threads must be free to run it: an
+isolated wait never will. (With no workers there is no isolation.)
 
 ## Inline callables are small and trivially copyable
 

@@ -39,9 +39,18 @@ loom::ParallelFor(0, meshes.size(), 64, [&](size_t begin, size_t end) {
   threads with their own queue; they can sleep when idle or help the pool.
   **Lanes** (`AcquireLane`) are dedicated threads reserved for one owner.
 - **Counters** are the only synchronisation: a task can signal one when it
-  finishes and wait for one before it may start, so a dependency graph is a
-  set of counters. `WaitFor` either helps (`Help::WhileWaiting`) or blocks
-  (`Help::BlockOnly`).
+  finishes and wait for one or several before it may start, so a dependency
+  graph is a set of counters. `WaitFor` either helps (`Help::WhileWaiting`)
+  or blocks (`Help::BlockOnly`), and rethrows an exception a task of that
+  counter threw. `Cancel` skips a counter's tasks that have not started.
+- **Priorities**: `Priority::High` work runs before Normal, and `Low` only
+  when nothing else is queued.
+- **Isolation** (`Isolated`): a wait inside an isolated region helps only
+  with that region's tasks, so a frame-critical wait never picks up an
+  unrelated long task.
+- **Parallel loops**: `ParallelFor` chunks automatically (or by a chunk size
+  you give), and `ParallelReduce` combines per-chunk results in a fixed
+  order, so the result is the same on every run.
 - **Parking** (`ParkAll` / `UnparkAll`) stops every pool thread at a known
   point with its stack recorded: the hook a live code reloader needs.
 - **Introspection**: `SnapshotThreadStats()` for a thread-pool view, and
