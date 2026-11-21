@@ -1642,6 +1642,22 @@ void PumpMainThreadTasks()
 
 // Rounds of stealing before a worker sleeps: the first spin, the rest yield.
 static constexpr int kSearchRounds = 32;
+
+// Names the calling OS thread. Linux takes at most 15 characters and rejects
+// a longer name outright, so the name is cut to fit (loom's own records keep
+// the full name).
+static void SetOsThreadName(const char* name)
+{
+#if defined(__linux__)
+	if (!name || !*name)
+		return;
+	char shortName[16];
+	std::snprintf(shortName, sizeof(shortName), "%s", name);
+	pthread_setname_np(pthread_self(), shortName);
+#else
+	(void)name;
+#endif
+}
 static constexpr int kSpinRounds = 8;
 
 static uint32_t Search(PoolState& P, WorkerCtx& ctx)
@@ -1686,9 +1702,8 @@ static void WorkerLoop(PoolState& P, WorkerCtx& ctx)
 	static thread_local char t_name[32];
 	std::snprintf(t_name, sizeof(t_name), "loom-worker-%d", index);
 	ThreadStats* stats = RegisterThreadStats(P, index, t_name);
-#if defined(__linux__)
-	if (stats) pthread_setname_np(pthread_self(), stats->name);
-#endif
+	if (stats)
+		SetOsThreadName(stats->name);
 
 	Waiter& w = t_Waiter;
 	// Whether this worker counts in numSearching. Every path out of the
@@ -1840,10 +1855,7 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 	const int index = CurrentThreadIndex(); // reserve this thread's index
 	const char* name = d.name.empty() ? "loom-dedicated" : d.name.c_str();
 	ThreadStats* stats = RegisterThreadStats(P, index, name);
-#if defined(__linux__)
-	if (!d.name.empty())
-		pthread_setname_np(pthread_self(), d.name.c_str());
-#endif
+	SetOsThreadName(d.name.c_str());
 	const bool steals = d.idle == DedicatedConfig::Idle::StealFromPool;
 	Waiter& w = t_Waiter;
 	for (;;)

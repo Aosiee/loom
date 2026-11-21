@@ -18,6 +18,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <pthread.h>
+#endif
+
 namespace loom { namespace tests {
 
 namespace {
@@ -848,6 +852,27 @@ TEST_CASE("loom: slots — recycling and growth under every submitter keep every
 		std::this_thread::yield();
 	CHECK(loom::LiveTaskCount() == 0);
 }
+
+#if defined(__linux__)
+TEST_CASE("loom: thread names — a long name is cut to the OS limit, loom keeps it whole")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	const char* longName = "a-dedicated-thread-name-26";
+	loom::DedicatedId ded = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = longName });
+	char osName[64] = {};
+	loom::ScopedCounter done(1);
+	loom::Submit(loom::TaskDesc{ .fn = [](void* out) { pthread_getname_np(pthread_self(), static_cast<char*>(out), 64); },
+		.userData = osName, .affinity = loom::Affinity::Dedicated, .thread = ded, .signals = done });
+	loom::WaitFor(done);
+	CHECK(std::string(osName) == std::string(longName).substr(0, 15));
+
+	bool statsHaveFullName = false;
+	for (const auto& t : loom::SnapshotThreadStats().threads)
+		statsHaveFullName |= t.name == longName;
+	CHECK_MESSAGE(statsHaveFullName, "the pool's thread stats keep the full name");
+	loom::UnregisterDedicatedThread(ded);
+}
+#endif
 
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
