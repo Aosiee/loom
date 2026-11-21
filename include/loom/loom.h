@@ -78,9 +78,8 @@ struct TaskDesc
 	DedicatedId   thread   = {};        // required iff Dedicated
 	CounterHandle signals  = kInvalidCounter; // decremented by 1 on completion; receives the task's exception
 	CounterHandle waitsFor = kInvalidCounter; // runnable when it hits 0
-	// The app-supplied task metadata,
-	// forwarded verbatim to the profiler zone hook (loom never interprets
-	// it) - the interned name id (0 = unnamed) + the window-slot tag.
+	// Profiler metadata, passed through to the zone hook untouched: an
+	// interned name id (0 = unnamed) and a window-slot tag.
 	uint32_t      nameId   = 0;
 	uint8_t       window   = 0;
 	// More counters to wait for: the task becomes runnable once waitsFor and
@@ -105,14 +104,13 @@ struct LoomConfig
 };
 
 // ---- Lifecycle -------------------------------------------------------------
-// The pool's whole state (task slots,
-// queues, counters, workers, dedicated threads, stats, the profiler hooks)
-// is one PoolState owned by a Pool. The engine's LoomPool subsystem owns the
-// app's (its Init is the only init in an app); a standalone user - the
-// loom/debug_draw suites - owns one explicitly. Constructing a Pool installs
-// it as the ACTIVE pool every free function below resolves and spawns its
-// threads; there is no lazy auto-init (a call with no active pool asserts).
-// One pool at a time.
+// A Pool owns all of loom's state: task slots, queues, counters, workers,
+// dedicated threads, stats and the profiler hooks. In the engine, the LoomPool
+// subsystem owns the app's pool; standalone users (the loom and debug_draw
+// test suites) construct one themselves. Constructing a Pool spawns its
+// threads and installs it as the ACTIVE pool that every free function below
+// uses. There is no lazy init: calling them with no active pool asserts. One
+// pool at a time.
 struct PoolState;
 
 class Pool
@@ -160,6 +158,8 @@ void Submit(F&& fn, const TaskDesc& opts = {})
 		"loom::Submit(F) requires a trivially-copyable callable");
 	static_assert(sizeof(G) <= 48,
 		"loom::Submit(F) callables must fit in 48 bytes");
+	// Materialise the decayed callable, then copy its bytes into the slot
+	// (hence trivially copyable: no constructor runs there).
 	G copy(std::forward<F>(fn));
 	detail::SubmitInlineRaw(&copy, sizeof(G), &detail::InlineTrampoline<G>, opts);
 }
@@ -222,6 +222,7 @@ namespace detail {
 template <typename F> requires std::is_invocable_v<F&&>
 void Isolated(F&& fn)
 {
+	// Restores the outer region even if fn throws.
 	struct Scope
 	{
 		uint16_t outer = detail::BeginIsolation();
@@ -296,6 +297,9 @@ T ParallelReduce(size_t begin, size_t end, size_t chunkSize, T identity, Map&& m
 	if (chunkSize == 0)
 		chunkSize = (n - 1) / 256 + 1;
 	const size_t chunks = (n - 1) / chunkSize + 1;
+	// One slot per fixed chunk, indexed by the chunk's position: each chunk
+	// writes only its own slot, so no locking, and the combine order below is
+	// the index order whichever thread ran what.
 	std::vector<T> partials(chunks, identity);
 	ParallelFor(begin, end, chunkSize, [&](size_t b, size_t e) {
 		partials[(b - begin) / chunkSize] = map(b, e);

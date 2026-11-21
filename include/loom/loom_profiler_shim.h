@@ -1,18 +1,17 @@
 #pragma once
 
-// The loom -> profiler state shim.
+// The loom -> profiler shim.
 //
-// The dependency direction forbids loom including the engine's profiler
-// (loom deps nobody), so the state marks flow through these hooks: loom
-// marks its waits/helping and each task's execution, and an app layer that
-// depends on BOTH (the engine's LoomPool) registers the hooks that forward
-// into the profiler. Null hook = the marks are free no-ops.
+// loom depends on nothing, so it cannot include the engine's profiler.
+// Instead it reports through these hooks: it marks its waits and helping and
+// each task's execution, and a layer that depends on both (the engine's
+// LoomPool) installs hooks that forward to the profiler. With no hook
+// installed, the marks cost one null check.
 //
-// The hooks are members of the ACTIVE
-// pool's state (the old function-local statics here), so a hook is
-// installed after the pool is created and dies with it; installing a
-// non-null hook with no active pool asserts. They stay atomic: the owner
-// unhooks while the workers are still alive.
+// The hooks belong to the active pool: install them after the pool is
+// created; they go away with it. Installing a non-null hook with no active
+// pool asserts. They are atomic because the owner may unhook while the
+// workers are still running.
 
 #include <cstdint>
 
@@ -24,13 +23,11 @@ namespace loom {
 
 	void SetProfilerStateHook(ProfilerStateFn fn);
 
-	// Per-task profiler zones: loom
-	// marks a "Task" zone around each task's execution. The app hook
-	// pairs the profiler's ZoneBegin/ZoneEnd: the BEGIN call returns the
-	// handle the matching END must pass back. Null hook = free no-op.
-	// The task's interned name id
-	// (0 = unnamed - the hook falls back to the generic name) and the
-	// window tag ride alongside, so named, multi-window tasks stay
+	// Per-task zones: loom marks a "Task" zone around each task's execution.
+	// The hook maps these onto the profiler's ZoneBegin/ZoneEnd: the begin
+	// call returns a handle, and loom passes it back with the matching end.
+	// The task's name id (0 = unnamed; the hook falls back to `name`) and
+	// window tag come along, so named tasks from different windows stay
 	// distinguishable in the timeline.
 	using ProfilerZoneFn = uint64_t (*)(int threadIndex, uint32_t nameId, uint8_t window, const char* name, bool begin, uint64_t handle);
 

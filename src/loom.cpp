@@ -43,8 +43,11 @@ namespace loom {
 //     in the idle list, so new work wakes them; a waiter also registers on its
 //     counter (and on the main or dedicated queue it may run from).
 
+// "No slot": an empty queue, the end of a list, an empty free stack.
 static constexpr uint32_t kNoSlot = ~0u;
 
+// A spin-wait hint: PAUSE on x86 (backs off the pipeline and frees the core
+// for its hyperthread sibling), YIELD on ARM.
 static inline void CpuRelax()
 {
 #if defined(__x86_64__) || defined(__i386__)
@@ -91,6 +94,9 @@ static_assert(offsetof(TaskSlot, nextBatch) + sizeof(uint32_t) <= 48 && offsetof
 static_assert(offsetof(TaskSlot, batchCount) == 40 && offsetof(TaskSlot, nextBatch) == 44,
 	"the free-batch list bytes [0, 40) and [48, 64) hold no free-list field");
 
+// A slot index is (chunk << 12) | offset. Chunks are allocated whole and never
+// freed or moved, so a slot's address is stable for the pool's lifetime and
+// a thread can hold a TaskSlot& without a lock.
 static constexpr uint32_t kSlotChunkBits = 12;
 static constexpr uint32_t kSlotChunkSize = 1u << kSlotChunkBits;
 static constexpr uint32_t kMaxSlotChunks = 1024; // 4M slots
@@ -159,6 +165,10 @@ static void Wake(Waiter& w, uint32_t why)
 	FutexWakeOne(w.word);
 }
 
+// The caller arms the word (kArmed), registers wherever a waker will look,
+// re-checks its condition, and only then sleeps here. A wake that lands
+// between the re-check and the futex call is not lost: FUTEX_WAIT returns at
+// once when the word is no longer kArmed. The loop absorbs spurious wakeups.
 static void SleepOn(Waiter& w)
 {
 	while (w.word.load(std::memory_order_acquire) == kArmed)
@@ -208,15 +218,20 @@ public:
 		m_Bottom.store(b + 1, std::memory_order_release);
 	}
 
-	// Owner only.
+	// Owner only. LIFO: the newest entry, still warm in this core's cache.
 	uint32_t Pop()
 	{
 		const int64_t b = m_Bottom.load(std::memory_order_relaxed) - 1;
 		Buffer* a = m_Buffer.load(std::memory_order_relaxed);
+		// Claim the bottom element BEFORE reading top. With both seq_cst, this
+		// store and a thief's top CAS are totally ordered: either the thief
+		// sees the lowered bottom and backs off, or we see its raised top.
+		// Only for the very last element can both get past that, hence the CAS.
 		m_Bottom.store(b, std::memory_order_seq_cst);
 		int64_t t = m_Top.load(std::memory_order_seq_cst);
 		if (t > b)
 		{
+			// Empty: undo the claim.
 			m_Bottom.store(b + 1, std::memory_order_release);
 			return kNoSlot;
 		}
@@ -231,13 +246,19 @@ public:
 		return v;
 	}
 
-	// Any thread. kNoSlot when empty or when another thief won the element.
+	// Any thread. FIFO: the oldest entry, which in a recursive split is the
+	// biggest piece of work. kNoSlot when empty or when another thief (or the
+	// owner's Pop of the last element) won the element.
 	uint32_t Steal()
 	{
+		// Top before bottom: the mirror of Pop's bottom-then-top.
 		int64_t t = m_Top.load(std::memory_order_seq_cst);
 		const int64_t b = m_Bottom.load(std::memory_order_seq_cst);
 		if (t >= b)
 			return kNoSlot;
+		// Read the value before the CAS: once top moves past it, the owner may
+		// overwrite that cell. A stale buffer is fine (old buffers stay alive),
+		// and a value read from it is used only if the CAS proves it current.
 		Buffer* a = m_Buffer.load(std::memory_order_acquire);
 		const uint32_t v = a->Get(t);
 		if (!m_Top.compare_exchange_strong(t, t + 1, std::memory_order_seq_cst, std::memory_order_relaxed))
@@ -245,6 +266,8 @@ public:
 		return v;
 	}
 
+	// Empty and Size are snapshots: another thread may push or take between
+	// the two loads. Fine for "is there work worth looking for" and for stats.
 	bool Empty() const
 	{
 		return m_Bottom.load(std::memory_order_seq_cst) <= m_Top.load(std::memory_order_seq_cst);
@@ -257,6 +280,10 @@ public:
 	}
 
 private:
+	// A ring indexed by the ever-growing top/bottom positions; the capacity is
+	// a power of two, so a position maps to its cell with a mask. Cells are
+	// relaxed atomics only so that a thief's racy read is not a data race; the
+	// top/bottom operations above order them.
 	struct Buffer
 	{
 		explicit Buffer(int64_t c) : capacity(c), mask(c - 1), data(new std::atomic<uint32_t>[(size_t)c]) {}
@@ -267,6 +294,8 @@ private:
 		std::unique_ptr<std::atomic<uint32_t>[]> data;
 	};
 
+	// Separate lines: thieves write top, the owner writes bottom on every
+	// push and pop.
 	alignas(64) std::atomic<int64_t> m_Top{ 0 };
 	alignas(64) std::atomic<int64_t> m_Bottom{ 0 };
 	std::atomic<Buffer*> m_Buffer{ nullptr };
@@ -324,6 +353,8 @@ struct alignas(64) WorkerCtx
 	// This thread's share of the live-task count: +1 per task it submits, -1
 	// per task it finishes. Only the owner writes it; LiveTaskCount sums them.
 	alignas(64) std::atomic<int64_t> live{ 0 };
+	// xorshift state for picking a first steal victim. Seeded per worker so
+	// the thieves start their scans at different deques.
 	uint32_t rng = 0x9E3779B9u;
 	bool     isMain = false;
 	// Free task slots this thread may reuse without touching the shared
@@ -412,7 +443,8 @@ struct PoolState
 	DedicatedId             nextDedicatedId = 0;
 	std::atomic<int>        lanesHeld{ 0 };
 
-	// Thread stats (the pool visualizer).
+	// Thread stats (the pool visualizer). Rows are only ever added until
+	// Shutdown, so t_ThreadStats pointers stay valid while their thread runs.
 	std::mutex              statsMutex;
 	std::vector<std::unique_ptr<PaddedStats>> threadStats;
 	std::vector<std::thread> workers;
@@ -497,11 +529,16 @@ static uint16_t ActiveIsolation(PoolState& P)
 	return P.workerCount > 0 ? t_Isolation : 0;
 }
 
+// The live-task count is sharded so that submitting and finishing write only
+// the thread's own line. A task submitted on one thread and finished on
+// another leaves one shard +1 and the other -1; only the sum means anything.
 static std::atomic<int64_t>& LiveShard(PoolState& P, WorkerCtx* ctx)
 {
 	return ctx ? ctx->live : P.externalLive;
 }
 
+// Not a snapshot: the shards are read one after another while tasks move, so
+// the sum can be briefly off (never below zero once everything settles).
 static int64_t LiveTasksIn(PoolState& P)
 {
 	int64_t n = P.externalLive.load(std::memory_order_acquire);
@@ -523,7 +560,9 @@ static uint64_t MarkProfilerZone(PoolState& P, int threadIndex, uint32_t nameId,
 	return 0;
 }
 
-// Counter handle packing: generation in the high bits, index low.
+// Counter handle packing: a 20-bit table index (up to ~1M counters) and a
+// 12-bit generation above it. Destroying a counter bumps its generation, so
+// an old handle to a reused index no longer resolves.
 static constexpr uint32_t kCounterGenBits = 20;
 static constexpr uint32_t kCounterIndexMask = (1u << kCounterGenBits) - 1;
 
@@ -534,6 +573,10 @@ static CounterHandle PackCounter(uint32_t index, uint32_t generation)
 static uint32_t CounterIndex(CounterHandle h) { return h & kCounterIndexMask; }
 static uint32_t CounterGeneration(CounterHandle h) { return h >> kCounterGenBits; }
 
+// Handle -> state, or null for a stale or invalid handle. The checks are
+// relaxed and lock-free: they catch misuse (asserted by the callers), they do
+// not make a racing Destroy safe. Using a counter while another thread
+// destroys it is a bug either way.
 static CounterState* ResolveCounter(PoolState& P, CounterHandle h)
 {
 	if (h == kInvalidCounter) return nullptr;
@@ -575,11 +618,17 @@ static TaskSlot& Slot(PoolState& P, uint32_t i)
 // costs one cache miss (the head's first line, which the submit writes
 // anyway), where walking a chain was one DEPENDENT miss per slot, on lines
 // another core (often on the other die) wrote last. A thread with a cache
-// trades a whole batch per CAS; others trade one slot. The stack's head
-// carries a 32-bit tag against ABA.
+// trades a whole batch per CAS; others trade one slot.
+//
+// The stack's head carries a 32-bit tag against ABA: without it, a popper
+// that read head A and next B could be preempted while A is popped, B is
+// popped, and A is pushed back; its CAS would then succeed and install B,
+// which is no longer free. Every push and pop bumps the tag, so that CAS fails.
 
 static uint8_t* SlotBytes(TaskSlot& s) { return reinterpret_cast<uint8_t*>(&s); }
 
+// Writes a batch head: its count, and the other members' indices into the
+// two free regions of its first line (low first, then from byte 48).
 static void SetBatch(TaskSlot& head, const uint32_t* rest, uint32_t restCount)
 {
 	head.batchCount = 1 + restCount;
@@ -613,7 +662,9 @@ static void PushBatch(PoolState& P, const uint32_t* slots, uint32_t n)
 	PushBatches(P, slots[0], slots[0]);
 }
 
-// The head of a batch, or kNoSlot when the stack is empty.
+// The head of a batch, or kNoSlot when the stack is empty. Acquire on success
+// pairs with the pusher's release, so the batch list written before the push
+// is visible to TakeBatch.
 static uint32_t PopBatch(PoolState& P)
 {
 	uint64_t head = P.freeHead.load(std::memory_order_acquire);
@@ -671,7 +722,9 @@ static void AddSlotChunkLocked(PoolState& P)
 	PushBatches(P, base, lastHead);
 }
 
-// A batch off the shared stack, growing the pool (with a warning) when it is empty.
+// A batch off the shared stack, growing the pool (with a warning) when it is
+// empty. The emptiness check is repeated under growMutex so that several
+// threads finding it empty at once grow it once, not once each.
 static uint32_t PopBatchOrGrow(PoolState& P)
 {
 	for (;;)
@@ -688,6 +741,8 @@ static uint32_t PopBatchOrGrow(PoolState& P)
 	}
 }
 
+// A free slot for a new task. The common case (a worker or the main thread
+// with slots cached) is a plain array pop: no atomics at all.
 static uint32_t AllocateSlot(PoolState& P, WorkerCtx* ctx)
 {
 	if (ctx)
@@ -722,6 +777,9 @@ static void FlushSlotCache(PoolState& P, WorkerCtx& ctx)
 		SpillSlotCache(P, ctx, kSlotBatch);
 }
 
+// A finished task's slot. A full cache spills one batch, not all of it, so a
+// thread that alternates between submitting and finishing keeps a batch on
+// hand instead of trading with the shared stack every time.
 static void ReleaseSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 {
 	if (ctx)
@@ -794,6 +852,7 @@ Pool::~Pool()
 	Shutdown();
 }
 
+// Empties the idle list, waking everyone on it to re-check (Shutdown, ParkAll).
 static void WakeAllIdle(PoolState& P)
 {
 	std::lock_guard<std::mutex> lock(P.idleMutex);
@@ -922,6 +981,8 @@ int WorkerCount()
 	return pool ? pool->workerCount : 0;
 }
 
+// Assigned on a thread's first call and kept for the thread's life. No lock:
+// only the thread itself ever writes its own t_index.
 int CurrentThreadIndex()
 {
 	static thread_local int t_index = -1;
@@ -945,6 +1006,8 @@ static int PoolQueueDepth(PoolState& P)
 	return n;
 }
 
+// Holds at most dedicatedMutex plus one thread's mutex at a time, in the order
+// EnqueueSlot takes them.
 static int PendingTaskCountIn(PoolState& P)
 {
 	int n = PoolQueueDepth(P);
@@ -969,6 +1032,8 @@ int PendingTaskCount()
 
 // ---- Finding work and the idle list ------------------------------------------------------
 
+// A sleeper's re-check after it registered as idle. seq_cst so it cannot be
+// ordered before that registration (see WakeForWork for the pairing).
 static bool HasPoolWork(PoolState& P)
 {
 	if (P.injectSize.load(std::memory_order_seq_cst) > 0)
@@ -993,6 +1058,8 @@ static void NoteTaken(PoolState& P, Priority priority)
 		P.queuedLow.fetch_sub(1, std::memory_order_relaxed);
 }
 
+// The oldest injected entry of this priority. The size check keeps an empty
+// queue off the lock entirely: every search on every worker passes through here.
 static uint32_t PopInjected(PoolState& P, Priority priority)
 {
 	if (P.injectSize.load(std::memory_order_relaxed) <= 0)
@@ -1044,6 +1111,9 @@ static uint32_t PopOwn(PoolState& P, WorkerCtx& ctx)
 // then Low (this thread's own first).
 static uint32_t StealOnce(PoolState& P, WorkerCtx* self)
 {
+	// A random first victim (xorshift32), so thieves spread over the deques
+	// instead of all hammering the main thread's first. Threads without a
+	// context (dedicated, outside) keep their own state.
 	static thread_local uint32_t t_rng = 0x2545F491u;
 	uint32_t& rng = self ? self->rng : t_rng;
 	rng ^= rng << 13;
@@ -1065,6 +1135,8 @@ static uint32_t StealOnce(PoolState& P, WorkerCtx* self)
 	return slot;
 }
 
+// The idle list is a plain vector under a mutex: it changes only when a
+// thread goes to sleep or is woken, never on the submit/run fast path.
 static void RegisterIdle(PoolState& P, Waiter& w)
 {
 	std::lock_guard<std::mutex> lock(P.idleMutex);
@@ -1092,6 +1164,7 @@ static void WakeIdle(PoolState& P, int max, bool onlyIfNoSearcher)
 	if (onlyIfNoSearcher && P.numSearching.load(std::memory_order_seq_cst) > 0)
 		return;
 	int woken = 0;
+	// From the back: the most recent sleeper, whose cache is likeliest still warm.
 	for (size_t i = P.idle.size(); i-- > 0 && woken < max;)
 	{
 		Waiter* w = P.idle[i];
@@ -1210,8 +1283,6 @@ static bool EnqueueSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	return false;
 }
 
-// Parks the slot on its waitsFor counter, or enqueues it. True when it went
-// into the pool (AnyWorker, runnable now).
 // A parked task's count of unmet dependencies. It lives in groupNext, which
 // only a runnable task uses (a task with dependencies is never grouped).
 static std::atomic_ref<uint32_t> PendingDeps(PoolState& P, uint32_t slot)
@@ -1254,11 +1325,15 @@ static bool DispatchSlot(PoolState& P, uint32_t slot, const TaskDesc& desc, Work
 	park(desc.waitsFor);
 	for (CounterHandle h : desc.waitsForAll)
 		park(h);
+	// Drop our hold. Whoever takes the count to zero (us, or the last
+	// counter's final signal) enqueues the task, exactly once.
 	if (deps.fetch_sub(1, std::memory_order_acq_rel) == 1)
 		return EnqueueSlot(P, slot, ctx); // every counter was already zero
 	return false;
 }
 
+// Allocates a slot and fills it from the description; does not queue it.
+// The task counts as live from here.
 static uint32_t PrepareSlot(PoolState& P, const TaskDesc& desc, WorkerCtx* ctx)
 {
 	assert((desc.affinity != Affinity::Dedicated) || desc.thread != kInvalidDedicated);
@@ -1345,6 +1420,9 @@ void Submit(std::span<const TaskDesc> descs)
 
 namespace detail {
 
+// Submit(F): the callable's bytes are copied into the slot itself, and the
+// task's userData points back at them, so the callable lives exactly as long
+// as the slot (RunSlot releases the slot only after the call returns).
 void SubmitInlineRaw(const void* data, size_t size, void (*trampoline)(void*), const TaskDesc& opts)
 {
 	PoolState& P = ActivePool();
@@ -1366,6 +1444,8 @@ void SubmitInlineRaw(const void* data, size_t size, void (*trampoline)(void*), c
 
 namespace {
 
+	// One fixed chunk. The records live in a vector on the caller's stack
+	// frame, which outlives the chunks because ParallelFor waits for them.
 	struct ParallelRange { size_t begin = 0, end = 0; void* userData = nullptr; ParallelForFn fn = nullptr; };
 
 	void ParallelRangeTrampoline(void* p)
@@ -1394,6 +1474,8 @@ namespace {
 	};
 	static_assert(sizeof(AutoRange) <= 48 && std::is_trivially_copyable_v<AutoRange>, "an AutoRange travels inline in a task slot");
 
+	// Relaxed and racy on purpose: a wrong answer costs one needless split or
+	// one grain of delay, while the check runs once per grain on every piece.
 	bool SomeoneCouldTakeWork(PoolState& P)
 	{
 		return P.numIdle.load(std::memory_order_relaxed) > 0 || P.numSearching.load(std::memory_order_relaxed) > 0;
@@ -1402,6 +1484,8 @@ namespace {
 	void AutoRangeRun(AutoRange r);
 	void AutoRangeTask(void* p) { AutoRangeRun(*static_cast<AutoRange*>(p)); }
 
+	// `r` is a local copy: the piece shrinks as it runs and splits, and the
+	// record it came from is left untouched.
 	void AutoRangeRun(AutoRange r)
 	{
 		PoolState& P = ActivePool();
@@ -1455,6 +1539,10 @@ static void ParallelForAuto(PoolState& P, size_t begin, size_t end, ParallelForF
 		ParallelForFixed(P, begin, end, (n - 1) / (threads * 16) + 1, fn, userData);
 		return;
 	}
+	// About 64 grains per thread: small enough that an idle worker waits at
+	// most a sixty-fourth of a thread's share for a split, big enough that the
+	// per-grain check is noise. A range smaller than the thread count gets one
+	// piece per index.
 	const size_t grain = std::max<size_t>(1, n / (threads * 64));
 	const size_t pieces = std::min(threads, (n - 1) / grain + 1);
 	const CounterHandle items = CreateCounter((int)n);
@@ -1521,6 +1609,8 @@ static void ParallelForFixed(PoolState& P, size_t begin, size_t end, size_t chun
 }
 
 // ---- Lanes ---------------------------------------------------------------------
+// A lane is a sleeping (never stealing) dedicated thread plus a held count,
+// so Shutdown can tell a forgotten lane from an ordinary dedicated thread.
 
 LaneId AcquireLane(const char* name)
 {
@@ -1649,6 +1739,8 @@ static void SignalCounter(PoolState& P, CounterHandle h, int n)
 
 namespace detail {
 
+// A region is just a tag on the thread: PrepareSlot stamps it on every task
+// submitted from here, and TryHelpIn reads it to filter what a wait may run.
 uint16_t BeginIsolation()
 {
 	PoolState& P = ActivePool();
@@ -1667,6 +1759,8 @@ void EndIsolation(uint16_t outer)
 
 } // namespace detail
 
+// Only a flag: RunSlot checks it before calling a task's function, so the
+// skipped tasks still flow through the queues and signal as usual.
 void Cancel(CounterHandle h)
 {
 	CounterState* c = ResolveCounter(ActivePool(), h);
@@ -1701,6 +1795,8 @@ static void SleepOnCounter(PoolState& P, CounterState& c, bool help)
 {
 	Waiter& w = t_Waiter;
 	w.isWorker = false;
+	// Armed before any registration: a waker may fire the moment we appear in
+	// a list, and that wake must not be overwritten.
 	w.word.store(kArmed, std::memory_order_relaxed);
 	{
 		std::lock_guard<std::mutex> lock(c.mutex);
@@ -1708,6 +1804,10 @@ static void SleepOnCounter(PoolState& P, CounterState& c, bool help)
 			return;
 		c.waiters.push_back(&w);
 	}
+
+	// Register everywhere that could make this thread useful, re-checking each
+	// source after registering on it. One Waiter serves every list; a second
+	// waker before we unregister only sets the word again, which is harmless.
 
 	bool ready = false;
 	bool inMain = false, inIdle = false;
@@ -1748,6 +1848,8 @@ static void SleepOnCounter(PoolState& P, CounterState& c, bool help)
 	if (!ready)
 		SleepOn(w);
 
+	// Unregister from every list under its lock, whether or not that list's
+	// waker fired: after this, nobody can still hold a pointer to `w`.
 	{
 		std::lock_guard<std::mutex> lock(c.mutex);
 		auto it = std::find(c.waiters.begin(), c.waiters.end(), &w);
@@ -1838,6 +1940,8 @@ static uint32_t PopFront(std::mutex& m, std::deque<uint32_t>& q)
 	return slot;
 }
 
+// The oldest entry of a locked queue that belongs to `region`. A linear scan:
+// main and dedicated queues are short, and only isolated waits come here.
 static uint32_t PopFrontInRegion(PoolState& P, std::mutex& m, std::deque<uint32_t>& q, uint16_t region)
 {
 	std::lock_guard<std::mutex> lock(m);
@@ -1858,6 +1962,9 @@ static uint32_t PopFrontInRegion(PoolState& P, std::mutex& m, std::deque<uint32_
 // where the other workers take them: an isolated wait never runs them.
 static uint32_t PopOwnInRegion(PoolState& P, WorkerCtx& ctx, uint16_t region)
 {
+	// Bounded, so a wait never spends long moving foreign work about. Past
+	// that, it leaves the rest to the other workers (who may steal the
+	// region's tasks) and sleeps.
 	for (int moved = 0; moved < 64; moved++)
 	{
 		uint32_t entry = PopOwn(P, ctx);
@@ -1873,6 +1980,9 @@ static uint32_t PopOwnInRegion(PoolState& P, WorkerCtx& ctx, uint16_t region)
 	return kNoSlot;
 }
 
+// One task for a waiting (or explicitly helping) thread. Sources in order:
+// the thread's own pinned queue (main or dedicated), its own deques, then a
+// steal. An isolated wait narrows all of that to its region, and never steals.
 static bool TryHelpIn(PoolState& P)
 {
 	if (P.stop.load(std::memory_order_relaxed)) return false; // the workers are going
@@ -1982,6 +2092,8 @@ static void RecordTaskException(PoolState& P, CounterHandle signals, std::except
 }
 #endif
 
+// Calls the task, catching anything it throws so the worker survives and the
+// exception reaches the task's counter.
 static void RunTaskFn(PoolState& P, TaskFn fn, void* userData, CounterHandle signals)
 {
 #if defined(__cpp_exceptions)
@@ -2033,6 +2145,8 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	t_Isolation = outerRegion;
 	MarkProfilerZone(P, threadIndex, nameId, window, "Task", false, zone);
 
+	// Live count and slot are given back before the signal: once a WaitFor on
+	// this counter returns, the task no longer counts as live.
 	LiveShard(P, ctx).fetch_sub(1, std::memory_order_relaxed);
 	ReleaseSlot(P, slot, ctx);
 	if (signals == kInvalidCounter)
@@ -2070,6 +2184,8 @@ void PumpMainThreadTasks()
 	if (!pool || !pool->running) return;
 	PoolState& P = *pool;
 	WorkerCtx* ctx = CurrentCtx(P);
+	// Bounded: a main-thread task that resubmits itself must not trap the
+	// frame loop here forever.
 	for (int guard = 0; guard < 1000000; guard++)
 	{
 		const uint32_t slot = PopFront(P.mainMutex, P.mainQueue);
@@ -2082,8 +2198,11 @@ void PumpMainThreadTasks()
 
 // ---- Workers --------------------------------------------------------------------------
 
-// Rounds of stealing before a worker sleeps: the first spin, the rest yield.
+// Rounds of stealing before a worker sleeps: the first kSpinRounds spin, the
+// rest yield. A futex sleep and wake costs several microseconds, so a worker
+// that finds work again within a few rounds is cheaper than one that slept.
 static constexpr int kSearchRounds = 32;
+static constexpr int kSpinRounds = 8;
 
 // Names the calling OS thread. Linux takes at most 15 characters and rejects
 // a longer name outright, so the name is cut to fit (loom's own records keep
@@ -2100,8 +2219,9 @@ static void SetOsThreadName(const char* name)
 	(void)name;
 #endif
 }
-static constexpr int kSpinRounds = 8;
 
+// A worker with nothing of its own: steal for a while before giving up.
+// kNoSlot means "go to sleep" (or park, when a park is requested).
 static uint32_t Search(PoolState& P, WorkerCtx& ctx)
 {
 	for (int round = 0; round < kSearchRounds; round++)
@@ -2132,6 +2252,8 @@ static uint32_t Search(PoolState& P, WorkerCtx& ctx)
 	return kNoSlot;
 }
 
+// A pool worker: its own deque, then a search, then sleep. Exits once `stop`
+// is set and a full search comes up empty.
 static void WorkerLoop(PoolState& P, WorkerCtx& ctx)
 {
 	if (P.onThreadStart)
@@ -2223,6 +2345,8 @@ static void WorkerLoop(PoolState& P, WorkerCtx& ctx)
 
 // ---- Thread stats (the pool visualizer) ------------------------------------------------
 
+// The row for a thread index, created on first use. A thread index is never
+// reused, so an existing row with the index is this thread's own.
 static ThreadStats* RegisterThreadStats(PoolState& P, int index, const char* name)
 {
 	std::lock_guard<std::mutex> lock(P.statsMutex);
@@ -2274,7 +2398,9 @@ PoolSnapshot SnapshotThreadStats()
 				std::lock_guard<std::mutex> dl(d->mutex);
 				depth = (int)d->queue.size();
 			}
-			// Attach the dedicated queue depth to its stats row.
+			// Attach the dedicated queue depth to its stats row, matched by
+			// name (the registry does not record thread indices). Two threads
+			// with the same name both show the last one's depth.
 			for (auto& t : snap.threads)
 				if (!t.name.empty() && t.name == (d->name.empty() ? "loom-dedicated" : d->name))
 					t.queueDepth = depth;
@@ -2291,6 +2417,9 @@ PoolSnapshot SnapshotThreadStats()
 
 // ---- Dedicated threads --------------------------------------------------------------------
 
+// A dedicated thread: its own queue first, then (if configured) the pool.
+// No deque of its own, so anything it submits goes through the injection
+// queue. Exits when unregistered, once its own queue is empty.
 static void DedicatedLoop(PoolState& P, DedicatedState& d)
 {
 	if (P.onThreadStart)
@@ -2418,6 +2547,11 @@ long CurrentOsThreadId()
 #endif
 }
 
+// A frame-pointer walk: with frame pointers, each frame begins with
+// { caller's frame pointer, return address }. The walk stays inside this
+// thread's stack bounds and stops at the first frame that does not point
+// further up the stack, so a frame without a frame pointer ends it instead of
+// sending it into garbage.
 void CaptureReturnAddresses(std::vector<uintptr_t>& out, size_t max)
 {
 #if defined(__linux__)
@@ -2447,6 +2581,9 @@ void CaptureReturnAddresses(std::vector<uintptr_t>& out, size_t max)
 #endif
 }
 
+// A pool thread's (or participant's) side of a park: record where it is,
+// check in, and block until the round it joined is released. The stack is
+// captured before taking the lock, so ParkAll's caller can read it at once.
 static void ParkHere(PoolState& P, int index, const char* name)
 {
 	ParkedThread self;
@@ -2463,6 +2600,8 @@ static void ParkHere(PoolState& P, int index, const char* name)
 	P.parkCV.wait(lock, [&] { return P.parkReleases != round; });
 }
 
+// Request, wake everyone who might be asleep, then wait for every thread to
+// check in. Running threads see the request at their next loop top.
 bool ParkAll(uint32_t timeoutMs)
 {
 	PoolState& P = ActivePool();
