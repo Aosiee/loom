@@ -68,7 +68,7 @@ struct alignas(64) TaskSlot
 	uint8_t       window   = 0;                       // 17
 	DedicatedId   thread   = 0;                       // 20
 	CounterHandle signals  = kInvalidCounter;         // 24
-	CounterHandle waitsFor = kInvalidCounter;         // 28
+	Priority      priority = Priority::Normal;        // 28 (29-31 free)
 	uint32_t      nameId   = 0;                       // 32
 	// The next task of a group (a queue entry with kGroupBit), written by the
 	// submitter before the push and read by whoever takes the group. While a
@@ -314,7 +314,9 @@ struct DedicatedState
 
 struct alignas(64) WorkerCtx
 {
-	WorkDeque deque;
+	WorkDeque deque; // Normal priority (and every group)
+	WorkDeque high;
+	WorkDeque low;
 	// This thread's share of the live-task count: +1 per task it submits, -1
 	// per task it finishes. Only the owner writes it; LiveTaskCount sums them.
 	alignas(64) std::atomic<int64_t> live{ 0 };
@@ -373,8 +375,14 @@ struct PoolState
 
 	// The injection queue: AnyWorker work from threads without a deque.
 	alignas(64) std::mutex  injectMutex;
-	std::deque<uint32_t>    injectQueue;
-	std::atomic<int>        injectSize{ 0 };
+	std::deque<uint32_t>    injectQueue[3]; // by Priority
+	std::atomic<int>        injectSize{ 0 }; // all three
+
+	// High and Low entries queued anywhere (deques and injection): a search
+	// looks at those queues only when there is something in them, so Normal
+	// work, the default, pays nothing for priorities.
+	alignas(64) std::atomic<int> queuedHigh{ 0 };
+	alignas(64) std::atomic<int> queuedLow{ 0 };
 
 	// Live tasks submitted or finished by threads without a deque.
 	alignas(64) std::atomic<int64_t> externalLive{ 0 };
@@ -850,11 +858,15 @@ void Pool::Shutdown()
 	// Drain-or-assert: the queues must be empty at shutdown.
 	{
 		std::lock_guard<std::mutex> lock(P.injectMutex);
-		assert(P.injectQueue.empty() && "AnyWorker tasks abandoned at shutdown");
+		for (auto& q : P.injectQueue)
+		{
+			assert(q.empty() && "AnyWorker tasks abandoned at shutdown");
+			(void)q;
+		}
 	}
 	for (WorkerCtx* c : P.deques)
 	{
-		assert(c->deque.Empty() && "AnyWorker tasks abandoned at shutdown");
+		assert(c->deque.Empty() && c->high.Empty() && c->low.Empty() && "AnyWorker tasks abandoned at shutdown");
 		(void)c;
 	}
 	{
@@ -906,7 +918,7 @@ static int PoolQueueDepth(PoolState& P)
 {
 	int n = P.injectSize.load(std::memory_order_acquire);
 	for (WorkerCtx* c : P.deques)
-		n += c->deque.Size();
+		n += c->deque.Size() + c->high.Size() + c->low.Size();
 	return n;
 }
 
@@ -939,47 +951,95 @@ static bool HasPoolWork(PoolState& P)
 	if (P.injectSize.load(std::memory_order_seq_cst) > 0)
 		return true;
 	for (WorkerCtx* c : P.deques)
-		if (!c->deque.Empty())
+		if (!c->deque.Empty() || !c->high.Empty() || !c->low.Empty())
 			return true;
 	return false;
 }
 
-static uint32_t PopInjected(PoolState& P)
+static WorkDeque& DequeFor(WorkerCtx& c, Priority priority)
+{
+	return priority == Priority::High ? c.high : priority == Priority::Low ? c.low : c.deque;
+}
+
+// Called after an entry of this priority left a queue.
+static void NoteTaken(PoolState& P, Priority priority)
+{
+	if (priority == Priority::High)
+		P.queuedHigh.fetch_sub(1, std::memory_order_relaxed);
+	else if (priority == Priority::Low)
+		P.queuedLow.fetch_sub(1, std::memory_order_relaxed);
+}
+
+static uint32_t PopInjected(PoolState& P, Priority priority)
 {
 	if (P.injectSize.load(std::memory_order_relaxed) <= 0)
 		return kNoSlot;
 	std::lock_guard<std::mutex> lock(P.injectMutex);
-	if (P.injectQueue.empty())
+	auto& q = P.injectQueue[(int)priority];
+	if (q.empty())
 		return kNoSlot;
-	const uint32_t slot = P.injectQueue.front();
-	P.injectQueue.pop_front();
+	const uint32_t slot = q.front();
+	q.pop_front();
 	P.injectSize.fetch_sub(1, std::memory_order_relaxed);
 	return slot;
 }
 
-// One pass over the injection queue and every other deque, from a random victim.
+// The injection queue, then every other thread's deque of this priority,
+// from a random victim.
+static uint32_t StealAt(PoolState& P, WorkerCtx* self, Priority priority, size_t start)
+{
+	uint32_t slot = PopInjected(P, priority);
+	const size_t n = P.deques.size();
+	for (size_t k = 0; k < n && slot == kNoSlot; k++)
+	{
+		WorkerCtx* victim = P.deques[(start + k) % n];
+		if (victim != self)
+			slot = DequeFor(*victim, priority).Steal();
+	}
+	if (slot != kNoSlot)
+		NoteTaken(P, priority);
+	return slot;
+}
+
+// This thread's own work: High first, then Normal. (Its Low work waits for
+// StealOnce, which takes Low only when nothing else is queued.)
+static uint32_t PopOwn(PoolState& P, WorkerCtx& ctx)
+{
+	if (P.queuedHigh.load(std::memory_order_relaxed) > 0)
+	{
+		const uint32_t slot = ctx.high.Pop();
+		if (slot != kNoSlot)
+		{
+			NoteTaken(P, Priority::High);
+			return slot;
+		}
+	}
+	return ctx.deque.Pop();
+}
+
+// One pass for work queued elsewhere: High anywhere, then Normal anywhere,
+// then Low (this thread's own first).
 static uint32_t StealOnce(PoolState& P, WorkerCtx* self)
 {
-	const uint32_t injected = PopInjected(P);
-	if (injected != kNoSlot)
-		return injected;
-	const size_t n = P.deques.size();
 	static thread_local uint32_t t_rng = 0x2545F491u;
 	uint32_t& rng = self ? self->rng : t_rng;
 	rng ^= rng << 13;
 	rng ^= rng >> 17;
 	rng ^= rng << 5;
-	const size_t start = rng % n;
-	for (size_t k = 0; k < n; k++)
+	const size_t start = rng % P.deques.size();
+	uint32_t slot = kNoSlot;
+	if (P.queuedHigh.load(std::memory_order_relaxed) > 0)
+		slot = StealAt(P, self, Priority::High, start);
+	if (slot == kNoSlot)
+		slot = StealAt(P, self, Priority::Normal, start);
+	if (slot == kNoSlot && P.queuedLow.load(std::memory_order_relaxed) > 0)
 	{
-		WorkerCtx* victim = P.deques[(start + k) % n];
-		if (victim == self)
-			continue;
-		const uint32_t slot = victim->deque.Steal();
-		if (slot != kNoSlot)
-			return slot;
+		if (self && (slot = self->low.Pop()) != kNoSlot)
+			NoteTaken(P, Priority::Low);
+		else
+			slot = StealAt(P, self, Priority::Low, start);
 	}
-	return kNoSlot;
+	return slot;
 }
 
 static void RegisterIdle(PoolState& P, Waiter& w)
@@ -1056,15 +1116,23 @@ static void WakeForWork(PoolState& P, size_t n)
 
 // ---- Submission -------------------------------------------------------------------
 
-static void PushPool(PoolState& P, uint32_t slot, WorkerCtx* ctx)
+// Queues an entry by its task's priority (a group is always Normal): onto
+// this thread's deque, or the injection queue for a thread without one.
+static void PushPool(PoolState& P, uint32_t entry, WorkerCtx* ctx)
 {
+	const Priority priority = (entry & kGroupBit) ? Priority::Normal : Slot(P, entry).priority;
+	// Counted before it is queued, so a taker never counts it out first.
+	if (priority == Priority::High)
+		P.queuedHigh.fetch_add(1, std::memory_order_relaxed);
+	else if (priority == Priority::Low)
+		P.queuedLow.fetch_add(1, std::memory_order_relaxed);
 	if (ctx)
 	{
-		ctx->deque.Push(slot);
+		DequeFor(*ctx, priority).Push(entry);
 		return;
 	}
 	std::lock_guard<std::mutex> lock(P.injectMutex);
-	P.injectQueue.push_back(slot);
+	P.injectQueue[(int)priority].push_back(entry);
 	P.injectSize.fetch_add(1, std::memory_order_seq_cst);
 }
 
@@ -1081,7 +1149,10 @@ static bool EnqueueSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	case Affinity::MainThread:
 	{
 		std::lock_guard<std::mutex> lock(P.mainMutex);
-		P.mainQueue.push_back(slot);
+		if (t.priority == Priority::High)
+			P.mainQueue.push_front(slot);
+		else
+			P.mainQueue.push_back(slot);
 		if (P.mainWaiter)
 		{
 			Wake(*P.mainWaiter, kWokeRecheck);
@@ -1101,7 +1172,10 @@ static bool EnqueueSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 		if (!d)
 			return false;
 		std::lock_guard<std::mutex> lock(d->mutex);
-		d->queue.push_back(slot);
+		if (t.priority == Priority::High)
+			d->queue.push_front(slot);
+		else
+			d->queue.push_back(slot);
 		if (d->waiter)
 		{
 			Wake(*d->waiter, kWokeRecheck);
@@ -1172,7 +1246,7 @@ static uint32_t PrepareSlot(PoolState& P, const TaskDesc& desc, WorkerCtx* ctx)
 	t.affinity = desc.affinity;
 	t.thread = desc.thread;
 	t.signals = desc.signals;
-	t.waitsFor = desc.waitsFor;
+	t.priority = desc.priority;
 	t.nameId = desc.nameId;
 	t.window = desc.window;
 	LiveShard(P, ctx).fetch_add(1, std::memory_order_relaxed);
@@ -1226,7 +1300,7 @@ void Submit(std::span<const TaskDesc> descs)
 	};
 	for (const TaskDesc& d : descs)
 	{
-		if (groupSize > 1 && d.affinity == Affinity::AnyWorker && !HasDependencies(d))
+		if (groupSize > 1 && d.affinity == Affinity::AnyWorker && d.priority == Priority::Normal && !HasDependencies(d))
 		{
 			assert(d.fn && "task without a function");
 			const uint32_t slot = PrepareSlot(P, d, ctx);
@@ -1613,7 +1687,7 @@ static bool TryHelpIn(PoolState& P)
 			return false;
 	}
 	if (slot == kNoSlot && ctx)
-		slot = ctx->deque.Pop();
+		slot = PopOwn(P, *ctx);
 	if (slot == kNoSlot)
 		slot = StealOnce(P, ctx);
 	if (slot == kNoSlot)
@@ -1815,7 +1889,7 @@ static uint32_t Search(PoolState& P, WorkerCtx& ctx)
 			// spinning (a waiter may need only these), and run what they
 			// release onto this deque.
 			FlushDeferredSignals(P, &ctx);
-			const uint32_t released = ctx.deque.Pop();
+			const uint32_t released = PopOwn(P, ctx);
 			if (released != kNoSlot)
 				return released;
 		}
@@ -1876,7 +1950,7 @@ static void WorkerLoop(PoolState& P, WorkerCtx& ctx)
 			continue;
 		}
 
-		uint32_t slot = ctx.deque.Pop();
+		uint32_t slot = PopOwn(P, ctx);
 		if (slot == kNoSlot)
 		{
 			if (!searching)

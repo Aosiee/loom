@@ -1169,6 +1169,87 @@ TEST_CASE("loom: dependencies — a random DAG with several counters per task ru
 		loom::DestroyCounter(g);
 }
 
+namespace {
+	// One worker, held by a gate task until released: what it runs next, and
+	// in which order, is up to the priorities alone (the main thread only
+	// blocks).
+	struct OrderLog
+	{
+		std::mutex m;
+		std::vector<char> order;
+		std::atomic<bool> open{ false };
+		void Add(char c) { std::lock_guard<std::mutex> l(m); order.push_back(c); }
+	};
+	struct Tagged { OrderLog* log; char tag; };
+	void LogTag(void* p) { auto* t = static_cast<Tagged*>(p); t->log->Add(t->tag); }
+	void HoldUntilOpen(void* p)
+	{
+		auto* log = static_cast<OrderLog*>(p);
+		while (!log->open)
+			std::this_thread::yield();
+	}
+}
+
+TEST_CASE("loom: priorities — High before Normal before Low")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	OrderLog log;
+	loom::ScopedCounter gate(1);
+	loom::Submit(loom::TaskDesc{ .fn = &HoldUntilOpen, .userData = &log, .signals = gate });
+	std::this_thread::sleep_for(std::chrono::milliseconds(20)); // (let the worker take it; if not, it runs first and logs nothing)
+
+	const int PerLevel = 6;
+	std::vector<Tagged> tags;
+	tags.reserve(3 * PerLevel);
+	loom::ScopedCounter done(3 * PerLevel);
+	const loom::Priority levels[3] = { loom::Priority::Low, loom::Priority::Normal, loom::Priority::High };
+	const char names[3] = { 'L', 'N', 'H' };
+	for (int i = 0; i < PerLevel; i++)
+		for (int l = 0; l < 3; l++) // interleaved: L, N, H, L, N, H, ...
+		{
+			tags.push_back(Tagged{ &log, names[l] });
+			loom::Submit(loom::TaskDesc{ .fn = &LogTag, .userData = &tags.back(), .signals = done, .priority = levels[l] });
+		}
+	log.open = true;
+	loom::WaitFor(gate, loom::Help::BlockOnly);
+	loom::WaitFor(done, loom::Help::BlockOnly);
+	std::string order(log.order.begin(), log.order.end());
+	CHECK(order == std::string(PerLevel, 'H') + std::string(PerLevel, 'N') + std::string(PerLevel, 'L'));
+}
+
+TEST_CASE("loom: priorities — a High task released later still runs before queued Normal work")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	OrderLog log;
+	loom::ScopedCounter gate(1), release(1);
+	loom::Submit(loom::TaskDesc{ .fn = &HoldUntilOpen, .userData = &log, .signals = gate });
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	std::vector<Tagged> tags(5, Tagged{ &log, 'N' });
+	Tagged high{ &log, 'H' };
+	loom::ScopedCounter done(6);
+	for (auto& t : tags)
+		loom::Submit(loom::TaskDesc{ .fn = &LogTag, .userData = &t, .signals = done });
+	loom::Submit(loom::TaskDesc{ .fn = &LogTag, .userData = &high, .signals = done, .waitsFor = release, .priority = loom::Priority::High });
+	loom::Signal(release);
+	log.open = true;
+	loom::WaitFor(done, loom::Help::BlockOnly);
+	loom::WaitFor(gate, loom::Help::BlockOnly);
+	CHECK(std::string(log.order.begin(), log.order.end()) == "HNNNNN");
+}
+
+TEST_CASE("loom: priorities — High goes to the front of the main thread's queue")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	OrderLog log;
+	Tagged n1{ &log, '1' }, n2{ &log, '2' }, h{ &log, 'H' };
+	loom::ScopedCounter done(3);
+	loom::Submit(loom::TaskDesc{ .fn = &LogTag, .userData = &n1, .affinity = loom::Affinity::MainThread, .signals = done });
+	loom::Submit(loom::TaskDesc{ .fn = &LogTag, .userData = &n2, .affinity = loom::Affinity::MainThread, .signals = done });
+	loom::Submit(loom::TaskDesc{ .fn = &LogTag, .userData = &h, .affinity = loom::Affinity::MainThread, .signals = done, .priority = loom::Priority::High });
+	loom::PumpMainThreadTasks();
+	CHECK(std::string(log.order.begin(), log.order.end()) == "H12");
+}
+
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
 	loom::Pool pool; // the suite owns its pool explicitly
