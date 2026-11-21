@@ -71,7 +71,8 @@ struct alignas(64) TaskSlot
 	CounterHandle waitsFor = kInvalidCounter;         // 28
 	uint32_t      nameId   = 0;                       // 32
 	// The next task of a group (a queue entry with kGroupBit), written by the
-	// submitter before the push and read by whoever takes the group.
+	// submitter before the push and read by whoever takes the group. While a
+	// task waits on counters, its count of unmet ones (see PendingDeps).
 	uint32_t      groupNext = kNoSlot;                // 36
 	// Free-list fields, on a free batch's head slot: how many slots the batch
 	// holds (the head, plus the rest listed in the bytes a free slot does not
@@ -1114,25 +1115,51 @@ static bool EnqueueSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 
 // Parks the slot on its waitsFor counter, or enqueues it. True when it went
 // into the pool (AnyWorker, runnable now).
-static bool DispatchSlot(PoolState& P, uint32_t slot, CounterHandle waitsFor, WorkerCtx* ctx)
+// A parked task's count of unmet dependencies. It lives in groupNext, which
+// only a runnable task uses (a task with dependencies is never grouped).
+static std::atomic_ref<uint32_t> PendingDeps(PoolState& P, uint32_t slot)
 {
-	if (waitsFor != kInvalidCounter)
-	{
-		CounterState* c = ResolveCounter(P, waitsFor);
+	return std::atomic_ref<uint32_t>(Slot(P, slot).groupNext);
+}
+
+static bool HasDependencies(const TaskDesc& desc)
+{
+	return desc.waitsFor != kInvalidCounter || !desc.waitsForAll.empty();
+}
+
+// Parks the slot on each of its counters that is not yet zero, or enqueues it
+// when none is. True when it went into the pool (AnyWorker, runnable now).
+static bool DispatchSlot(PoolState& P, uint32_t slot, const TaskDesc& desc, WorkerCtx* ctx)
+{
+	if (!HasDependencies(desc))
+		return EnqueueSlot(P, slot, ctx);
+
+	// One hold of our own while registering, so the task cannot be released
+	// (by a counter reaching zero meanwhile) before every counter has it.
+	auto deps = PendingDeps(P, slot);
+	deps.store(1, std::memory_order_relaxed);
+	auto park = [&](CounterHandle h) {
+		if (h == kInvalidCounter)
+			return;
+		CounterState* c = ResolveCounter(P, h);
 		assert(c && "task waits on an invalid/destroyed counter");
-		if (c)
+		if (!c)
+			return;
+		// Under the lock the count is either settled (0) or the final
+		// signaller has yet to take this lock and will release the list.
+		std::lock_guard<std::mutex> lock(c->mutex);
+		if (c->count.load(std::memory_order_acquire) != 0)
 		{
-			// Under the lock the count is either settled (0) or the final
-			// signaller has yet to take this lock and will release the list.
-			std::lock_guard<std::mutex> lock(c->mutex);
-			if (c->count.load(std::memory_order_acquire) != 0)
-			{
-				c->pending.push_back(slot);
-				return false;
-			}
+			deps.fetch_add(1, std::memory_order_relaxed);
+			c->pending.push_back(slot);
 		}
-	}
-	return EnqueueSlot(P, slot, ctx);
+	};
+	park(desc.waitsFor);
+	for (CounterHandle h : desc.waitsForAll)
+		park(h);
+	if (deps.fetch_sub(1, std::memory_order_acq_rel) == 1)
+		return EnqueueSlot(P, slot, ctx); // every counter was already zero
+	return false;
 }
 
 static uint32_t PrepareSlot(PoolState& P, const TaskDesc& desc, WorkerCtx* ctx)
@@ -1156,7 +1183,7 @@ static bool SubmitOne(PoolState& P, const TaskDesc& desc, WorkerCtx* ctx)
 {
 	assert(desc.fn && "task without a function");
 	const uint32_t slot = PrepareSlot(P, desc, ctx);
-	return DispatchSlot(P, slot, desc.waitsFor, ctx);
+	return DispatchSlot(P, slot, desc, ctx);
 }
 
 void Submit(const TaskDesc& desc)
@@ -1199,7 +1226,7 @@ void Submit(std::span<const TaskDesc> descs)
 	};
 	for (const TaskDesc& d : descs)
 	{
-		if (groupSize > 1 && d.affinity == Affinity::AnyWorker && d.waitsFor == kInvalidCounter)
+		if (groupSize > 1 && d.affinity == Affinity::AnyWorker && !HasDependencies(d))
 		{
 			assert(d.fn && "task without a function");
 			const uint32_t slot = PrepareSlot(P, d, ctx);
@@ -1231,7 +1258,7 @@ void SubmitInlineRaw(const void* data, size_t size, void (*trampoline)(void*), c
 	std::memcpy(t.inlineData, data, size);
 	t.fn = trampoline;
 	t.userData = t.inlineData;
-	if (DispatchSlot(P, slot, opts.waitsFor, ctx))
+	if (DispatchSlot(P, slot, opts, ctx))
 		WakeForWork(P, 1);
 }
 
@@ -1399,8 +1426,10 @@ static void SignalCounter(PoolState& P, CounterHandle h, int n)
 	size_t pooled = 0;
 	{
 		std::lock_guard<std::mutex> lock(c->mutex);
+		// A task parked on several counters runs when the last one releases it.
 		for (uint32_t slot : c->pending)
-			pooled += EnqueueSlot(P, slot, ctx) ? 1 : 0;
+			if (PendingDeps(P, slot).fetch_sub(1, std::memory_order_acq_rel) == 1)
+				pooled += EnqueueSlot(P, slot, ctx) ? 1 : 0;
 		c->pending.clear();
 		c->count.store(0, std::memory_order_release);
 		for (Waiter* w : c->waiters)

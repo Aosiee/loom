@@ -1074,6 +1074,101 @@ TEST_CASE("loom: exceptions — ParallelFor, nested or not, rethrows and still c
 }
 #endif
 
+TEST_CASE("loom: dependencies — a task waits for every counter it lists")
+{
+	loom::Pool pool; // the suite owns its pool explicitly
+	for (int round = 0; round < 50; round++)
+	{
+		struct State { std::atomic<bool> released[3]; std::atomic<int> runs{ 0 }; std::atomic<bool> early{ false }; } st;
+		for (auto& r : st.released)
+			r = false;
+		loom::CounterHandle a = loom::CreateCounter(1), b = loom::CreateCounter(1), c = loom::CreateCounter(1);
+		loom::ScopedCounter done(1);
+		const loom::CounterHandle more[] = { b, c };
+		loom::Submit(loom::TaskDesc{ .fn = [](void* p) {
+			State& s = *static_cast<State*>(p);
+			for (auto& r : s.released)
+				if (!r)
+					s.early = true;
+			s.runs++;
+		}, .userData = &st, .signals = done, .waitsFor = a, .waitsForAll = more });
+		// Release the three from three threads, in a different order each round.
+		const loom::CounterHandle order[3] = { a, b, c };
+		std::vector<std::thread> releasers;
+		for (int k = 0; k < 3; k++)
+		{
+			const int which = (k + round) % 3;
+			releasers.emplace_back([&, which] {
+				std::this_thread::sleep_for(std::chrono::microseconds(50 * ((which + round) % 4)));
+				st.released[which] = true;
+				loom::Signal(order[which]);
+			});
+		}
+		for (auto& t : releasers)
+			t.join();
+		loom::WaitFor(done);
+		CHECK_MESSAGE(!st.early.load(), "round ", round, ": the task ran only after all three counters reached zero");
+		CHECK(st.runs.load() == 1);
+		loom::DestroyCounter(a);
+		loom::DestroyCounter(b);
+		loom::DestroyCounter(c);
+	}
+}
+
+TEST_CASE("loom: dependencies — counters already at zero, and one listed twice")
+{
+	loom::Pool pool; // the suite owns its pool explicitly
+	loom::ScopedCounter zero(0), gate(1), done(2);
+	std::atomic<int> runs{ 0 };
+	auto bump = [](void* p) { static_cast<std::atomic<int>*>(p)->fetch_add(1); };
+	const loom::CounterHandle allZero[] = { zero, zero };
+	loom::Submit(loom::TaskDesc{ .fn = bump, .userData = &runs, .signals = done, .waitsFor = zero, .waitsForAll = allZero });
+	const loom::CounterHandle twice[] = { gate, zero, gate };
+	loom::Submit(loom::TaskDesc{ .fn = bump, .userData = &runs, .signals = done, .waitsForAll = twice });
+	SpinUntil(1, done, 2000); // the first ran at once; the second still waits on the gate
+	CHECK(runs.load() == 1);
+	loom::Signal(gate);
+	loom::WaitFor(done);
+	CHECK(runs.load() == 2);
+}
+
+TEST_CASE("loom: dependencies — a random DAG with several counters per task runs each task once")
+{
+	loom::Pool pool; // the suite owns its pool explicitly
+	std::mt19937 rng(4242);
+	const int Counters = 64, Tasks = 3000;
+	std::vector<loom::CounterHandle> gates;
+	for (int i = 0; i < Counters; i++)
+		gates.push_back(loom::CreateCounter(1 + (int)(rng() % 3)));
+	std::vector<std::atomic<int>> runs(Tasks);
+	loom::ScopedCounter done(Tasks);
+	for (int t = 0; t < Tasks; t++)
+	{
+		loom::CounterHandle deps[4];
+		const int n = 1 + (int)(rng() % 4);
+		for (int k = 0; k < n; k++)
+			deps[k] = gates[rng() % Counters];
+		loom::Submit(loom::TaskDesc{ .fn = [](void* p) { static_cast<std::atomic<int>*>(p)->fetch_add(1); },
+			.userData = &runs[(size_t)t], .signals = done, .waitsForAll = std::span<const loom::CounterHandle>(deps, (size_t)n) });
+	}
+	// Two threads release every gate, interleaved.
+	auto release = [&](int parity) {
+		for (int i = parity; i < Counters; i += 2)
+			while (loom::Load(gates[(size_t)i]) > 0)
+				loom::Signal(gates[(size_t)i]);
+	};
+	std::thread other(release, 1);
+	release(0);
+	other.join();
+	loom::WaitFor(done);
+	bool allOnce = true;
+	for (auto& r : runs)
+		allOnce &= r.load() == 1;
+	CHECK(allOnce);
+	for (loom::CounterHandle g : gates)
+		loom::DestroyCounter(g);
+}
+
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
 	loom::Pool pool; // the suite owns its pool explicitly

@@ -72,6 +72,10 @@ struct TaskDesc
 	// it) - the interned name id (0 = unnamed) + the window-slot tag.
 	uint32_t      nameId   = 0;
 	uint8_t       window   = 0;
+	// More counters to wait for: the task becomes runnable once waitsFor and
+	// every counter here have reached zero. Read only during Submit (the
+	// array need not outlive it); a counter may be listed more than once.
+	std::span<const CounterHandle> waitsForAll = {};
 };
 
 struct LoomConfig
