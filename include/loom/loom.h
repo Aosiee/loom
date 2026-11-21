@@ -175,11 +175,18 @@ void           Signal(CounterHandle, int n = 1);
 int            Load(CounterHandle);
 // Returns when the count reaches zero. If a task that signals this counter
 // threw, WaitFor then rethrows the first such exception (every WaitFor on the
-// counter does, until it is destroyed). The other tasks still ran. Tasks a
+// counter does, until it is destroyed); the throw cancelled the counter, so
+// its tasks that had not started were skipped (see Cancel). Tasks a
 // thread runs while helping report to their own counters, never to its wait.
 // (A task that throws and signals no counter ends the program.)
 void           WaitFor(CounterHandle, Help help = Help::WhileWaiting);
 bool           TryHelp(); // run at most one eligible task; true if one ran
+// Cancels the work behind a counter: tasks that signal it and have not
+// started are skipped (they still signal it, so WaitFor returns as usual).
+// Running tasks finish; a long one can poll IsCancelled to stop early. A
+// task's exception cancels its counter too. A new counter is never cancelled.
+void           Cancel(CounterHandle);
+bool           IsCancelled(CounterHandle);
 
 // RAII wrapper over a counter handle: destroys on scope exit; non-copyable.
 class ScopedCounter

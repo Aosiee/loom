@@ -289,11 +289,14 @@ struct alignas(64) CounterState
 	// The first exception a task signalling this counter threw (under the
 	// lock); `failed` lets WaitFor check without it.
 	std::exception_ptr    error;
-	std::atomic<bool>     failed{ false };
 	// Read lock-free by ResolveCounter on every thread while Create/Destroy
 	// write them (the old plain fields were a data race the TSAN suite caught).
-	std::atomic<bool>     alive{ false };
+	// Their own cache line, away from the count every signal writes: a task
+	// reads `cancelled` before it runs.
+	alignas(64) std::atomic<bool> alive{ false };
 	std::atomic<uint32_t> generation{ 0 };
+	std::atomic<bool>     failed{ false };
+	std::atomic<bool>     cancelled{ false }; // Cancel, or a task's exception
 };
 
 // ---- Dedicated threads --------------------------------------------------------
@@ -1438,6 +1441,7 @@ CounterHandle CreateCounter(int initial)
 	CounterState& c = P.counters[i];
 	c.count.store(initial > 0 ? initial + 1 : 0, std::memory_order_relaxed);
 	c.failed.store(false, std::memory_order_relaxed); // (error was cleared by the destroy)
+	c.cancelled.store(false, std::memory_order_relaxed);
 	c.alive.store(true, std::memory_order_release);
 	// No generation bump here: the DESTROY path invalidates stale handles.
 	// Bumping on create too doubled the churn and overflowed the packed
@@ -1511,6 +1515,21 @@ static void SignalCounter(PoolState& P, CounterHandle h, int n)
 		c->waiters.clear();
 	}
 	WakeForWork(P, pooled);
+}
+
+void Cancel(CounterHandle h)
+{
+	CounterState* c = ResolveCounter(ActivePool(), h);
+	assert(c && "cancelling an invalid/destroyed counter");
+	if (c)
+		c->cancelled.store(true, std::memory_order_release);
+}
+
+bool IsCancelled(CounterHandle h)
+{
+	const CounterState* c = ResolveCounter(ActivePool(), h);
+	assert(c && "querying an invalid/destroyed counter");
+	return c && c->cancelled.load(std::memory_order_acquire);
 }
 
 int Load(CounterHandle h)
@@ -1761,6 +1780,8 @@ static void RecordTaskException(PoolState& P, CounterHandle signals, std::except
 		c->error = std::move(error);
 		c->failed.store(true, std::memory_order_release);
 	}
+	// The counter's work has failed: what has not started need not run.
+	c->cancelled.store(true, std::memory_order_release);
 }
 #endif
 
@@ -1803,7 +1824,10 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	// returns the handle the end mark pairs with.
 	const int threadIndex = CurrentThreadIndex();
 	const uint64_t zone = MarkProfilerZone(P, threadIndex, nameId, window, "Task", true, 0);
-	if (fn)
+	// A task of a cancelled counter is skipped, though it still signals it.
+	const CounterState* counter = signals != kInvalidCounter ? ResolveCounter(P, signals) : nullptr;
+	const bool cancelled = counter && counter->cancelled.load(std::memory_order_acquire);
+	if (fn && !cancelled)
 		RunTaskFn(P, fn, userData, signals); // an inline callable's userData is the slot: release after
 	MarkProfilerZone(P, threadIndex, nameId, window, "Task", false, zone);
 

@@ -1027,7 +1027,9 @@ TEST_CASE("loom: exceptions — WaitFor rethrows a task's exception, for every w
 	other.join();
 	CHECK(mainSaw == "boom");
 	CHECK(otherSaw == "boom");
-	CHECK(ran.load() == 3);
+	CHECK(ran.load() >= 1); // the throw cancelled the counter: tasks not yet started were skipped
+	CHECK(ran.load() <= 3);
+	CHECK(loom::IsCancelled(c));
 	CHECK(loom::Load(c) == 0);
 	loom::DestroyCounter(c);
 
@@ -1048,7 +1050,7 @@ TEST_CASE("loom: exceptions — a helper keeps other counters' exceptions out of
 	CHECK_THROWS_AS(loom::WaitFor(bad), std::logic_error);
 }
 
-TEST_CASE("loom: exceptions — ParallelFor, nested or not, rethrows and still covers the range")
+TEST_CASE("loom: exceptions — ParallelFor, nested or not, rethrows; chunks not yet started are skipped")
 {
 	loom::Pool pool; // the suite owns its pool explicitly
 	const size_t N = 1000;
@@ -1059,10 +1061,11 @@ TEST_CASE("loom: exceptions — ParallelFor, nested or not, rethrows and still c
 		if (b == 500)
 			throw std::runtime_error("chunk 50");
 	}), "chunk 50", std::runtime_error);
-	bool allOnce = true;
+	bool atMostOnce = true;
 	for (auto& h : hits)
-		allOnce &= h.load() == 1;
-	CHECK_MESSAGE(allOnce, "every other chunk still ran");
+		atMostOnce &= h.load() <= 1;
+	CHECK_MESSAGE(atMostOnce, "no index ran twice");
+	CHECK_MESSAGE(hits[500].load() == 1, "the chunk that threw ran");
 
 	CHECK_THROWS_AS(loom::ParallelFor(0, 64, 8, [](size_t b, size_t) {
 		loom::ParallelFor(0, 64, 8, [b](size_t ib, size_t) {
@@ -1249,6 +1252,84 @@ TEST_CASE("loom: priorities — High goes to the front of the main thread's queu
 	loom::PumpMainThreadTasks();
 	CHECK(std::string(log.order.begin(), log.order.end()) == "H12");
 }
+
+TEST_CASE("loom: cancellation — queued tasks are skipped, still signal, and a fresh counter is clean")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	OrderLog hold;
+	loom::ScopedCounter gate(1);
+	loom::Submit(loom::TaskDesc{ .fn = &HoldUntilOpen, .userData = &hold, .signals = gate });
+	std::atomic<int> ran{ 0 };
+	loom::CounterHandle c = loom::CreateCounter(10);
+	for (int i = 0; i < 10; i++)
+		loom::Submit([&ran]() { ran++; }, loom::TaskDesc{ .signals = c });
+	CHECK_FALSE(loom::IsCancelled(c));
+	loom::Cancel(c);
+	CHECK(loom::IsCancelled(c));
+	hold.open = true;
+	loom::WaitFor(c, loom::Help::BlockOnly); // returns: every skipped task still signalled
+	CHECK(ran.load() == 0);
+	CHECK(loom::Load(c) == 0);
+	loom::DestroyCounter(c);
+	loom::WaitFor(gate, loom::Help::BlockOnly);
+
+	loom::CounterHandle fresh = loom::CreateCounter(1);
+	CHECK_FALSE(loom::IsCancelled(fresh));
+	loom::Submit([&ran]() { ran++; }, loom::TaskDesc{ .signals = fresh });
+	loom::WaitFor(fresh);
+	CHECK(ran.load() == 1);
+	loom::DestroyCounter(fresh);
+}
+
+TEST_CASE("loom: cancellation — a running task can see it and stop early")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	struct Long { loom::CounterHandle self; std::atomic<bool> started{ false }, sawCancel{ false }; } job;
+	job.self = loom::CreateCounter(1);
+	loom::Submit(loom::TaskDesc{ .fn = [](void* p) {
+		Long& j = *static_cast<Long*>(p);
+		j.started = true;
+		const auto start = std::chrono::steady_clock::now();
+		while (std::chrono::steady_clock::now() - start < std::chrono::seconds(2))
+		{
+			if (loom::IsCancelled(j.self))
+			{
+				j.sawCancel = true;
+				return;
+			}
+			std::this_thread::yield();
+		}
+	}, .userData = &job, .signals = job.self });
+	while (!job.started)
+		std::this_thread::yield();
+	const auto start = std::chrono::steady_clock::now();
+	loom::Cancel(job.self);
+	loom::WaitFor(job.self, loom::Help::BlockOnly);
+	CHECK(job.sawCancel.load());
+	CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500));
+	loom::DestroyCounter(job.self);
+}
+
+#if defined(__cpp_exceptions)
+TEST_CASE("loom: cancellation — a task's exception skips the rest of its counter's queued work")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	OrderLog hold;
+	loom::ScopedCounter gate(1);
+	loom::Submit(loom::TaskDesc{ .fn = &HoldUntilOpen, .userData = &hold, .signals = gate });
+	std::atomic<int> after{ 0 };
+	loom::CounterHandle c = loom::CreateCounter(6);
+	// The one worker takes these oldest first: the throw, then the rest.
+	loom::Submit([]() { throw std::runtime_error("first"); }, loom::TaskDesc{ .signals = c });
+	for (int i = 0; i < 5; i++)
+		loom::Submit([&after]() { after++; }, loom::TaskDesc{ .signals = c });
+	hold.open = true;
+	CHECK_THROWS_AS(loom::WaitFor(c, loom::Help::BlockOnly), std::runtime_error);
+	CHECK(after.load() == 0);
+	loom::DestroyCounter(c);
+	loom::WaitFor(gate, loom::Help::BlockOnly);
+}
+#endif
 
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
