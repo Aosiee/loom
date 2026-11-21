@@ -596,6 +596,259 @@ TEST_CASE("loom: park — back-to-back park/unpark rounds never strand a thread"
 	pool.Shutdown();
 }
 
+// Submit(span) chains runnable AnyWorker tasks into groups handed over as one
+// queue entry; whoever takes a group spreads the rest. Every path: the main
+// thread's deque, an outside thread's injection queue (taken by a stealing
+// dedicated thread too), a worker's own deque, and a span mixing in tasks that
+// must NOT be grouped (main, dedicated, waitsFor).
+TEST_CASE("loom: batch submit — grouped tasks run exactly once from any thread")
+{
+	loom::Pool pool; // the suite owns its pool explicitly
+	loom::DedicatedId stealer = loom::RegisterDedicatedThread(
+		loom::DedicatedConfig{ .name = "batch-stealer", .idle = loom::DedicatedConfig::Idle::StealFromPool });
+
+	auto bump = [](void* p) { static_cast<std::atomic<int>*>(p)->fetch_add(1, std::memory_order_relaxed); };
+	auto allOnce = [](const std::vector<std::atomic<int>>& hits) {
+		for (const auto& h : hits)
+			if (h.load() != 1)
+				return false;
+		return true;
+	};
+
+	// 1. A mixed span from the main thread.
+	const int N = 10000;
+	std::vector<std::atomic<int>> mixed(N);
+	loom::ScopedCounter gate(1);
+	loom::ScopedCounter mixedDone(N);
+	{
+		std::vector<loom::TaskDesc> descs(N);
+		for (int i = 0; i < N; i++)
+		{
+			loom::TaskDesc d{ .fn = bump, .userData = &mixed[i], .signals = mixedDone };
+			if (i % 7 == 0)
+				d.affinity = loom::Affinity::MainThread;
+			else if (i % 11 == 0)
+				d.waitsFor = gate;
+			else if (i % 13 == 0)
+			{
+				d.affinity = loom::Affinity::Dedicated;
+				d.thread = stealer;
+			}
+			descs[i] = d;
+		}
+		loom::Submit(std::span<const loom::TaskDesc>(descs));
+	}
+	loom::Signal(gate);
+
+	// 2. A span from a thread loom did not start (the injection queue).
+	const int M = 5000;
+	std::vector<std::atomic<int>> outside(M);
+	loom::ScopedCounter outsideDone(M);
+	std::thread outsider([&] {
+		std::vector<loom::TaskDesc> descs(M);
+		for (int i = 0; i < M; i++)
+			descs[i] = loom::TaskDesc{ .fn = bump, .userData = &outside[i], .signals = outsideDone };
+		loom::Submit(std::span<const loom::TaskDesc>(descs));
+	});
+
+	// 3. Spans submitted from inside tasks (a worker's own deque).
+	const int Parents = 100, Children = 100;
+	std::vector<std::atomic<int>> nested(Parents * Children);
+	loom::ScopedCounter nestedDone(Parents * Children);
+	loom::ScopedCounter parentsDone(Parents);
+	struct Parent { std::atomic<int>* hits; loom::CounterHandle done; void (*bump)(void*); };
+	std::vector<Parent> parents(Parents);
+	for (int p = 0; p < Parents; p++)
+	{
+		parents[p] = Parent{ &nested[(size_t)p * Children], nestedDone, +bump };
+		loom::Submit(loom::TaskDesc{ .fn = [](void* user) {
+			Parent& parent = *static_cast<Parent*>(user);
+			loom::TaskDesc kids[100];
+			for (int c = 0; c < 100; c++)
+				kids[c] = loom::TaskDesc{ .fn = parent.bump, .userData = &parent.hits[c], .signals = parent.done };
+			loom::Submit(std::span<const loom::TaskDesc>(kids, 100));
+		}, .userData = &parents[p], .signals = parentsDone });
+	}
+
+	loom::WaitFor(mixedDone); // pumps the main-thread tasks too
+	outsider.join();
+	loom::WaitFor(outsideDone);
+	loom::WaitFor(parentsDone);
+	loom::WaitFor(nestedDone);
+
+	CHECK_MESSAGE(allOnce(mixed), "mixed span: every task ran exactly once");
+	CHECK_MESSAGE(allOnce(outside), "outside-thread span: every task ran exactly once");
+	CHECK_MESSAGE(allOnce(nested), "spans from tasks: every task ran exactly once");
+	loom::UnregisterDedicatedThread(stealer);
+}
+
+// A thread applies its finished tasks' signals to a counter in one go (one
+// shared-counter write per run of same-counter tasks). These pin the rules
+// that keep that invisible: nothing returns to a caller, waits or runs other
+// work while holding signals.
+
+TEST_CASE("loom: deferred signals — TryHelp never returns holding signals another thread waits for")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 0 }); // only the main thread runs tasks
+	loom::ScopedCounter done(8);
+	for (int i = 0; i < 8; i++)
+		loom::Submit(loom::TaskDesc{ .fn = &Noop, .signals = done });
+
+	std::atomic<bool> finished{ false };
+	std::thread waiter([&] {
+		loom::WaitFor(done, loom::Help::BlockOnly);
+		finished = true;
+	});
+	for (int i = 0; i < 8; i++)
+		CHECK(loom::TryHelp());
+
+	// The waiter must see zero with the main thread doing nothing more.
+	const auto start = std::chrono::steady_clock::now();
+	while (!finished && std::chrono::steady_clock::now() - start < std::chrono::seconds(2))
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	CHECK_MESSAGE(finished.load(), "the BlockOnly waiter saw zero after the last TryHelp");
+	if (!finished)
+		(void)loom::Load(done); // apply anything held back, so the join cannot hang
+	waiter.join();
+}
+
+TEST_CASE("loom: deferred signals — a long task of another counter does not delay a finished one")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::ScopedCounter quick(1), slow(1);
+	// The worker steals oldest-first: the quick task, then the long one.
+	loom::Submit(loom::TaskDesc{ .fn = &Noop, .signals = quick });
+	loom::Submit(loom::TaskDesc{ .fn = [](void*) { std::this_thread::sleep_for(std::chrono::milliseconds(400)); }, .signals = slow });
+
+	const auto start = std::chrono::steady_clock::now();
+	loom::WaitFor(quick, loom::Help::BlockOnly); // the main thread runs nothing itself
+	const auto waited = std::chrono::steady_clock::now() - start;
+	CHECK_MESSAGE(waited < std::chrono::milliseconds(200), "the quick counter reached zero before the long task finished");
+	loom::WaitFor(slow, loom::Help::BlockOnly);
+}
+
+TEST_CASE("loom: deferred signals — a task polling its own counter sees its predecessors' signals")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	const int Quick = 16;
+	loom::ScopedCounter done(Quick + 1);
+	std::atomic<bool> sawOnlyItself{ false };
+	struct Poll { loom::CounterHandle done; std::atomic<bool>* saw; } poll{ done, &sawOnlyItself };
+	for (int i = 0; i < Quick; i++)
+		loom::Submit(loom::TaskDesc{ .fn = &Noop, .signals = done });
+	// Runs after the quick ones on the same worker, signalling the same counter:
+	// it waits until only its own signal is left.
+	loom::Submit(loom::TaskDesc{ .fn = [](void* user) {
+		Poll& p = *static_cast<Poll*>(user);
+		const auto start = std::chrono::steady_clock::now();
+		while (std::chrono::steady_clock::now() - start < std::chrono::seconds(2))
+		{
+			if (loom::Load(p.done) == 1)
+			{
+				*p.saw = true;
+				return;
+			}
+			std::this_thread::yield();
+		}
+	}, .userData = &poll, .signals = done });
+	loom::WaitFor(done, loom::Help::BlockOnly);
+	CHECK_MESSAGE(sawOnlyItself.load(), "Load counted the finished tasks the polling thread still held");
+}
+
+TEST_CASE("loom: deferred signals — interleaved counters in grouped batches all reach zero")
+{
+	loom::Pool pool; // the suite owns its pool explicitly
+	const int Counters = 4, PerCounter = 2000;
+	std::vector<loom::CounterHandle> counters;
+	for (int k = 0; k < Counters; k++)
+		counters.push_back(loom::CreateCounter(PerCounter));
+	std::atomic<int> ran{ 0 };
+	std::vector<loom::TaskDesc> descs;
+	for (int i = 0; i < Counters * PerCounter; i++)
+		descs.push_back(loom::TaskDesc{ .fn = [](void* p) { static_cast<std::atomic<int>*>(p)->fetch_add(1, std::memory_order_relaxed); },
+			.userData = &ran, .signals = counters[(size_t)(i % Counters)] });
+	loom::Submit(std::span<const loom::TaskDesc>(descs));
+	for (int k = Counters; k-- > 0;)
+	{
+		loom::WaitFor(counters[(size_t)k]);
+		CHECK(loom::Load(counters[(size_t)k]) == 0);
+	}
+	CHECK(ran.load() == Counters * PerCounter);
+	for (loom::CounterHandle c : counters)
+		loom::DestroyCounter(c);
+}
+
+// Task slots recycle through per-thread caches and a shared stack of batches.
+// Every allocation path at once (the main thread's cache, the workers' caches,
+// outside threads without one) while the pool grows past its first chunk.
+TEST_CASE("loom: slots — recycling and growth under every submitter keep every task exactly once")
+{
+	loom::Pool pool(loom::LoomConfig{ .maxTasks = 1 }); // one chunk, so the bursts below grow it
+	auto bump = [](void* p) { static_cast<std::atomic<int>*>(p)->fetch_add(1, std::memory_order_relaxed); };
+	const int Rounds = 3, PerSource = 12000;
+	for (int round = 0; round < Rounds; round++)
+	{
+		std::vector<std::atomic<int>> fromMain(PerSource), fromOutside(2 * PerSource), fromTasks(PerSource);
+		loom::ScopedCounter mainDone(PerSource), outsideDone(2 * PerSource), taskDone(PerSource), spawnersDone(PerSource / 100);
+
+		// The workers parked: nothing runs, so the main thread's burst (and the
+		// outside threads' first submits) hold more slots than the pool has.
+		REQUIRE(loom::ParkAll(2000));
+		std::vector<loom::TaskDesc> descs((size_t)PerSource);
+		for (int i = 0; i < PerSource; i++)
+			descs[(size_t)i] = loom::TaskDesc{ .fn = bump, .userData = &fromMain[(size_t)i], .signals = mainDone };
+		loom::Submit(std::span<const loom::TaskDesc>(descs));
+
+		// Outside threads: no slot cache, one slot per allocation.
+		std::vector<std::thread> outsiders;
+		for (int t = 0; t < 2; t++)
+		{
+			outsiders.emplace_back([&, t] {
+				for (int i = 0; i < PerSource; i++)
+					loom::Submit(loom::TaskDesc{ .fn = bump, .userData = &fromOutside[(size_t)(t * PerSource + i)], .signals = outsideDone });
+			});
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		loom::UnparkAll();
+		// Spans submitted from tasks: the workers' caches.
+		struct Spawn { std::atomic<int>* hits; loom::CounterHandle done; void (*bump)(void*); };
+		std::vector<Spawn> spawns((size_t)PerSource / 100);
+		for (size_t s = 0; s < spawns.size(); s++)
+		{
+			spawns[s] = Spawn{ &fromTasks[s * 100], taskDone, +bump };
+			loom::Submit(loom::TaskDesc{ .fn = [](void* user) {
+				Spawn& sp = *static_cast<Spawn*>(user);
+				loom::TaskDesc kids[100];
+				for (int c = 0; c < 100; c++)
+					kids[c] = loom::TaskDesc{ .fn = sp.bump, .userData = &sp.hits[c], .signals = sp.done };
+				loom::Submit(std::span<const loom::TaskDesc>(kids, 100));
+			}, .userData = &spawns[s], .signals = spawnersDone });
+		}
+		for (auto& t : outsiders)
+			t.join();
+		loom::WaitFor(mainDone);
+		loom::WaitFor(outsideDone);
+		loom::WaitFor(spawnersDone);
+		loom::WaitFor(taskDone);
+
+		auto allOnce = [](const std::vector<std::atomic<int>>& hits) {
+			for (const auto& h : hits)
+				if (h.load() != 1)
+					return false;
+			return true;
+		};
+		CHECK_MESSAGE(allOnce(fromMain), "round ", round, ": main-thread tasks ran exactly once");
+		CHECK_MESSAGE(allOnce(fromOutside), "round ", round, ": outside-thread tasks ran exactly once");
+		CHECK_MESSAGE(allOnce(fromTasks), "round ", round, ": tasks submitted from tasks ran exactly once");
+	}
+	// Every slot was handed back: nothing is live once all the counters are done
+	// (the spawner tasks finish before their counter's final signal).
+	const auto start = std::chrono::steady_clock::now();
+	while (loom::LiveTaskCount() != 0 && std::chrono::steady_clock::now() - start < std::chrono::seconds(2))
+		std::this_thread::yield();
+	CHECK(loom::LiveTaskCount() == 0);
+}
+
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
 	loom::Pool pool; // the suite owns its pool explicitly

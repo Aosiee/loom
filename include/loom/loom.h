@@ -23,9 +23,9 @@
 //   - Determinism: loom guarantees WHAT completes (counter semantics),
 //     never scheduling ORDER. Order-independent outputs only.
 //
-// M1 internals are mutex+condvar and correct (M2 swaps work-stealing
-// deques behind the same API). Shutdown is drain-or-assert: abandoned
-// queued tasks are a bug.
+// Internals: per-worker work-stealing deques, lock-free task slots,
+// counters that lock only on their final signal; docs/design.md has the
+// details. Shutdown is drain-or-assert: abandoned queued tasks are a bug.
 
 #include <atomic>
 #include <cstdint>
@@ -56,7 +56,7 @@ enum class Affinity : uint8_t
 enum class Help : uint8_t
 {
 	WhileWaiting, // execute eligible tasks while the counter is nonzero
-	BlockOnly,    // sleep on the condvar; never reenter
+	BlockOnly,    // sleep until the counter reaches zero; never reenter
 };
 
 struct TaskDesc
@@ -77,7 +77,7 @@ struct TaskDesc
 struct LoomConfig
 {
 	int      workerCount = -1;   // default max(1, hw_concurrency - 1)
-	uint32_t maxTasks    = 4096; // task-slot pool size (grows with a warning)
+	uint32_t maxTasks    = 4096; // task-slot pool size, rounded up to 4096s (grows with a warning)
 	uint32_t maxCounters = 2048;
 	// Runs first on every worker and dedicated thread (the engine's crash
 	// handler gives each its alternate signal stack here). Optional.
@@ -114,7 +114,10 @@ private:
 
 // ---- Submission ------------------------------------------------------------
 void Submit(const TaskDesc&);
-void Submit(std::span<const TaskDesc>); // batch
+// A batch: much cheaper per task than one Submit per task when there are many
+// (runnable AnyWorker tasks are handed to the workers in groups; see
+// docs/design.md). Prefer it whenever the tasks are known together.
+void Submit(std::span<const TaskDesc>);
 
 // Convenience: inline-stores a trivially-copyable callable of <= 48 bytes
 // into the task slot — zero allocation.
@@ -142,6 +145,10 @@ void Submit(F&& fn, const TaskDesc& opts = {})
 CounterHandle CreateCounter(int initial);
 void           DestroyCounter(CounterHandle);  // asserts count == 0, no waiters
 void           Signal(CounterHandle, int n = 1);
+// The current count. It can lag briefly behind tasks that have finished on
+// other threads (a worker applies its finished tasks' signals to a counter in
+// one go, at the latest when it runs out of work at hand or runs a task of
+// another counter); it never runs ahead, and WaitFor is never delayed by it.
 int            Load(CounterHandle);
 void           WaitFor(CounterHandle, Help help = Help::WhileWaiting);
 bool           TryHelp(); // run at most one eligible task; true if one ran
@@ -168,57 +175,36 @@ private:
 // each task processes AT MOST chunkSize indices (the last chunk takes the
 // remainder) - fans each out as an AnyWorker task signalling one counter,
 // and waits for all of them. `fn` is invoked as fn(chunkBegin, chunkEnd,
-// userData). The zero-alloc pointer form stores its chunk records on the
-// caller's stack (alive until the wait returns). The lambda convenience
-// makes ONE heap copy of the callable per call (never per task). Pick
-// chunkSize so there are a small multiple of WorkerCount() chunks, each
-// with enough work to dwarf the per-task tax (see bench/loom_bench.cpp).
+// userData). Each call allocates one array of chunk records (one entry per
+// chunk, freed when the wait returns); the chunks themselves take task
+// slots, which never allocate. The lambda convenience calls the callable in
+// place (it lives on the caller's stack until the wait returns), never a
+// heap copy. Pick chunkSize so there are a small multiple of WorkerCount()
+// chunks, each with enough work to dwarf the per-task tax (see
+// bench/loom_bench.cpp).
 using ParallelForFn = void (*)(size_t begin, size_t end, void* userData);
 
 void ParallelFor(size_t begin, size_t end, size_t chunkSize, ParallelForFn fn, void* userData);
 
-namespace detail {
-
-	template <typename G>
-	struct ParallelLambdaRange { size_t begin = 0, end = 0; G* fn = nullptr; };
-
-	template <typename G>
-	void ParallelForLambdaTrampoline(void* p)
-	{
-		auto& range = *static_cast<ParallelLambdaRange<G>*>(p);
-		(*range.fn)(range.begin, range.end);
-	}
-
-} // namespace detail
-
 template <typename F> requires std::is_invocable_v<std::decay_t<F>&, size_t, size_t>
 void ParallelFor(size_t begin, size_t end, size_t chunkSize, F&& fn)
 {
-	using G = std::decay_t<F>;
-	G* copy = new G(std::forward<F>(fn));
-
-	if (begin < end && chunkSize > 0)
+	using R = std::remove_reference_t<F>;
+	if constexpr (std::is_invocable_v<R&, size_t, size_t>)
 	{
-		// Overflow-free chunk count: (end - begin - 1) / chunkSize + 1.
-		size_t chunkCount = (end - begin - 1) / chunkSize + 1;
-		std::vector<detail::ParallelLambdaRange<G>> ranges(chunkCount);
-		CounterHandle counter = CreateCounter((int)chunkCount);
-
-		size_t cursor = begin;
-		for (size_t i = 0; i < chunkCount; i++)
-		{
-			size_t chunkEnd = cursor + chunkSize < end ? cursor + chunkSize : end;
-			ranges[i] = { cursor, chunkEnd, copy };
-			Submit(TaskDesc{ .fn = &detail::ParallelForLambdaTrampoline<G>,
-				.userData = &ranges[i], .affinity = Affinity::AnyWorker, .signals = counter });
-			cursor = chunkEnd;
-		}
-
-		WaitFor(counter);
-		DestroyCounter(counter);
+		// Every chunk calls the caller's own callable (alive until the wait returns).
+		ParallelFor(begin, end, chunkSize,
+			[](size_t b, size_t e, void* user) { (*static_cast<R*>(user))(b, e); },
+			const_cast<void*>(static_cast<const void*>(std::addressof(fn))));
 	}
-
-	delete copy;
+	else
+	{
+		// A const callable with a non-const call operator: call a stack copy.
+		using G = std::decay_t<F>;
+		G copy(std::forward<F>(fn));
+		ParallelFor(begin, end, chunkSize,
+			[](size_t b, size_t e, void* user) { (*static_cast<G*>(user))(b, e); }, &copy);
+	}
 }
 
 // ---- Lanes ------------------------------------------------------------------
