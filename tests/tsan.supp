@@ -1,7 +1,7 @@
 # Loom suite TSAN suppressions: races reported inside uninstrumented system
 # libraries (glib/fontconfig/gdbus threads spawned by GTK/font init in the
-# sandbox) are not loom's. Run the minimal-link loom_tests_tsan binary:
-#   TSAN_OPTIONS="suppressions=plugins/engine/loom/tsan.supp" .kiln/out/linux-dev/bin/loom_tests_tsan
+# sandbox) are not loom's. Run the minimal-link TSAN build of loom_tests (cmake -DLOOM_SANITIZE=thread):
+#   TSAN_OPTIONS="suppressions=tests/tsan.supp" build-tsan/loom_tests
 race:g_malloc
 race:g_free
 race:g_realloc
