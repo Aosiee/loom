@@ -400,6 +400,7 @@ struct PoolState
 
 	// Runs first on every pool thread.
 	void (*onThreadStart)() = nullptr;
+	uint32_t                shutdownTimeoutMs = 5000;
 
 	// The park. parkRequested is written under parkMutex (a thread checks it
 	// again there before it counts itself).
@@ -732,6 +733,7 @@ Pool::Pool(const LoomConfig& config)
 	}
 
 	P.onThreadStart = config.onThreadStart;
+	P.shutdownTimeoutMs = config.shutdownTimeoutMs;
 	P.workerCount = config.workerCount >= 0
 		? config.workerCount
 		: std::max(1, (int)std::thread::hardware_concurrency() - 1);
@@ -764,11 +766,48 @@ static void WakeAllIdle(PoolState& P)
 	P.numIdle.store(0, std::memory_order_seq_cst);
 }
 
+// Shutdown's drain: runs until no task is live, the calling thread helping
+// (main-thread work first when it is the main thread). Gives up, with a
+// report, when no task finishes for shutdownTimeoutMs: what is left can never
+// run (tasks waiting on counters nobody will signal), and the drain-or-assert
+// checks that follow name it.
+static void DrainForShutdown(PoolState& P)
+{
+	WorkerCtx* ctx = CurrentCtx(P);
+	int64_t last = LiveTasksIn(P);
+	auto lastProgress = std::chrono::steady_clock::now();
+	for (;;)
+	{
+		const int64_t live = LiveTasksIn(P);
+		if (live <= 0)
+			return;
+		if (live != last)
+		{
+			last = live;
+			lastProgress = std::chrono::steady_clock::now();
+		}
+		if (TryHelpIn(P))
+			continue;
+		FlushDeferredSignals(P, ctx);
+		if (std::chrono::steady_clock::now() - lastProgress > std::chrono::milliseconds(P.shutdownTimeoutMs))
+		{
+			std::fprintf(stderr, "loom: Shutdown: %lld task(s) did not finish within %u ms of the last one that did "
+				"(waiting on a counter nobody signals?)\n", (long long)live, P.shutdownTimeoutMs);
+			return;
+		}
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	}
+}
+
 void Pool::Shutdown()
 {
 	PoolState& P = *m_State;
 	if (!P.running) return;
-	P.running = false;
+	P.running = false; // IsInitialised and PumpMainThreadTasks report the pool as down from here
+
+	// Drain first, with every thread still running: a task may still submit
+	// work (main-thread work too) and wait for it, and every wait completes.
+	DrainForShutdown(P);
 
 	// Every sleeper registers, then re-checks `stop`; the wake below takes the
 	// lists' locks, so a sleeper either sees the flag or is in a list.
@@ -796,16 +835,6 @@ void Pool::Shutdown()
 		for (auto& d : P.dedicated)
 			if (d->thread.joinable()) d->thread.join();
 		P.dedicated.clear();
-	}
-
-	// A thread still asleep in WaitFor(BlockOnly) tests `stop` too.
-	for (uint32_t i = 0; i < P.counterCount; i++)
-	{
-		CounterState& c = P.counters[i];
-		std::lock_guard<std::mutex> lock(c.mutex);
-		for (Waiter* w : c.waiters)
-			Wake(*w, kWokeRecheck);
-		c.waiters.clear();
 	}
 
 	// Lanes join like every dedicated thread; a still-held lane at
@@ -1395,7 +1424,7 @@ static void SleepOnCounter(PoolState& P, CounterState& c, bool help)
 		c.waiters.push_back(&w);
 	}
 
-	bool ready = P.stop.load(std::memory_order_seq_cst);
+	bool ready = false;
 	bool inMain = false, inIdle = false;
 	DedicatedState* d = help ? CurrentDedicated() : nullptr;
 	bool inDedicated = false;
@@ -1429,7 +1458,7 @@ static void SleepOnCounter(PoolState& P, CounterState& c, bool help)
 		ready = HasPoolWork(P);
 	}
 	if (!ready)
-		ready = c.count.load(std::memory_order_acquire) == 0 || P.stop.load(std::memory_order_seq_cst);
+		ready = c.count.load(std::memory_order_acquire) == 0;
 	if (!ready)
 		SleepOn(w);
 
@@ -1467,7 +1496,9 @@ void WaitFor(CounterHandle h, Help help)
 	WorkerCtx* ctx = CurrentCtx(P);
 	FlushDeferredSignals(P, ctx); // this thread's own finished tasks may be what we wait for
 	MarkProfilerState(P, threadIndex, 0); // waiting
-	while (c->count.load(std::memory_order_acquire) != 0 && !P.stop.load(std::memory_order_relaxed))
+	// Until zero, always: Shutdown drains before it stops anything, so a wait
+	// never needs to give up early.
+	while (c->count.load(std::memory_order_acquire) != 0)
 	{
 		if (help == Help::WhileWaiting && TryHelpIn(P))
 		{
@@ -1511,7 +1542,7 @@ static uint32_t PopFront(std::mutex& m, std::deque<uint32_t>& q)
 
 static bool TryHelpIn(PoolState& P)
 {
-	if (!P.running) return false;
+	if (P.stop.load(std::memory_order_relaxed)) return false; // the workers are going
 
 	WorkerCtx* ctx = CurrentCtx(P);
 	uint32_t slot = kNoSlot;

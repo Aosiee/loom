@@ -82,6 +82,10 @@ struct LoomConfig
 	// Runs first on every worker and dedicated thread (the engine's crash
 	// handler gives each its alternate signal stack here). Optional.
 	void (*onThreadStart)() = nullptr;
+	// Shutdown first drains: it runs every task (helping on the calling
+	// thread) until none is live. When no task finishes for this long, what
+	// is left can never run; Shutdown reports it and its asserts fire.
+	uint32_t shutdownTimeoutMs = 5000;
 };
 
 // ---- Lifecycle -------------------------------------------------------------
@@ -103,9 +107,12 @@ public:
 	Pool(const Pool&) = delete;
 	Pool& operator=(const Pool&) = delete;
 
-	// Idempotent; drains workers + dedicated threads, joins all, then
-	// uninstalls the pool (drain-or-assert: abandoned tasks, held lanes and
-	// live tasks assert).
+	// Idempotent. Drains first: every submitted task runs, including work
+	// submitted while draining (main-thread work runs on the calling thread,
+	// which should be the main thread), and every WaitFor completes. Then
+	// joins the workers and dedicated threads and uninstalls the pool.
+	// Drain-or-assert: tasks that could never run, held lanes and live tasks
+	// assert (see LoomConfig::shutdownTimeoutMs).
 	void Shutdown();
 
 private:

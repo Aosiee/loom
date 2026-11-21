@@ -964,6 +964,47 @@ TEST_CASE("loom: dedicated — submits stay safe while other dedicated threads c
 	loom::UnregisterDedicatedThread(steady);
 }
 
+TEST_CASE("loom: shutdown — drains first: a task's wait completes and late work runs")
+{
+	struct State
+	{
+		std::atomic<bool> childRan{ false };
+		std::atomic<int>  countAfterWait{ -1 };
+		std::atomic<bool> mainWorkRan{ false };
+		std::atomic<bool> mainWorkOnMain{ false };
+		std::thread::id   mainId;
+	} st;
+	st.mainId = std::this_thread::get_id();
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+		// A task that waits for its child, blocking (no helping), while
+		// Shutdown runs: the wait must end at zero, not when stopping starts.
+		loom::Submit([&st]() {
+			loom::CounterHandle child = loom::CreateCounter(1);
+			loom::Submit([&st]() {
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+				st.childRan = true;
+			}, loom::TaskDesc{ .signals = child });
+			loom::WaitFor(child, loom::Help::BlockOnly);
+			st.countAfterWait = loom::Load(child);
+			loom::DestroyCounter(child);
+		});
+		// A task that submits main-thread work after Shutdown has begun.
+		loom::Submit([&st]() {
+			std::this_thread::sleep_for(std::chrono::milliseconds(30));
+			loom::Submit([&st]() {
+				st.mainWorkOnMain = std::this_thread::get_id() == st.mainId;
+				st.mainWorkRan = true;
+			}, loom::TaskDesc{ .affinity = loom::Affinity::MainThread });
+		});
+		pool.Shutdown(); // at once: both tasks are still running
+	}
+	CHECK(st.childRan.load());
+	CHECK_MESSAGE(st.countAfterWait.load() == 0, "the task's WaitFor returned only at zero");
+	CHECK_MESSAGE(st.mainWorkRan.load(), "main-thread work submitted during Shutdown ran");
+	CHECK(st.mainWorkOnMain.load());
+}
+
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
 	loom::Pool pool; // the suite owns its pool explicitly
