@@ -208,6 +208,11 @@ int            Load(CounterHandle);
 // thread runs while helping report to their own counters, never to its wait.
 // (A task that throws and signals no counter ends the program.)
 void           WaitFor(CounterHandle, Help help = Help::WhileWaiting);
+// WaitFor with a time limit: true once the count reached zero (rethrowing as
+// WaitFor does), false if `timeoutMs` passed first. 0 only checks, without
+// helping. While helping, the limit is checked between tasks, so a long task
+// run on the way can overrun it.
+[[nodiscard]] bool TryWaitFor(CounterHandle, uint32_t timeoutMs, Help help = Help::WhileWaiting);
 bool           TryHelp(); // run at most one eligible task; true if one ran
 // Cancels the work behind a counter: tasks that signal it and have not
 // started are skipped (they still signal it, so WaitFor returns as usual).

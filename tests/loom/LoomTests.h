@@ -966,6 +966,52 @@ TEST_CASE("loom: thread stats — two dedicated threads with one name keep their
 	loom::UnregisterDedicatedThread(quiet);
 }
 
+TEST_CASE("loom: TryWaitFor — times out, returns early on zero, and rethrows")
+{
+	using Clock = std::chrono::steady_clock;
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	for (loom::Help help : { loom::Help::WhileWaiting, loom::Help::BlockOnly })
+	{
+		loom::ScopedCounter never(1);
+		const auto start = Clock::now();
+		CHECK_FALSE(loom::TryWaitFor(never, 30, help));
+		const auto waited = Clock::now() - start;
+		CHECK(waited >= std::chrono::milliseconds(30));
+		CHECK(waited < std::chrono::seconds(2));
+		CHECK_FALSE(loom::TryWaitFor(never, 0, help));
+		loom::Signal(never);
+		CHECK(loom::TryWaitFor(never, 0, help));
+
+		// Woken by the signal, long before the limit.
+		loom::ScopedCounter soon(1);
+		loom::Submit([&soon]() {
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+			loom::Signal(soon);
+		});
+		const auto before = Clock::now();
+		CHECK(loom::TryWaitFor(soon, 10000, help));
+		CHECK(Clock::now() - before < std::chrono::seconds(5));
+	}
+
+#if defined(__cpp_exceptions)
+	loom::ScopedCounter failed(1);
+	loom::Submit([]() { throw std::runtime_error("timed"); }, loom::TaskDesc{ .signals = failed });
+	CHECK_THROWS_AS((void)loom::TryWaitFor(failed, 10000), std::runtime_error);
+#endif
+}
+
+TEST_CASE("loom: TryWaitFor — a zero limit never helps; a longer one does")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 0 }); // only a helping wait runs AnyWorker work
+	std::atomic<int> ran{ 0 };
+	loom::ScopedCounter done(1);
+	loom::Submit([&ran]() { ran++; }, loom::TaskDesc{ .signals = done });
+	CHECK_FALSE(loom::TryWaitFor(done, 0));
+	CHECK(ran.load() == 0);
+	CHECK(loom::TryWaitFor(done, 10000));
+	CHECK(ran.load() == 1);
+}
+
 TEST_CASE("loom: dedicated — submits stay safe while other dedicated threads come and go")
 {
 	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });

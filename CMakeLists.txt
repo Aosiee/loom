@@ -18,6 +18,12 @@ endif()
 
 add_library(loom STATIC src/loom.cpp)
 target_include_directories(loom PUBLIC include)
+# Sleep on a mutex and condition variable instead of a futex, as non-Linux
+# builds do: lets that path be tested on Linux.
+option(LOOM_NO_FUTEX "Use the portable sleep instead of the Linux futex" OFF)
+if(LOOM_NO_FUTEX)
+    target_compile_definitions(loom PRIVATE LOOM_NO_FUTEX)
+endif()
 target_link_libraries(loom PUBLIC Threads::Threads)
 if(LOOM_SANITIZE STREQUAL "thread")
     # The suite's TSAN-aware paths (the same define the host's tsan build sets).

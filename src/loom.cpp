@@ -135,32 +135,47 @@ enum : uint32_t
 	kWokeRecheck   = 2, // anything else: re-check whatever you were waiting for
 };
 
+// The sleep primitive: a raw futex on Linux, a mutex and condition variable
+// elsewhere (LOOM_NO_FUTEX forces the portable one, so it can be tested on
+// Linux too).
+#if defined(__linux__) && !defined(LOOM_NO_FUTEX)
+#define LOOM_FUTEX 1
+#else
+#define LOOM_FUTEX 0
+#endif
+
 struct Waiter
 {
 	std::atomic<uint32_t> word{ kArmed };
 	bool isWorker = false; // a worker's idle sleep (not a helper's)
+#if !LOOM_FUTEX
+	std::mutex              mutex;
+	std::condition_variable cv;
+#endif
 };
 
 // One per thread: a thread sleeps in at most one place at a time.
 static thread_local Waiter t_Waiter;
 
-// The sleep itself. On Linux a raw futex on the word: the kernel re-checks
-// the word under its own lock, so a store-then-wake can never be missed
-// (std::atomic::wait/notify keep their own waiter bookkeeping in the library,
-// which loom cannot see into or test against).
-#if defined(__linux__)
+// When a timed sleep gives up; kNoDeadline for an untimed one.
+using Deadline = std::chrono::steady_clock::time_point;
+static constexpr Deadline kNoDeadline = Deadline::max();
+
+// On Linux a raw futex on the word: the kernel re-checks the word under its
+// own lock, so a store-then-wake can never be missed. (std::atomic::wait and
+// notify keep their own waiter bookkeeping in the library, which loom cannot
+// see into or test against, and have no timeout.)
+#if LOOM_FUTEX
 static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t), "futex word layout");
-static void FutexWait(std::atomic<uint32_t>& word, uint32_t expected)
+static void FutexWait(std::atomic<uint32_t>& word, uint32_t expected, const timespec* timeout)
 {
-	syscall(SYS_futex, reinterpret_cast<uint32_t*>(&word), FUTEX_WAIT_PRIVATE, expected, nullptr, nullptr, 0);
+	// FUTEX_WAIT's timeout is relative.
+	syscall(SYS_futex, reinterpret_cast<uint32_t*>(&word), FUTEX_WAIT_PRIVATE, expected, timeout, nullptr, 0);
 }
 static void FutexWakeOne(std::atomic<uint32_t>& word)
 {
 	syscall(SYS_futex, reinterpret_cast<uint32_t*>(&word), FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
 }
-#else
-static void FutexWait(std::atomic<uint32_t>& word, uint32_t expected) { word.wait(expected, std::memory_order_acquire); }
-static void FutexWakeOne(std::atomic<uint32_t>& word) { word.notify_one(); }
 #endif
 
 // Wakers call this while holding the lock of the list they found the waiter
@@ -168,18 +183,52 @@ static void FutexWakeOne(std::atomic<uint32_t>& word) { word.notify_one(); }
 // Waiter can never be notified after it has moved on.
 static void Wake(Waiter& w, uint32_t why)
 {
+#if LOOM_FUTEX
 	w.word.store(why, std::memory_order_release);
 	FutexWakeOne(w.word);
+#else
+	// The store under the waiter's mutex: it cannot fall between the
+	// sleeper's check of the word and its wait.
+	std::lock_guard<std::mutex> lock(w.mutex);
+	w.word.store(why, std::memory_order_release);
+	w.cv.notify_one();
+#endif
 }
 
 // The caller arms the word (kArmed), registers wherever a waker will look,
 // re-checks its condition, and only then sleeps here. A wake that lands
-// between the re-check and the futex call is not lost: FUTEX_WAIT returns at
-// once when the word is no longer kArmed. The loop absorbs spurious wakeups.
-static void SleepOn(Waiter& w)
+// between the re-check and the sleep is not lost: FUTEX_WAIT returns at once
+// when the word is no longer kArmed (the portable path checks it under the
+// mutex the waker stores under). The loops absorb spurious wakeups. Returns
+// false when the deadline passed first.
+static bool SleepOn(Waiter& w, Deadline deadline = kNoDeadline)
 {
+#if LOOM_FUTEX
 	while (w.word.load(std::memory_order_acquire) == kArmed)
-		FutexWait(w.word, kArmed);
+	{
+		if (deadline == kNoDeadline)
+		{
+			FutexWait(w.word, kArmed, nullptr);
+			continue;
+		}
+		const auto left = deadline - std::chrono::steady_clock::now();
+		if (left <= std::chrono::steady_clock::duration::zero())
+			return false;
+		const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(left).count();
+		const timespec rel{ (time_t)(ns / 1000000000), (long)(ns % 1000000000) };
+		FutexWait(w.word, kArmed, &rel);
+	}
+	return true;
+#else
+	std::unique_lock<std::mutex> lock(w.mutex);
+	auto woken = [&] { return w.word.load(std::memory_order_acquire) != kArmed; };
+	if (deadline == kNoDeadline)
+	{
+		w.cv.wait(lock, woken);
+		return true;
+	}
+	return w.cv.wait_until(lock, deadline, woken);
+#endif
 }
 
 // ---- The work-stealing deque --------------------------------------------------------
@@ -1823,7 +1872,7 @@ int Load(CounterHandle h)
 
 // One sleep of a WaitFor: registers on the counter, and (when helping) on
 // whatever else this thread may run, re-checks, sleeps, and unregisters.
-static void SleepOnCounter(PoolState& P, CounterState& c, bool help)
+static void SleepOnCounter(PoolState& P, CounterState& c, bool help, Deadline deadline)
 {
 	Waiter& w = t_Waiter;
 	w.isWorker = false;
@@ -1878,7 +1927,7 @@ static void SleepOnCounter(PoolState& P, CounterState& c, bool help)
 	if (!ready)
 		ready = c.count.load(std::memory_order_acquire) == 0;
 	if (!ready)
-		SleepOn(w);
+		SleepOn(w, deadline); // a timeout is noticed by the caller's loop
 
 	// Unregister from every list under its lock, whether or not that list's
 	// waker fired: after this, nobody can still hold a pointer to `w`.
@@ -1904,22 +1953,31 @@ static void SleepOnCounter(PoolState& P, CounterState& c, bool help)
 		UnregisterIdle(P, w);
 }
 
-void WaitFor(CounterHandle h, Help help)
+// WaitFor and TryWaitFor. True when the count reached zero (and then
+// rethrows a task's exception), false when the deadline passed first.
+static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 {
 	PoolState& P = ActivePool();
 	CounterState* c = ResolveCounter(P, h);
 	assert(c && "waiting on an invalid/destroyed counter");
 	if (!c)
-		return;
+		return true;
 
 	const int threadIndex = CurrentThreadIndex();
 	WorkerCtx* ctx = CurrentCtx(P);
 	FlushDeferredSignals(P, ctx); // this thread's own finished tasks may be what we wait for
 	MarkProfilerState(P, threadIndex, 0); // waiting
-	// Until zero, always: Shutdown drains before it stops anything, so a wait
-	// never needs to give up early.
+	// Untimed, until zero: Shutdown drains before it stops anything, so a
+	// wait never needs to give up early.
+	bool reached = true;
 	while (c->count.load(std::memory_order_acquire) != 0)
 	{
+		// Checked between tasks, never during one: a helped task can overrun.
+		if (deadline != kNoDeadline && std::chrono::steady_clock::now() >= deadline)
+		{
+			reached = false;
+			break;
+		}
 		if (help == Help::WhileWaiting && TryHelpIn(P))
 		{
 			MarkProfilerState(P, threadIndex, 1); // helping
@@ -1932,13 +1990,13 @@ void WaitFor(CounterHandle h, Help help)
 			FlushDeferredSignals(P, ctx);
 			continue;
 		}
-		SleepOnCounter(P, *c, help == Help::WhileWaiting);
+		SleepOnCounter(P, *c, help == Help::WhileWaiting, deadline);
 	}
 	// Never return to the caller holding signals: it may block on anything.
 	FlushDeferredSignals(P, ctx);
 	MarkProfilerState(P, threadIndex, 2); // wait over
 #if defined(__cpp_exceptions)
-	if (c->failed.load(std::memory_order_acquire))
+	if (reached && c->failed.load(std::memory_order_acquire))
 	{
 		std::exception_ptr error;
 		{
@@ -1949,6 +2007,17 @@ void WaitFor(CounterHandle h, Help help)
 			std::rethrow_exception(error);
 	}
 #endif
+	return reached;
+}
+
+void WaitFor(CounterHandle h, Help help)
+{
+	WaitUntil(h, help, kNoDeadline);
+}
+
+bool TryWaitFor(CounterHandle h, uint32_t timeoutMs, Help help)
+{
+	return WaitUntil(h, help, std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs));
 }
 
 // Run at most one eligible task on the CALLING thread.

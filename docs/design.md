@@ -147,7 +147,10 @@ put a High task at the front. Groups are always Normal.
 ## Sleeping and waking
 
 Every sleep in loom goes through one `Waiter` per thread, a 32-bit word the
-thread sleeps on (a raw futex on Linux). A sleeper sets the word to armed,
+thread sleeps on: a raw futex on Linux, a mutex and condition variable
+elsewhere (the `LOOM_NO_FUTEX` CMake option selects the portable one on
+Linux, for testing). A sleep can carry a deadline, which is how
+`TryWaitFor` gives up. A sleeper sets the word to armed,
 registers wherever a waker will look for it, re-checks for work, and only
 then sleeps; a waker takes it off the list, sets the word and wakes it while
 holding that list's lock. The sleeper takes the same lock to unregister, so
