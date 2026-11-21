@@ -927,6 +927,43 @@ TEST_CASE("loom: thread stats — helping is counted and shown, rows outlive the
 	CHECK(rowKept);
 }
 
+TEST_CASE("loom: thread stats — two dedicated threads with one name keep their own queue depths")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	const loom::DedicatedId busy = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "twin" });
+	const loom::DedicatedId quiet = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "twin" });
+	struct Gate { std::atomic<bool> open{ false }; } gate;
+	loom::ScopedCounter done(4);
+	loom::Submit(loom::TaskDesc{ .fn = [](void* g) {
+		while (!static_cast<Gate*>(g)->open)
+			std::this_thread::yield();
+	}, .userData = &gate, .affinity = loom::Affinity::Dedicated, .thread = busy, .signals = done });
+	for (int i = 0; i < 3; i++)
+		loom::Submit(loom::TaskDesc{ .fn = &Noop, .affinity = loom::Affinity::Dedicated, .thread = busy, .signals = done });
+
+	// Both rows exist once both threads have started.
+	std::vector<loom::ThreadStatsView> twins;
+	for (int tries = 0; tries < 2000 && twins.size() != 2; tries++)
+	{
+		twins.clear();
+		for (const auto& t : loom::SnapshotThreadStats().threads)
+			if (t.name == "twin")
+				twins.push_back(t);
+		if (twins.size() != 2)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+	REQUIRE(twins.size() == 2);
+	const int deep = std::max(twins[0].queueDepth, twins[1].queueDepth);
+	const int shallow = std::min(twins[0].queueDepth, twins[1].queueDepth);
+	CHECK(deep >= 3); // 3, or 4 if the busy thread has not taken the gate task yet
+	CHECK(shallow == 0);
+
+	gate.open = true;
+	loom::WaitFor(done);
+	loom::UnregisterDedicatedThread(busy);
+	loom::UnregisterDedicatedThread(quiet);
+}
+
 TEST_CASE("loom: dedicated — submits stay safe while other dedicated threads come and go")
 {
 	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });

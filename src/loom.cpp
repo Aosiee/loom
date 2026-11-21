@@ -341,6 +341,9 @@ struct DedicatedState
 	Waiter*                waiter = nullptr; // set while the thread sleeps
 	std::atomic<bool>      stop{ false };
 	DedicatedId            id = 0;
+	// Its CurrentThreadIndex, once the thread has started: the key of its
+	// stats row (names need not be unique).
+	std::atomic<int>       threadIndex{ -1 };
 };
 
 // ---- Per-thread scheduler state (the main thread and each worker) ------------------
@@ -2398,11 +2401,11 @@ PoolSnapshot SnapshotThreadStats()
 				std::lock_guard<std::mutex> dl(d->mutex);
 				depth = (int)d->queue.size();
 			}
-			// Attach the dedicated queue depth to its stats row, matched by
-			// name (the registry does not record thread indices). Two threads
-			// with the same name both show the last one's depth.
+			// Attach the dedicated queue depth to its stats row (none yet if
+			// the thread has not started).
+			const int index = d->threadIndex.load(std::memory_order_relaxed);
 			for (auto& t : snap.threads)
-				if (!t.name.empty() && t.name == (d->name.empty() ? "loom-dedicated" : d->name))
+				if (t.index == index)
 					t.queueDepth = depth;
 		}
 	}
@@ -2426,6 +2429,7 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 		P.onThreadStart();
 	t_CurrentDedicated = &d;
 	const int index = CurrentThreadIndex(); // reserve this thread's index
+	d.threadIndex.store(index, std::memory_order_relaxed);
 	const char* name = d.name.empty() ? "loom-dedicated" : d.name.c_str();
 	ThreadStats* stats = RegisterThreadStats(P, index, name);
 	t_ThreadStats = stats;
