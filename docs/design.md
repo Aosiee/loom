@@ -7,7 +7,8 @@ is the contract.
 
 Tasks live in slots (`LoomConfig::maxTasks`, rounded up to chunks of 4096
 and grown a chunk at a time, with a warning, when exhausted). A slot holds the
-function, its user data or up to 48 bytes of an inline callable, the
+function, its user data or up to 48 bytes of an inline callable (an owned,
+non-trivial callable keeps its destroy function in the last 8), the
 affinity, and the counters it signals and waits on; each is two cache lines
 so adjacent slots run on different threads never share one. Every field a
 submit writes and a run reads sits in the first line (the second holds only

@@ -71,7 +71,10 @@ struct alignas(64) TaskSlot
 	uint8_t       window   = 0;                       // 17
 	DedicatedId   thread   = 0;                       // 20
 	CounterHandle signals  = kInvalidCounter;         // 24
-	Priority      priority = Priority::Normal;        // 28 (29 free)
+	Priority      priority = Priority::Normal;        // 28
+	// It owns a callable (Submit(F) with a non-trivial or large one): the
+	// destroy function sits at the end of inlineData (kOwnedDestroyOffset).
+	bool          owned    = false;                   // 29
 	uint16_t      isolation = 0;                      // 30: the Isolated region it belongs to (0 none)
 	uint32_t      nameId   = 0;                       // 32
 	// The next task of a group (a queue entry with kGroupBit), written by the
@@ -93,6 +96,10 @@ static_assert(offsetof(TaskSlot, nextBatch) + sizeof(uint32_t) <= 48 && offsetof
 // fields only (no atomic), and clear of batchCount and nextBatch.
 static_assert(offsetof(TaskSlot, batchCount) == 40 && offsetof(TaskSlot, nextBatch) == 44,
 	"the free-batch list bytes [0, 40) and [48, 64) hold no free-list field");
+// An owned callable takes inlineData's first kOwnedInlineSize bytes; its
+// destroy function the rest.
+static constexpr size_t kOwnedDestroyOffset = detail::kOwnedInlineSize;
+static_assert(kOwnedDestroyOffset + sizeof(TaskFn) <= sizeof(TaskSlot::inlineData), "the destroy pointer fits after the callable");
 
 // A slot index is (chunk << 12) | offset. Chunks are allocated whole and never
 // freed or moved, so a slot's address is stable for the pool's lifetime and
@@ -1348,6 +1355,7 @@ static uint32_t PrepareSlot(PoolState& P, const TaskDesc& desc, WorkerCtx* ctx)
 	t.thread = desc.thread;
 	t.signals = desc.signals;
 	t.priority = desc.priority;
+	t.owned = false; // byte 29 was part of the free-batch list
 	t.isolation = t_Isolation; // a task belongs to the region it was submitted in
 	t.nameId = desc.nameId;
 	t.window = desc.window;
@@ -1437,6 +1445,27 @@ void SubmitInlineRaw(const void* data, size_t size, void (*trampoline)(void*), c
 	std::memcpy(t.inlineData, data, size);
 	t.fn = trampoline;
 	t.userData = t.inlineData;
+	if (DispatchSlot(P, slot, opts, ctx))
+		WakeForWork(P, 1);
+}
+
+void SubmitOwnedRaw(void* src, void (*relocate)(void*, void*), void (*run)(void*), void (*destroy)(void*), const TaskDesc& opts)
+{
+	PoolState& P = ActivePool();
+	assert(opts.fn == nullptr && "Submit(F) and TaskDesc::fn are mutually exclusive");
+	WorkerCtx* ctx = CurrentCtx(P);
+	const uint32_t slot = PrepareSlot(P, opts, ctx);
+	TaskSlot& t = Slot(P, slot);
+	void* object = src;
+	if (relocate)
+	{
+		relocate(t.inlineData, src);
+		object = t.inlineData;
+	}
+	std::memcpy(t.inlineData + kOwnedDestroyOffset, &destroy, sizeof destroy);
+	t.owned = true;
+	t.fn = run;
+	t.userData = object;
 	if (DispatchSlot(P, slot, opts, ctx))
 		WakeForWork(P, 1);
 }
@@ -2124,6 +2153,9 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	const CounterHandle signals = t.signals;
 	const uint32_t nameId = t.nameId;
 	const uint8_t window = t.window;
+	TaskFn destroy = nullptr;
+	if (t.owned)
+		std::memcpy(&destroy, t.inlineData + kOwnedDestroyOffset, sizeof destroy);
 
 	// Deferred signals only ever belong to the counter the RUNNING task
 	// signals: that counter cannot reach zero before this task finishes, so
@@ -2146,6 +2178,10 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	if (fn && !cancelled)
 		RunTaskFn(P, fn, userData, signals); // an inline callable's userData is the slot: release after
 	t_Isolation = outerRegion;
+	// An owned callable dies whether it ran, threw or was skipped, and before
+	// the slot it may live in is released.
+	if (destroy)
+		destroy(userData);
 	MarkProfilerZone(P, threadIndex, nameId, window, "Task", false, zone);
 
 	// Live count and slot are given back before the signal: once a WaitFor on

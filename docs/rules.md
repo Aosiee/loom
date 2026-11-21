@@ -59,7 +59,12 @@ hands anything else to the other workers. If the region's work waits on
 work outside the region, the other threads must be free to run it: an
 isolated wait never will. (With no workers there is no isolation.)
 
-## Inline callables are small and trivially copyable
+## Keep hot-path callables small
 
-`Submit(F)` stores the callable in the task slot (48 bytes, no allocation),
-so it must be trivially copyable. Capture pointers, not owning objects.
+`Submit(F)` takes any callable, but only small ones avoid an allocation: a
+trivially copyable callable of up to 48 bytes, or a nothrow-movable one of up
+to 40 bytes (capturing a `std::string` or a `shared_ptr`, say), lives in the
+task slot. Anything bigger, or aligned past 16 bytes, costs one heap
+allocation per task. For per-frame work, capture pointers and indices. An
+owned callable is destroyed after its task runs, or when the task is skipped
+by cancellation, before the task signals its counter.

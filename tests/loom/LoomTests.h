@@ -9,10 +9,12 @@
 #include "loom/loom.h"
 #include "loom/loom_profiler_shim.h"
 #include <doctest/doctest.h>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <memory>
 #include <random>
 #include <set>
 #include <cstring>
@@ -1369,6 +1371,91 @@ TEST_CASE("loom: cancellation — a task's exception skips the rest of its count
 	loom::WaitFor(gate, loom::Help::BlockOnly);
 }
 #endif
+
+namespace {
+	// Counts its live instances, so a test can see every copy destroyed.
+	struct Tracked
+	{
+		static inline std::atomic<int> live{ 0 };
+		Tracked() { live++; }
+		Tracked(const Tracked&) { live++; }
+		Tracked(Tracked&&) noexcept { live++; }
+		~Tracked() { live--; }
+	};
+}
+
+TEST_CASE("loom: Submit(F) — non-trivial, large and over-aligned callables run once and are destroyed")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	Tracked::live = 0;
+	auto shared = std::make_shared<int>(0);
+	std::atomic<int> sum{ 0 };
+	loom::ScopedCounter done(3);
+	{
+		// Moved into the slot: a shared_ptr and a Tracked, well under 40 bytes.
+		Tracked tracked;
+		loom::Submit([shared, tracked, &sum]() { (void)tracked; sum += 1 + *shared; }, loom::TaskDesc{ .signals = done });
+		// Too big for the slot: on the heap.
+		std::array<int, 64> big{};
+		for (int i = 0; i < 64; i++)
+			big[(size_t)i] = i;
+		loom::Submit([big, tracked, &sum]() {
+			int s = 0;
+			for (int v : big)
+				s += v;
+			sum += s;
+		}, loom::TaskDesc{ .signals = done });
+		// Aligned past the slot's 16 bytes: on the heap, and still aligned.
+		struct alignas(64) Wide
+		{
+			std::atomic<int>* sum;
+			void operator()() const { *sum += ((uintptr_t)this % 64 == 0) ? 100 : -1000; }
+		};
+		loom::Submit(Wide{ &sum }, loom::TaskDesc{ .signals = done });
+	}
+	loom::WaitFor(done);
+	CHECK(sum.load() == 1 + 2016 + 100);
+	CHECK_MESSAGE(shared.use_count() == 1, "the task's copy of the shared_ptr is gone by the time WaitFor returns");
+	CHECK(Tracked::live.load() == 0);
+}
+
+TEST_CASE("loom: Submit(F) — an owned callable is destroyed when cancelled or when it throws")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	Tracked::live = 0;
+	OrderLog hold;
+	loom::ScopedCounter gate(1);
+	loom::Submit(loom::TaskDesc{ .fn = &HoldUntilOpen, .userData = &hold, .signals = gate });
+	std::atomic<int> ran{ 0 };
+	loom::CounterHandle c = loom::CreateCounter(6);
+	{
+		Tracked tracked;
+		std::array<char, 100> big{};
+		for (int i = 0; i < 3; i++)
+		{
+			loom::Submit([tracked, &ran]() { (void)tracked; ran++; }, loom::TaskDesc{ .signals = c });
+			loom::Submit([tracked, big, &ran]() { (void)tracked; (void)big; ran++; }, loom::TaskDesc{ .signals = c });
+		}
+	}
+	CHECK(Tracked::live.load() == 6); // one per queued task
+	loom::Cancel(c);
+	hold.open = true;
+	loom::WaitFor(c);
+	CHECK(ran.load() == 0);
+	CHECK_MESSAGE(Tracked::live.load() == 0, "skipped tasks still destroyed their callables");
+	loom::DestroyCounter(c);
+	loom::WaitFor(gate);
+
+#if defined(__cpp_exceptions)
+	loom::ScopedCounter thrown(1);
+	{
+		Tracked tracked;
+		loom::Submit([tracked]() { (void)tracked; throw std::runtime_error("owned"); }, loom::TaskDesc{ .signals = thrown });
+	}
+	CHECK_THROWS_AS(loom::WaitFor(thrown), std::runtime_error);
+	CHECK(Tracked::live.load() == 0);
+#endif
+}
 
 TEST_CASE("loom: isolation — an isolated wait skips a foreign task on its own deque")
 {

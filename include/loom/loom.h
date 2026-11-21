@@ -140,28 +140,56 @@ void Submit(const TaskDesc&);
 // docs/design.md). Prefer it whenever the tasks are known together.
 void Submit(std::span<const TaskDesc>);
 
-// Convenience: inline-stores a trivially-copyable callable of <= 48 bytes
-// into the task slot — zero allocation.
+// Convenience: submits any callable. Where it is stored:
+//   - trivially copyable, up to 48 bytes: its bytes, in the task slot;
+//   - otherwise up to 40 bytes and nothrow-movable (a lambda capturing a
+//     std::string or a shared_ptr, say): moved into the task slot;
+//   - anything bigger, or aligned past 16 bytes: one heap allocation.
+// The first two never allocate. A stored callable is destroyed once the task
+// has run, or when it is skipped because its counter was cancelled.
 namespace detail {
 // Copies `size` bytes from `data` into the task slot's inline storage and
 // enqueues a task that calls `trampoline` with the slot's storage pointer.
 void SubmitInlineRaw(const void* data, size_t size, void (*trampoline)(void*), const TaskDesc& opts);
+// Enqueues a task that owns a callable. With `relocate`, the callable is
+// move-constructed from `src` into the slot (it must fit kOwnedInlineSize);
+// without, `src` is a heap object the task takes over. `run` calls it and
+// `destroy` ends it (freeing a heap one), after the run or the skip.
+void SubmitOwnedRaw(void* src, void (*relocate)(void* dst, void* src), void (*run)(void*), void (*destroy)(void*), const TaskDesc& opts);
+inline constexpr size_t kOwnedInlineSize = 40; // the slot's 48, less the destroy pointer
 template <typename G>
 void InlineTrampoline(void* p) { (*static_cast<G*>(p))(); }
+template <typename G>
+void OwnedRelocate(void* dst, void* src) noexcept { ::new (dst) G(std::move(*static_cast<G*>(src))); }
+template <typename G>
+void OwnedDestroyInPlace(void* p) noexcept { static_cast<G*>(p)->~G(); }
+template <typename G>
+void OwnedDestroyHeap(void* p) noexcept { delete static_cast<G*>(p); }
 } // namespace detail
 
 template <typename F> requires std::is_invocable_v<std::decay_t<F>&>
 void Submit(F&& fn, const TaskDesc& opts = {})
 {
 	using G = std::decay_t<F>;
-	static_assert(std::is_trivially_copyable_v<G>,
-		"loom::Submit(F) requires a trivially-copyable callable");
-	static_assert(sizeof(G) <= 48,
-		"loom::Submit(F) callables must fit in 48 bytes");
-	// Materialise the decayed callable, then copy its bytes into the slot
-	// (hence trivially copyable: no constructor runs there).
-	G copy(std::forward<F>(fn));
-	detail::SubmitInlineRaw(&copy, sizeof(G), &detail::InlineTrampoline<G>, opts);
+	if constexpr (std::is_trivially_copyable_v<G> && sizeof(G) <= 48 && alignof(G) <= 16)
+	{
+		// Materialise the decayed callable, then copy its bytes into the slot
+		// (no constructor or destructor ever runs there).
+		G copy(std::forward<F>(fn));
+		detail::SubmitInlineRaw(&copy, sizeof(G), &detail::InlineTrampoline<G>, opts);
+	}
+	else if constexpr (sizeof(G) <= detail::kOwnedInlineSize && alignof(G) <= 16 && std::is_nothrow_move_constructible_v<G>)
+	{
+		// Built here, where a throwing copy cannot leave a half-made task, then
+		// moved into the slot (nothrow) and destroyed with it.
+		G copy(std::forward<F>(fn));
+		detail::SubmitOwnedRaw(&copy, &detail::OwnedRelocate<G>, &detail::InlineTrampoline<G>, &detail::OwnedDestroyInPlace<G>, opts);
+	}
+	else
+	{
+		G* heap = new G(std::forward<F>(fn)); // over-aligned types get aligned new
+		detail::SubmitOwnedRaw(heap, nullptr, &detail::InlineTrampoline<G>, &detail::OwnedDestroyHeap<G>, opts);
+	}
 }
 
 // ---- Counters (the only synchronization primitive) -------------------------
