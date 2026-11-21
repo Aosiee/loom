@@ -229,7 +229,10 @@ struct DedicatedConfig
 	enum class Idle : uint8_t { Sleep, StealFromPool };
 	Idle idle = Idle::Sleep;
 };
-DedicatedId RegisterDedicatedThread(const DedicatedConfig&); // spawns
+// Spawns the thread. Each id is handed out once per pool, so a stale id
+// (of an unregistered thread) never reaches a newer thread; ids are not small
+// indices. Submitting to an unregistered id is a bug (asserted).
+DedicatedId RegisterDedicatedThread(const DedicatedConfig&);
 void         UnregisterDedicatedThread(DedicatedId);         // drains + joins
 
 // ---- Thread identity -------------------------------------------------------

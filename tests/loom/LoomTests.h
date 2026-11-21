@@ -924,6 +924,46 @@ TEST_CASE("loom: thread stats — helping is counted and shown, rows outlive the
 	CHECK(rowKept);
 }
 
+TEST_CASE("loom: dedicated — submits stay safe while other dedicated threads come and go")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::DedicatedId steady = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "steady" });
+
+	// Ids are never reused: a stale id cannot reach a newer thread.
+	loom::DedicatedId first = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "first" });
+	loom::UnregisterDedicatedThread(first);
+	loom::DedicatedId second = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "second" });
+	CHECK(second != first);
+	loom::UnregisterDedicatedThread(second);
+
+	// One thread churns the registry (its vector reallocates) while the main
+	// thread keeps submitting to the steady thread.
+	std::atomic<bool> stop{ false };
+	std::thread churn([&] {
+		while (!stop)
+		{
+			loom::DedicatedId d = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "churn" });
+			loom::CounterHandle c = loom::CreateCounter(4);
+			for (int i = 0; i < 4; i++)
+				loom::Submit(loom::TaskDesc{ .fn = &Noop, .affinity = loom::Affinity::Dedicated, .thread = d, .signals = c });
+			loom::WaitFor(c, loom::Help::BlockOnly);
+			loom::DestroyCounter(c);
+			loom::UnregisterDedicatedThread(d);
+		}
+	});
+	std::atomic<int> ran{ 0 };
+	const int N = 20000;
+	loom::ScopedCounter done(N);
+	for (int i = 0; i < N; i++)
+		loom::Submit(loom::TaskDesc{ .fn = [](void* p) { static_cast<std::atomic<int>*>(p)->fetch_add(1); },
+			.userData = &ran, .affinity = loom::Affinity::Dedicated, .thread = steady, .signals = done });
+	loom::WaitFor(done);
+	stop = true;
+	churn.join();
+	CHECK(ran.load() == N);
+	loom::UnregisterDedicatedThread(steady);
+}
+
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
 	loom::Pool pool; // the suite owns its pool explicitly

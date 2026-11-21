@@ -388,6 +388,8 @@ struct PoolState
 
 	std::mutex              dedicatedMutex;
 	std::vector<std::unique_ptr<DedicatedState>> dedicated;
+	// Ids are handed out once: a stale id never reaches a newer thread.
+	DedicatedId             nextDedicatedId = 0;
 	std::atomic<int>        lanesHeld{ 0 };
 
 	// Thread stats (the pool visualizer).
@@ -1054,12 +1056,12 @@ static bool EnqueueSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	}
 	case Affinity::Dedicated:
 	{
+		// The registry lock stays held through the push: an unregister frees
+		// the thread's state as soon as it is out of the registry.
+		std::lock_guard<std::mutex> registry(P.dedicatedMutex);
 		DedicatedState* d = nullptr;
-		{
-			std::lock_guard<std::mutex> lock(P.dedicatedMutex);
-			for (auto& dd : P.dedicated)
-				if (dd->id == t.thread) { d = dd.get(); break; }
-		}
+		for (auto& dd : P.dedicated)
+			if (dd->id == t.thread) { d = dd.get(); break; }
 		assert(d && "Dedicated task submitted to an unregistered thread");
 		if (!d)
 			return false;
@@ -1936,15 +1938,8 @@ DedicatedId RegisterDedicatedThread(const DedicatedConfig& config)
 {
 	PoolState& P = ActivePool();
 	std::lock_guard<std::mutex> lock(P.dedicatedMutex);
-	uint32_t id = 0;
-	for (;;)
-	{
-		bool taken = false;
-		for (auto& d : P.dedicated)
-			if (d->id == id) { taken = true; break; }
-		if (!taken) break;
-		id++;
-	}
+	const DedicatedId id = P.nextDedicatedId++;
+	assert(id != kInvalidDedicated && "dedicated thread ids exhausted");
 	auto d = std::make_unique<DedicatedState>();
 	d->id = id;
 	d->name = config.name ? config.name : "";
@@ -1959,6 +1954,7 @@ DedicatedId RegisterDedicatedThread(const DedicatedConfig& config)
 void UnregisterDedicatedThread(DedicatedId id)
 {
 	PoolState& P = ActivePool();
+	assert((!CurrentDedicated() || CurrentDedicated()->id != id) && "a dedicated thread cannot unregister itself (it would join itself)");
 	std::unique_ptr<DedicatedState> d;
 	{
 		std::lock_guard<std::mutex> lock(P.dedicatedMutex);
