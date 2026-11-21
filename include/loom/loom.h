@@ -231,20 +231,25 @@ void Isolated(F&& fn)
 }
 
 // ---- ParallelFor ------------------------------------------------------------
-// Splits [begin, end) into ceil((end-begin)/chunkSize) contiguous chunks -
-// each task processes AT MOST chunkSize indices (the last chunk takes the
-// remainder) - fans each out as an AnyWorker task signalling one counter,
-// and waits for all of them. `fn` is invoked as fn(chunkBegin, chunkEnd,
-// userData). Each call allocates one array of chunk records (one entry per
-// chunk, freed when the wait returns); the chunks themselves take task
-// slots, which never allocate. The lambda convenience calls the callable in
-// place (it lives on the caller's stack until the wait returns), never a
-// heap copy. Pick chunkSize so there are a small multiple of WorkerCount()
-// chunks, each with enough work to dwarf the per-task tax (see
-// bench/loom_bench.cpp).
+// Runs fn over [begin, end) on the pool and waits. `fn` is invoked as
+// fn(subBegin, subEnd, userData) on disjoint pieces covering the range, each
+// index exactly once, in no particular order.
+//
+// chunkSize 0 (or the overloads without one) chunks automatically: the range
+// starts as one piece per thread, and a piece splits off half its remaining
+// work whenever a worker is idle, so an uneven workload still spreads and a
+// busy pool pays almost nothing. Otherwise the range is cut into
+// ceil((end-begin)/chunkSize) fixed chunks of at most chunkSize indices
+// (the last takes the remainder), one task each.
+//
+// If fn throws, the pieces not yet started are skipped and ParallelFor
+// rethrows the first exception. Each call allocates one small array of
+// piece records; the tasks themselves never allocate. The lambda forms call
+// the callable in place (it lives on the caller's stack), never a heap copy.
 using ParallelForFn = void (*)(size_t begin, size_t end, void* userData);
 
 void ParallelFor(size_t begin, size_t end, size_t chunkSize, ParallelForFn fn, void* userData);
+inline void ParallelFor(size_t begin, size_t end, ParallelForFn fn, void* userData) { ParallelFor(begin, end, 0, fn, userData); }
 
 template <typename F> requires std::is_invocable_v<std::decay_t<F>&, size_t, size_t>
 void ParallelFor(size_t begin, size_t end, size_t chunkSize, F&& fn)
@@ -265,6 +270,40 @@ void ParallelFor(size_t begin, size_t end, size_t chunkSize, F&& fn)
 		ParallelFor(begin, end, chunkSize,
 			[](size_t b, size_t e, void* user) { (*static_cast<G*>(user))(b, e); }, &copy);
 	}
+}
+
+template <typename F> requires std::is_invocable_v<std::decay_t<F>&, size_t, size_t>
+void ParallelFor(size_t begin, size_t end, F&& fn)
+{
+	ParallelFor(begin, end, size_t(0), std::forward<F>(fn));
+}
+
+// ---- ParallelReduce ---------------------------------------------------------
+// Reduces [begin, end) to one value, reproducibly: map(chunkBegin, chunkEnd)
+// gives each chunk's partial result, and the partials are combined in index
+// order, result = combine(combine(identity, p0), p1)..., on the calling
+// thread. The chunks depend only on the range and chunkSize, never on the
+// worker count or on timing, so the same inputs give the same bits (a
+// floating-point sum included). chunkSize 0 picks a size from the range length
+// alone (about 256 chunks). Exceptions propagate as in ParallelFor.
+template <typename T, typename Map, typename Combine>
+	requires std::is_invocable_r_v<T, Map&, size_t, size_t> && std::is_invocable_r_v<T, Combine&, T, T>
+T ParallelReduce(size_t begin, size_t end, size_t chunkSize, T identity, Map&& map, Combine&& combine)
+{
+	if (begin >= end)
+		return identity;
+	const size_t n = end - begin;
+	if (chunkSize == 0)
+		chunkSize = (n - 1) / 256 + 1;
+	const size_t chunks = (n - 1) / chunkSize + 1;
+	std::vector<T> partials(chunks, identity);
+	ParallelFor(begin, end, chunkSize, [&](size_t b, size_t e) {
+		partials[(b - begin) / chunkSize] = map(b, e);
+	});
+	T result = std::move(identity);
+	for (T& partial : partials)
+		result = combine(std::move(result), std::move(partial));
+	return result;
 }
 
 // ---- Lanes ------------------------------------------------------------------

@@ -548,6 +548,9 @@ static uint32_t AllocateSlot(PoolState& P, WorkerCtx* ctx);
 static bool     EnqueueSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx);
 static void     RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx);
 static void     RunEntry(PoolState& P, uint32_t entry, WorkerCtx* ctx);
+#if defined(__cpp_exceptions)
+static void     RecordTaskException(PoolState& P, CounterHandle signals, std::exception_ptr error);
+#endif
 static void     SignalCounter(PoolState& P, CounterHandle h, int n);
 static void     FlushDeferredSignals(PoolState& P, WorkerCtx* ctx);
 static void     WakeForWork(PoolState& P, size_t n);
@@ -1371,12 +1374,121 @@ namespace {
 
 } // namespace
 
+// ---- ParallelFor with automatic chunking ---------------------------------------
+// The range starts as one piece per thread. A piece works through its range a
+// grain at a time, and whenever a worker is idle or searching (someone could
+// take more), it splits off its upper half as a new task first. A busy pool
+// pays one load per grain; an idle worker gets work within a grain.
+// Completion counts ITEMS, so a split needs no counter increment.
+
+namespace {
+
+	struct AutoRange
+	{
+		size_t begin = 0, end = 0, grain = 1;
+		ParallelForFn fn = nullptr;
+		void* userData = nullptr;
+		CounterHandle items = kInvalidCounter;
+	};
+	static_assert(sizeof(AutoRange) <= 48 && std::is_trivially_copyable_v<AutoRange>, "an AutoRange travels inline in a task slot");
+
+	bool SomeoneCouldTakeWork(PoolState& P)
+	{
+		return P.numIdle.load(std::memory_order_relaxed) > 0 || P.numSearching.load(std::memory_order_relaxed) > 0;
+	}
+
+	void AutoRangeRun(AutoRange r);
+	void AutoRangeTask(void* p) { AutoRangeRun(*static_cast<AutoRange*>(p)); }
+
+	void AutoRangeRun(AutoRange r)
+	{
+		PoolState& P = ActivePool();
+		while (r.begin < r.end)
+		{
+			const size_t left = r.end - r.begin;
+			if (IsCancelled(r.items))
+			{
+				Signal(r.items, (int)left); // a chunk threw: the rest is skipped
+				return;
+			}
+			if (left >= 2 * r.grain && SomeoneCouldTakeWork(P))
+			{
+				AutoRange upper = r;
+				upper.begin = r.begin + left / 2;
+				r.end = upper.begin;
+				detail::SubmitInlineRaw(&upper, sizeof upper, &AutoRangeTask, TaskDesc{});
+				continue;
+			}
+			const size_t step = std::min(r.grain, left);
+#if defined(__cpp_exceptions)
+			try
+			{
+				r.fn(r.begin, r.begin + step, r.userData);
+			}
+			catch (...)
+			{
+				RecordTaskException(P, r.items, std::current_exception()); // and cancels the rest
+				Signal(r.items, (int)left);
+				return;
+			}
+#else
+			r.fn(r.begin, r.begin + step, r.userData);
+#endif
+			Signal(r.items, (int)step);
+			r.begin += step;
+		}
+	}
+
+} // namespace
+
+static void ParallelForFixed(PoolState& P, size_t begin, size_t end, size_t chunkSize, ParallelForFn fn, void* userData);
+
+static void ParallelForAuto(PoolState& P, size_t begin, size_t end, ParallelForFn fn, void* userData)
+{
+	const size_t n = end - begin;
+	const size_t threads = (size_t)P.workerCount + 1;
+	// The count is an int: past that, fall back to fixed chunks.
+	if (n >= (size_t)INT_MAX / 2)
+	{
+		ParallelForFixed(P, begin, end, (n - 1) / (threads * 16) + 1, fn, userData);
+		return;
+	}
+	const size_t grain = std::max<size_t>(1, n / (threads * 64));
+	const size_t pieces = std::min(threads, (n - 1) / grain + 1);
+	const CounterHandle items = CreateCounter((int)n);
+	struct DestroyOnExit
+	{
+		CounterHandle h;
+		~DestroyOnExit() { DestroyCounter(h); }
+	} destroy{ items };
+
+	std::vector<AutoRange> roots(pieces);
+	std::vector<TaskDesc> descs(pieces);
+	size_t cursor = begin;
+	for (size_t i = 0; i < pieces; i++)
+	{
+		const size_t pieceEnd = i + 1 == pieces ? end : cursor + n / pieces;
+		roots[i] = AutoRange{ cursor, pieceEnd, grain, fn, userData, items };
+		descs[i] = TaskDesc{ .fn = &AutoRangeTask, .userData = &roots[i] };
+		cursor = pieceEnd;
+	}
+	Submit(std::span<const TaskDesc>(descs));
+	WaitFor(items);
+}
+
 void ParallelFor(size_t begin, size_t end, size_t chunkSize, ParallelForFn fn, void* userData)
 {
 	PoolState& P = ActivePool(); // the no-pool assert even for an empty range
-	if (begin >= end || chunkSize == 0 || fn == nullptr)
+	if (begin >= end || fn == nullptr)
 		return;
+	if (chunkSize == 0)
+		ParallelForAuto(P, begin, end, fn, userData);
+	else
+		ParallelForFixed(P, begin, end, chunkSize, fn, userData);
+}
 
+static void ParallelForFixed(PoolState& P, size_t begin, size_t end, size_t chunkSize, ParallelForFn fn, void* userData)
+{
 	const size_t chunkCount = (end - begin - 1) / chunkSize + 1;
 	assert(chunkCount < (size_t)INT_MAX && "ParallelFor: too many chunks for one counter");
 	std::vector<ParallelRange> ranges(chunkCount);

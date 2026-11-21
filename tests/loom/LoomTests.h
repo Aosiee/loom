@@ -14,6 +14,8 @@
 #include <condition_variable>
 #include <mutex>
 #include <random>
+#include <set>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1427,6 +1429,122 @@ TEST_CASE("loom: isolation — without workers a region still waits on outside w
 	loom::Submit(loom::TaskDesc{ .fn = &Noop, .signals = outside }); // not in the region
 	loom::Isolated([&] { loom::WaitFor(outside); }); // nobody else could run it: no isolation
 	CHECK(loom::Load(outside) == 0);
+}
+
+TEST_CASE("loom: ParallelFor — automatic chunking covers every index once, any size, any pool")
+{
+	for (int workers : { 0, 1, 3, -1 })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		for (size_t n : { size_t(1), size_t(2), size_t(7), size_t(1000), size_t(100000), size_t(1000000) })
+		{
+			std::vector<std::atomic<uint8_t>> hits(n);
+			loom::ParallelFor(0, n, [&hits](size_t b, size_t e) {
+				for (size_t i = b; i < e; i++)
+					hits[i].fetch_add(1, std::memory_order_relaxed);
+			});
+			bool allOnce = true;
+			for (auto& h : hits)
+				allOnce &= h.load() == 1;
+			CHECK_MESSAGE(allOnce, "workers ", workers, ", n ", n, ": every index exactly once");
+		}
+		// The pointer form with chunkSize 0, over an offset range.
+		std::vector<std::atomic<int>> hits(500);
+		loom::ParallelFor(100, 600, 0, [](size_t b, size_t e, void* user) {
+			auto& h = *static_cast<std::vector<std::atomic<int>>*>(user);
+			for (size_t i = b; i < e; i++)
+				h[i - 100]++;
+		}, &hits);
+		bool allOnce = true;
+		for (auto& h : hits)
+			allOnce &= h.load() == 1;
+		CHECK(allOnce);
+	}
+}
+
+TEST_CASE("loom: ParallelFor — automatic chunking spreads uneven work and nests")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 3 });
+	// The last few items are expensive: a fixed one-piece-per-thread split
+	// would leave them on one thread.
+	std::mutex m;
+	std::set<int> heavyThreads;
+	loom::ParallelFor(0, 4096, [&](size_t b, size_t e) {
+		for (size_t i = b; i < e; i++)
+			if (i >= 4096 - 64)
+			{
+				std::this_thread::sleep_for(std::chrono::milliseconds(2));
+				std::lock_guard<std::mutex> l(m);
+				heavyThreads.insert(loom::CurrentThreadIndex());
+			}
+	});
+	CHECK_MESSAGE(heavyThreads.size() >= 2, "the expensive tail ran on ", heavyThreads.size(), " thread(s)");
+
+	std::atomic<int> cells{ 0 };
+	loom::ParallelFor(0, 64, [&cells](size_t b, size_t e) {
+		for (size_t i = b; i < e; i++)
+			loom::ParallelFor(0, 64, [&cells](size_t ib, size_t ie) { cells += (int)(ie - ib); });
+	});
+	CHECK(cells.load() == 64 * 64);
+}
+
+#if defined(__cpp_exceptions)
+TEST_CASE("loom: ParallelFor — automatic chunking rethrows and runs no index twice")
+{
+	loom::Pool pool; // the suite owns its pool explicitly
+	std::vector<std::atomic<int>> hits(100000);
+	CHECK_THROWS_AS(loom::ParallelFor(0, hits.size(), [&hits](size_t b, size_t e) {
+		for (size_t i = b; i < e; i++)
+		{
+			hits[i]++;
+			if (i == 54321)
+				throw std::runtime_error("auto");
+		}
+	}), std::runtime_error);
+	bool atMostOnce = true;
+	for (auto& h : hits)
+		atMostOnce &= h.load() <= 1;
+	CHECK(atMostOnce);
+	CHECK(loom::LiveTaskCount() == 0);
+}
+#endif
+
+TEST_CASE("loom: ParallelReduce — the same bits on every run and with any number of workers")
+{
+	const size_t N = 1000000;
+	auto map = [](size_t b, size_t e) {
+		double sum = 0.0;
+		for (size_t i = b; i < e; i++)
+			sum += 1.0 / (double)(i + 1);
+		return sum;
+	};
+	auto add = [](double a, double b) { return a + b; };
+	// The reference: the same chunks folded in order, serially.
+	const size_t chunk = (N - 1) / 256 + 1;
+	double expected = 0.0;
+	for (size_t b = 0; b < N; b += chunk)
+		expected = add(expected, map(b, std::min(N, b + chunk)));
+
+	for (int workers : { 0, 1, 4, -1 })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		for (int run = 0; run < 3; run++)
+		{
+			const double got = loom::ParallelReduce(0, N, 0, 0.0, map, add);
+			CHECK_MESSAGE(std::memcmp(&got, &expected, sizeof got) == 0, "workers ", workers, ", run ", run, ": bit-identical sum");
+		}
+	}
+
+	// The combine runs in index order: a non-commutative one shows it.
+	loom::Pool pool; // the suite owns its pool explicitly
+	const std::string joined = loom::ParallelReduce(0, 40, 3, std::string(),
+		[](size_t b, size_t e) { std::string s; for (size_t i = b; i < e; i++) s += (char)('A' + (i % 26)); return s; },
+		[](std::string a, std::string b) { return a + b; });
+	std::string serial;
+	for (size_t i = 0; i < 40; i++)
+		serial += (char)('A' + (i % 26));
+	CHECK(joined == serial);
+	CHECK(loom::ParallelReduce(5, 5, 0, 42, [](size_t, size_t) { return 0; }, [](int a, int b) { return a + b; }) == 42);
 }
 
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
