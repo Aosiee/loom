@@ -1331,6 +1331,104 @@ TEST_CASE("loom: cancellation — a task's exception skips the rest of its count
 }
 #endif
 
+TEST_CASE("loom: isolation — an isolated wait skips a foreign task on its own deque")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	OrderLog hold; // keeps the one worker busy until the checks are done
+	loom::ScopedCounter gate(1);
+	loom::Submit(loom::TaskDesc{ .fn = &HoldUntilOpen, .userData = &hold, .signals = gate });
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+	struct Foreign { std::thread::id mainId; std::atomic<bool> ranOnMain{ false }, ran{ false }; } foreign;
+	foreign.mainId = std::this_thread::get_id();
+	// A long task from outside the region, parked until `release`: signalling
+	// it from inside the region puts it on top of the main thread's deque,
+	// above the region's own task.
+	loom::ScopedCounter release(1), foreignDone(1), mine(1);
+	loom::Submit(loom::TaskDesc{ .fn = [](void* p) {
+		Foreign& f = *static_cast<Foreign*>(p);
+		f.ranOnMain = std::this_thread::get_id() == f.mainId;
+		std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		f.ran = true;
+	}, .userData = &foreign, .signals = foreignDone, .waitsFor = release });
+
+	std::chrono::steady_clock::duration waited{};
+	loom::Isolated([&] {
+		loom::Submit(loom::TaskDesc{ .fn = &Noop, .signals = mine });
+		loom::Signal(release);
+		const auto start = std::chrono::steady_clock::now();
+		loom::WaitFor(mine); // helps: must run its own task, not the long one above it
+		waited = std::chrono::steady_clock::now() - start;
+	});
+	CHECK_MESSAGE(waited < std::chrono::milliseconds(150), "the isolated wait did not run the foreign 300 ms task");
+	CHECK_FALSE(foreign.ran.load());
+	hold.open = true; // now the worker takes the foreign task
+	loom::WaitFor(foreignDone, loom::Help::BlockOnly);
+	CHECK(foreign.ran.load());
+	CHECK_FALSE(foreign.ranOnMain.load());
+	loom::WaitFor(gate, loom::Help::BlockOnly);
+}
+
+TEST_CASE("loom: isolation — a region's tasks, and their own waits, stay in the region")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	OrderLog hold; // the worker is held: only the main thread runs anything
+	loom::ScopedCounter gate(1);
+	loom::Submit(loom::TaskDesc{ .fn = &HoldUntilOpen, .userData = &hold, .signals = gate });
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+	struct State
+	{
+		loom::CounterHandle release = loom::kInvalidCounter;
+		std::atomic<bool> foreignRan{ false };
+		std::chrono::steady_clock::duration childWait{};
+	} st;
+	loom::ScopedCounter release(1), foreignDone(1), parentDone(1);
+	st.release = release;
+	loom::Submit(loom::TaskDesc{ .fn = [](void* p) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		static_cast<State*>(p)->foreignRan = true;
+	}, .userData = &st, .signals = foreignDone, .waitsFor = release }); // outside the region
+
+	loom::Isolated([&] {
+		// The parent runs on the main thread (its wait helps). Inside it, a
+		// child, then the foreign task released on top of it: the parent's own
+		// wait must be isolated to the region (skip the foreign task) and must
+		// count the child as the region's (or nobody could run it).
+		loom::Submit(loom::TaskDesc{ .fn = [](void* p) {
+			State& s = *static_cast<State*>(p);
+			loom::CounterHandle child = loom::CreateCounter(1);
+			loom::Submit(loom::TaskDesc{ .fn = &Noop, .signals = child });
+			loom::Signal(s.release);
+			const auto start = std::chrono::steady_clock::now();
+			loom::WaitFor(child);
+			s.childWait = std::chrono::steady_clock::now() - start;
+			loom::DestroyCounter(child);
+		}, .userData = &st, .signals = parentDone });
+		loom::WaitFor(parentDone);
+
+		std::atomic<int> cells{ 0 }; // nested ParallelFor inside a region
+		loom::ParallelFor(0, 4, 1, [&cells](size_t, size_t) {
+			loom::ParallelFor(0, 4, 1, [&cells](size_t, size_t) { cells++; });
+		});
+		CHECK(cells.load() == 16);
+	});
+	CHECK_MESSAGE(st.childWait < std::chrono::milliseconds(150), "the task's own wait skipped the foreign task");
+	CHECK_FALSE(st.foreignRan.load());
+	hold.open = true;
+	loom::WaitFor(foreignDone, loom::Help::BlockOnly);
+	loom::WaitFor(gate, loom::Help::BlockOnly);
+}
+
+TEST_CASE("loom: isolation — without workers a region still waits on outside work")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 0 });
+	loom::ScopedCounter outside(1);
+	loom::Submit(loom::TaskDesc{ .fn = &Noop, .signals = outside }); // not in the region
+	loom::Isolated([&] { loom::WaitFor(outside); }); // nobody else could run it: no isolation
+	CHECK(loom::Load(outside) == 0);
+}
+
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
 	loom::Pool pool; // the suite owns its pool explicitly

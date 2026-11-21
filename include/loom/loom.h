@@ -205,6 +205,31 @@ private:
 	CounterHandle m_Handle = kInvalidCounter;
 };
 
+// ---- Isolation ---------------------------------------------------------------
+// Runs fn() as an isolated region. The tasks submitted inside it, and the
+// tasks those submit, belong to the region; a WaitFor inside it helps only
+// with the region's tasks, so a frame-critical wait never picks up an
+// unrelated long task. Other work it meets in its own queues is handed to the
+// other workers, and it never steals. So the region's work must not depend on
+// work outside it that only this thread could run. With no workers
+// (workerCount 0) a region does not isolate: nobody else could run the rest.
+// Regions nest; the innermost one counts.
+namespace detail {
+	uint16_t BeginIsolation();   // returns the region the thread was in
+	void     EndIsolation(uint16_t outer);
+}
+
+template <typename F> requires std::is_invocable_v<F&&>
+void Isolated(F&& fn)
+{
+	struct Scope
+	{
+		uint16_t outer = detail::BeginIsolation();
+		~Scope() { detail::EndIsolation(outer); }
+	} scope;
+	std::forward<F>(fn)();
+}
+
 // ---- ParallelFor ------------------------------------------------------------
 // Splits [begin, end) into ceil((end-begin)/chunkSize) contiguous chunks -
 // each task processes AT MOST chunkSize indices (the last chunk takes the

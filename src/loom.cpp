@@ -68,7 +68,8 @@ struct alignas(64) TaskSlot
 	uint8_t       window   = 0;                       // 17
 	DedicatedId   thread   = 0;                       // 20
 	CounterHandle signals  = kInvalidCounter;         // 24
-	Priority      priority = Priority::Normal;        // 28 (29-31 free)
+	Priority      priority = Priority::Normal;        // 28 (29 free)
+	uint16_t      isolation = 0;                      // 30: the Isolated region it belongs to (0 none)
 	uint32_t      nameId   = 0;                       // 32
 	// The next task of a group (a queue entry with kGroupBit), written by the
 	// submitter before the push and read by whoever takes the group. While a
@@ -439,6 +440,10 @@ struct PoolState
 	// are still alive.
 	std::atomic<ProfilerStateFn> profilerStateHook{ nullptr };
 	std::atomic<ProfilerZoneFn>  profilerZoneHook{ nullptr };
+
+	// The next Isolated region's tag (16 bits, 0 skipped: a tag is reused
+	// only after 65535 regions, and a clash only widens what a wait helps with).
+	std::atomic<uint16_t>   nextIsolation{ 1 };
 };
 
 // The two process-scope values:
@@ -459,6 +464,9 @@ static thread_local WorkerCtx*      t_WorkerCtx = nullptr;
 static thread_local DedicatedState* t_CurrentDedicated = nullptr;
 // A pool thread's stats row (workers and dedicated threads; null elsewhere).
 static thread_local ThreadStats*    t_ThreadStats = nullptr;
+// The Isolated region the calling thread is in (0: none). A running task's
+// thread is in that task's region, so its children inherit it.
+static thread_local uint16_t        t_Isolation = 0;
 
 static PoolState& ActivePool()
 {
@@ -479,6 +487,13 @@ static WorkerCtx* CurrentCtx(PoolState& P)
 }
 
 static DedicatedState* CurrentDedicated() { return t_CurrentDedicated; }
+
+// The region a wait on this thread is isolated to. None without workers:
+// nobody else could run the work outside it.
+static uint16_t ActiveIsolation(PoolState& P)
+{
+	return P.workerCount > 0 ? t_Isolation : 0;
+}
 
 static std::atomic<int64_t>& LiveShard(PoolState& P, WorkerCtx* ctx)
 {
@@ -1250,6 +1265,7 @@ static uint32_t PrepareSlot(PoolState& P, const TaskDesc& desc, WorkerCtx* ctx)
 	t.thread = desc.thread;
 	t.signals = desc.signals;
 	t.priority = desc.priority;
+	t.isolation = t_Isolation; // a task belongs to the region it was submitted in
 	t.nameId = desc.nameId;
 	t.window = desc.window;
 	LiveShard(P, ctx).fetch_add(1, std::memory_order_relaxed);
@@ -1517,6 +1533,26 @@ static void SignalCounter(PoolState& P, CounterHandle h, int n)
 	WakeForWork(P, pooled);
 }
 
+namespace detail {
+
+uint16_t BeginIsolation()
+{
+	PoolState& P = ActivePool();
+	uint16_t region = P.nextIsolation.fetch_add(1, std::memory_order_relaxed);
+	if (region == 0)
+		region = P.nextIsolation.fetch_add(1, std::memory_order_relaxed);
+	const uint16_t outer = t_Isolation;
+	t_Isolation = region;
+	return outer;
+}
+
+void EndIsolation(uint16_t outer)
+{
+	t_Isolation = outer;
+}
+
+} // namespace detail
+
 void Cancel(CounterHandle h)
 {
 	CounterState* c = ResolveCounter(ActivePool(), h);
@@ -1585,7 +1621,8 @@ static void SleepOnCounter(PoolState& P, CounterState& c, bool help)
 			inDedicated = true;
 		}
 	}
-	const bool poolEligible = help && (!d || d->idle == DedicatedConfig::Idle::StealFromPool);
+	// An isolated wait takes no pool work, so new pool work need not wake it.
+	const bool poolEligible = help && (!d || d->idle == DedicatedConfig::Idle::StealFromPool) && !ActiveIsolation(P);
 	if (!ready && poolEligible)
 	{
 		RegisterIdle(P, w);
@@ -1687,13 +1724,59 @@ static uint32_t PopFront(std::mutex& m, std::deque<uint32_t>& q)
 	return slot;
 }
 
+static uint32_t PopFrontInRegion(PoolState& P, std::mutex& m, std::deque<uint32_t>& q, uint16_t region)
+{
+	std::lock_guard<std::mutex> lock(m);
+	for (auto it = q.begin(); it != q.end(); ++it)
+	{
+		if (Slot(P, *it).isolation == region)
+		{
+			const uint32_t slot = *it;
+			q.erase(it);
+			return slot;
+		}
+	}
+	return kNoSlot;
+}
+
+// The newest entry of this thread's own deques that belongs to `region`.
+// Entries of other regions it meets on the way go to the injection queue,
+// where the other workers take them: an isolated wait never runs them.
+static uint32_t PopOwnInRegion(PoolState& P, WorkerCtx& ctx, uint16_t region)
+{
+	for (int moved = 0; moved < 64; moved++)
+	{
+		uint32_t entry = PopOwn(P, ctx);
+		if (entry == kNoSlot && (entry = ctx.low.Pop()) != kNoSlot)
+			NoteTaken(P, Priority::Low);
+		if (entry == kNoSlot)
+			return kNoSlot;
+		if (Slot(P, entry & ~kGroupBit).isolation == region)
+			return entry;
+		PushPool(P, entry, nullptr);
+		WakeForWork(P, 1);
+	}
+	return kNoSlot;
+}
+
 static bool TryHelpIn(PoolState& P)
 {
 	if (P.stop.load(std::memory_order_relaxed)) return false; // the workers are going
 
 	WorkerCtx* ctx = CurrentCtx(P);
 	uint32_t slot = kNoSlot;
-	if (ctx && ctx->isMain)
+	if (const uint16_t region = ActiveIsolation(P))
+	{
+		// An isolated wait: only this region's tasks, from this thread's own
+		// queues; never a steal.
+		if (ctx && ctx->isMain)
+			slot = PopFrontInRegion(P, P.mainMutex, P.mainQueue, region);
+		else if (DedicatedState* d = CurrentDedicated())
+			slot = PopFrontInRegion(P, d->mutex, d->queue, region);
+		if (slot == kNoSlot && ctx)
+			slot = PopOwnInRegion(P, *ctx, region);
+	}
+	else if (ctx && ctx->isMain)
 	{
 		// Main-affinity first: it keeps main-only work deadlock-free while the
 		// main thread waits.
@@ -1705,9 +1788,9 @@ static bool TryHelpIn(PoolState& P)
 		if (slot == kNoSlot && d->idle != DedicatedConfig::Idle::StealFromPool)
 			return false;
 	}
-	if (slot == kNoSlot && ctx)
+	if (slot == kNoSlot && ctx && !ActiveIsolation(P))
 		slot = PopOwn(P, *ctx);
-	if (slot == kNoSlot)
+	if (slot == kNoSlot && !ActiveIsolation(P))
 		slot = StealOnce(P, ctx);
 	if (slot == kNoSlot)
 		return false;
@@ -1827,8 +1910,13 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	// A task of a cancelled counter is skipped, though it still signals it.
 	const CounterState* counter = signals != kInvalidCounter ? ResolveCounter(P, signals) : nullptr;
 	const bool cancelled = counter && counter->cancelled.load(std::memory_order_acquire);
+	// The task runs in its own region (RunTaskFn catches everything, so the
+	// restore below always happens).
+	const uint16_t outerRegion = t_Isolation;
+	t_Isolation = t.isolation;
 	if (fn && !cancelled)
 		RunTaskFn(P, fn, userData, signals); // an inline callable's userData is the slot: release after
+	t_Isolation = outerRegion;
 	MarkProfilerZone(P, threadIndex, nameId, window, "Task", false, zone);
 
 	LiveShard(P, ctx).fetch_sub(1, std::memory_order_relaxed);
