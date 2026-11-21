@@ -248,10 +248,10 @@ enum class ThreadState : uint8_t { Idle, Running, Helping };
 struct ThreadStats
 {
 	int         index = 0;
-	const char* name = "";     // static storage, valid until Shutdown
+	const char* name = "";     // owned by the pool, valid until Shutdown
 	std::atomic<ThreadState> state{ ThreadState::Idle };
-	std::atomic<uint64_t> tasksRun{ 0 };
-	std::atomic<uint64_t> helpedRun{ 0 };
+	std::atomic<uint64_t> tasksRun{ 0 };  // every task this thread ran
+	std::atomic<uint64_t> helpedRun{ 0 }; // the ones it ran while waiting (state Helping)
 	int         queueDepth = 0; // snapshot of the owned queue (0 = shared pool)
 };
 

@@ -329,6 +329,9 @@ struct alignas(64) WorkerCtx
 struct alignas(64) PaddedStats
 {
 	ThreadStats s;
+	// s.name points here: the row outlives the thread (a dedicated thread's
+	// own name string dies when it is unregistered).
+	std::string name;
 };
 
 // ---- The pool state --------------------------------------------------------------
@@ -434,6 +437,8 @@ static std::atomic<int>         s_NextThreadIndex{ 0 };
 static thread_local PoolState*      t_WorkerPool = nullptr;
 static thread_local WorkerCtx*      t_WorkerCtx = nullptr;
 static thread_local DedicatedState* t_CurrentDedicated = nullptr;
+// A pool thread's stats row (workers and dedicated threads; null elsewhere).
+static thread_local ThreadStats*    t_ThreadStats = nullptr;
 
 static PoolState& ActivePool()
 {
@@ -1527,7 +1532,18 @@ static bool TryHelpIn(PoolState& P)
 	if (slot == kNoSlot)
 		return false;
 	// Run OUTSIDE every lock: a task may submit more work (nested ParallelFor).
+	// A pool thread shows as Helping while it runs a task inside a wait.
+	ThreadStats* stats = t_ThreadStats;
+	const ThreadState before = stats ? stats->state.load(std::memory_order_relaxed) : ThreadState::Idle;
+	if (stats)
+		stats->state.store(ThreadState::Helping, std::memory_order_relaxed);
 	RunEntry(P, slot, ctx);
+	if (stats)
+	{
+		stats->tasksRun.fetch_add(1, std::memory_order_relaxed);
+		stats->helpedRun.fetch_add(1, std::memory_order_relaxed);
+		stats->state.store(before, std::memory_order_relaxed);
+	}
 	return true;
 }
 
@@ -1702,6 +1718,7 @@ static void WorkerLoop(PoolState& P, WorkerCtx& ctx)
 	static thread_local char t_name[32];
 	std::snprintf(t_name, sizeof(t_name), "loom-worker-%d", index);
 	ThreadStats* stats = RegisterThreadStats(P, index, t_name);
+	t_ThreadStats = stats;
 	if (stats)
 		SetOsThreadName(stats->name);
 
@@ -1788,7 +1805,8 @@ static ThreadStats* RegisterThreadStats(PoolState& P, int index, const char* nam
 			return &t->s;
 	auto stats = std::make_unique<PaddedStats>();
 	stats->s.index = index;
-	stats->s.name = name;
+	stats->name = name ? name : "";
+	stats->s.name = stats->name.c_str();
 	ThreadStats* raw = &stats->s;
 	P.threadStats.push_back(std::move(stats));
 	return raw;
@@ -1855,6 +1873,7 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 	const int index = CurrentThreadIndex(); // reserve this thread's index
 	const char* name = d.name.empty() ? "loom-dedicated" : d.name.c_str();
 	ThreadStats* stats = RegisterThreadStats(P, index, name);
+	t_ThreadStats = stats;
 	SetOsThreadName(d.name.c_str());
 	const bool steals = d.idle == DedicatedConfig::Idle::StealFromPool;
 	Waiter& w = t_Waiter;
@@ -1910,6 +1929,7 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 			UnregisterIdle(P, w);
 	}
 	t_CurrentDedicated = nullptr;
+	t_ThreadStats = nullptr;
 }
 
 DedicatedId RegisterDedicatedThread(const DedicatedConfig& config)

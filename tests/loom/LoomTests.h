@@ -874,6 +874,56 @@ TEST_CASE("loom: thread names — a long name is cut to the OS limit, loom keeps
 }
 #endif
 
+TEST_CASE("loom: thread stats — helping is counted and shown, rows outlive their threads")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	struct Probe { std::atomic<int> sawHelping{ 0 }; loom::CounterHandle kids = loom::kInvalidCounter; } probe;
+	loom::ScopedCounter outerDone(1);
+	// One worker runs the outer task, which waits for 8 children on its own
+	// deque: it runs every child while helping (the main thread only blocks).
+	loom::Submit(loom::TaskDesc{ .fn = [](void* user) {
+		Probe& p = *static_cast<Probe*>(user);
+		p.kids = loom::CreateCounter(8);
+		loom::TaskDesc kids[8];
+		for (auto& k : kids)
+			k = loom::TaskDesc{ .fn = [](void* u) {
+				Probe& pr = *static_cast<Probe*>(u);
+				const int me = loom::CurrentThreadIndex();
+				for (const auto& t : loom::SnapshotThreadStats().threads)
+					if (t.index == me && t.state == loom::ThreadState::Helping)
+						pr.sawHelping++;
+			}, .userData = &p, .signals = p.kids };
+		loom::Submit(std::span<const loom::TaskDesc>(kids, 8));
+		loom::WaitFor(p.kids);
+		loom::DestroyCounter(p.kids);
+	}, .userData = &probe, .signals = outerDone });
+	loom::WaitFor(outerDone, loom::Help::BlockOnly);
+
+	CHECK_MESSAGE(probe.sawHelping.load() == 8, "every child saw its thread as Helping");
+	bool found = false;
+	for (const auto& t : loom::SnapshotThreadStats().threads)
+	{
+		if (t.name.rfind("loom-worker", 0) != 0)
+			continue;
+		found = true;
+		CHECK(t.helpedRun == 8);
+		CHECK(t.tasksRun == 9);
+		CHECK(t.state != loom::ThreadState::Helping);
+	}
+	CHECK(found);
+
+	// A dedicated thread's row stays readable after the thread is gone.
+	loom::DedicatedId ded = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "stats-ded" });
+	loom::ScopedCounter dedDone(1);
+	loom::Submit(loom::TaskDesc{ .fn = &Noop, .affinity = loom::Affinity::Dedicated, .thread = ded, .signals = dedDone });
+	loom::WaitFor(dedDone);
+	loom::UnregisterDedicatedThread(ded);
+	bool rowKept = false;
+	for (const auto& t : loom::SnapshotThreadStats().threads)
+		rowKept |= t.name == "stats-ded";
+	CHECK(rowKept);
+}
+
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
 	loom::Pool pool; // the suite owns its pool explicitly
