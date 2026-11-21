@@ -359,8 +359,10 @@ struct PoolState
 	std::atomic<uint32_t>   slotCapacity{ 0 };
 	alignas(64) std::atomic<uint64_t> freeHead{ kNoSlot }; // (tag << 32) | first slot of the top batch
 
-	// Counters: a fixed table and a free list.
-	std::mutex              counterMutex;
+	// Counters: a fixed table and a free list. Their own cache line: every
+	// task reads `counters` (to check its counter is not cancelled), and the
+	// free-slot head above is written all the time.
+	alignas(64) std::mutex  counterMutex;
 	std::unique_ptr<CounterState[]> counters;
 	uint32_t                counterCount = 0;
 	std::vector<uint32_t>   freeCounters;
