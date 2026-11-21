@@ -65,7 +65,7 @@ struct TaskDesc
 	void*         userData = nullptr;   // caller-owned until completion
 	Affinity      affinity = Affinity::AnyWorker;
 	DedicatedId   thread   = {};        // required iff Dedicated
-	CounterHandle signals  = kInvalidCounter; // decremented by 1 on completion
+	CounterHandle signals  = kInvalidCounter; // decremented by 1 on completion; receives the task's exception
 	CounterHandle waitsFor = kInvalidCounter; // runnable when it hits 0
 	// The app-supplied task metadata,
 	// forwarded verbatim to the profiler zone hook (loom never interprets
@@ -157,6 +157,11 @@ void           Signal(CounterHandle, int n = 1);
 // one go, at the latest when it runs out of work at hand or runs a task of
 // another counter); it never runs ahead, and WaitFor is never delayed by it.
 int            Load(CounterHandle);
+// Returns when the count reaches zero. If a task that signals this counter
+// threw, WaitFor then rethrows the first such exception (every WaitFor on the
+// counter does, until it is destroyed). The other tasks still ran. Tasks a
+// thread runs while helping report to their own counters, never to its wait.
+// (A task that throws and signals no counter ends the program.)
 void           WaitFor(CounterHandle, Help help = Help::WhileWaiting);
 bool           TryHelp(); // run at most one eligible task; true if one ran
 

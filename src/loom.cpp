@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -284,6 +285,10 @@ struct alignas(64) CounterState
 	std::mutex            mutex;
 	std::vector<uint32_t> pending; // slots parked until zero
 	std::vector<Waiter*>  waiters; // threads asleep in WaitFor
+	// The first exception a task signalling this counter threw (under the
+	// lock); `failed` lets WaitFor check without it.
+	std::exception_ptr    error;
+	std::atomic<bool>     failed{ false };
 	// Read lock-free by ResolveCounter on every thread while Create/Destroy
 	// write them (the old plain fields were a data race the TSAN suite caught).
 	std::atomic<bool>     alive{ false };
@@ -1271,8 +1276,14 @@ void ParallelFor(size_t begin, size_t end, size_t chunkSize, ParallelForFn fn, v
 	}
 	WakeForWork(P, chunkCount);
 
+	// Destroyed on the way out even when WaitFor rethrows a chunk's exception
+	// (the count is zero by then).
+	struct DestroyOnExit
+	{
+		CounterHandle h;
+		~DestroyOnExit() { DestroyCounter(h); }
+	} destroy{ counter };
 	WaitFor(counter);
-	DestroyCounter(counter);
 }
 
 // ---- Lanes ---------------------------------------------------------------------
@@ -1325,6 +1336,7 @@ CounterHandle CreateCounter(int initial)
 	P.freeCounters.pop_back();
 	CounterState& c = P.counters[i];
 	c.count.store(initial > 0 ? initial + 1 : 0, std::memory_order_relaxed);
+	c.failed.store(false, std::memory_order_relaxed); // (error was cleared by the destroy)
 	c.alive.store(true, std::memory_order_release);
 	// No generation bump here: the DESTROY path invalidates stale handles.
 	// Bumping on create too doubled the churn and overflowed the packed
@@ -1345,6 +1357,7 @@ void DestroyCounter(CounterHandle h)
 		assert(c->count.load(std::memory_order_relaxed) == 0 && "destroying a counter with nonzero count");
 		assert(c->pending.empty() && "destroying a counter with parked tasks");
 		assert(c->waiters.empty() && "destroying a counter with waiters");
+		c->error = nullptr;
 	}
 	// Under the lock CreateCounter holds: the handle is invalidated before the
 	// index can be handed out again.
@@ -1517,6 +1530,18 @@ void WaitFor(CounterHandle h, Help help)
 	// Never return to the caller holding signals: it may block on anything.
 	FlushDeferredSignals(P, ctx);
 	MarkProfilerState(P, threadIndex, 2); // wait over
+#if defined(__cpp_exceptions)
+	if (c->failed.load(std::memory_order_acquire))
+	{
+		std::exception_ptr error;
+		{
+			std::lock_guard<std::mutex> lock(c->mutex);
+			error = c->error;
+		}
+		if (error)
+			std::rethrow_exception(error);
+	}
+#endif
 }
 
 // Run at most one eligible task on the CALLING thread.
@@ -1615,6 +1640,45 @@ static void RunEntry(PoolState& P, uint32_t entry, WorkerCtx* ctx)
 	RunSlot(P, first, ctx);
 }
 
+#if defined(__cpp_exceptions)
+// A task's exception goes to the counter it signals, for WaitFor to rethrow
+// (the first one wins). A task that signals no counter has nobody to report
+// to: that ends the program, as an uncaught exception would.
+static void RecordTaskException(PoolState& P, CounterHandle signals, std::exception_ptr error)
+{
+	CounterState* c = signals != kInvalidCounter ? ResolveCounter(P, signals) : nullptr;
+	if (!c)
+	{
+		std::fprintf(stderr, "loom: a task that signals no counter threw an exception; nothing can receive it\n");
+		std::terminate();
+	}
+	std::lock_guard<std::mutex> lock(c->mutex);
+	if (!c->error)
+	{
+		c->error = std::move(error);
+		c->failed.store(true, std::memory_order_release);
+	}
+}
+#endif
+
+static void RunTaskFn(PoolState& P, TaskFn fn, void* userData, CounterHandle signals)
+{
+#if defined(__cpp_exceptions)
+	try
+	{
+		fn(userData);
+	}
+	catch (...)
+	{
+		RecordTaskException(P, signals, std::current_exception());
+	}
+#else
+	(void)P;
+	(void)signals;
+	fn(userData);
+#endif
+}
+
 static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 {
 	// The runner owns the slot until it releases it: no copy, no lock.
@@ -1637,7 +1701,7 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	const int threadIndex = CurrentThreadIndex();
 	const uint64_t zone = MarkProfilerZone(P, threadIndex, nameId, window, "Task", true, 0);
 	if (fn)
-		fn(userData); // an inline callable's userData is the slot: release after
+		RunTaskFn(P, fn, userData, signals); // an inline callable's userData is the slot: release after
 	MarkProfilerZone(P, threadIndex, nameId, window, "Task", false, zone);
 
 	LiveShard(P, ctx).fetch_sub(1, std::memory_order_relaxed);

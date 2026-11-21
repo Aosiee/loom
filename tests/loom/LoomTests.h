@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1004,6 +1005,74 @@ TEST_CASE("loom: shutdown — drains first: a task's wait completes and late wor
 	CHECK_MESSAGE(st.mainWorkRan.load(), "main-thread work submitted during Shutdown ran");
 	CHECK(st.mainWorkOnMain.load());
 }
+
+#if defined(__cpp_exceptions)
+TEST_CASE("loom: exceptions — WaitFor rethrows a task's exception, for every waiter")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::CounterHandle c = loom::CreateCounter(3);
+	std::atomic<int> ran{ 0 };
+	loom::Submit([&ran]() { ran++; }, loom::TaskDesc{ .signals = c });
+	loom::Submit([&ran]() { ran++; throw std::runtime_error("boom"); }, loom::TaskDesc{ .signals = c });
+	loom::Submit([&ran]() { ran++; }, loom::TaskDesc{ .signals = c });
+
+	std::string otherSaw;
+	std::thread other([&] {
+		try { loom::WaitFor(c, loom::Help::BlockOnly); }
+		catch (const std::runtime_error& e) { otherSaw = e.what(); }
+	});
+	std::string mainSaw;
+	try { loom::WaitFor(c); }
+	catch (const std::runtime_error& e) { mainSaw = e.what(); }
+	other.join();
+	CHECK(mainSaw == "boom");
+	CHECK(otherSaw == "boom");
+	CHECK(ran.load() == 3);
+	CHECK(loom::Load(c) == 0);
+	loom::DestroyCounter(c);
+
+	// A re-used counter starts clean.
+	loom::CounterHandle fresh = loom::CreateCounter(1);
+	loom::Submit(loom::TaskDesc{ .fn = &Noop, .signals = fresh });
+	CHECK_NOTHROW(loom::WaitFor(fresh));
+	loom::DestroyCounter(fresh);
+}
+
+TEST_CASE("loom: exceptions — a helper keeps other counters' exceptions out of its own wait")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 0 }); // the main thread runs everything
+	loom::ScopedCounter good(1), bad(1);
+	loom::Submit(loom::TaskDesc{ .fn = &Noop, .signals = good });
+	loom::Submit([]() { throw std::logic_error("bad"); }, loom::TaskDesc{ .signals = bad }); // runs first (newest)
+	CHECK_NOTHROW(loom::WaitFor(good));
+	CHECK_THROWS_AS(loom::WaitFor(bad), std::logic_error);
+}
+
+TEST_CASE("loom: exceptions — ParallelFor, nested or not, rethrows and still covers the range")
+{
+	loom::Pool pool; // the suite owns its pool explicitly
+	const size_t N = 1000;
+	std::vector<std::atomic<int>> hits(N);
+	CHECK_THROWS_WITH_AS(loom::ParallelFor(0, N, 10, [&hits](size_t b, size_t e) {
+		for (size_t i = b; i < e; i++)
+			hits[i]++;
+		if (b == 500)
+			throw std::runtime_error("chunk 50");
+	}), "chunk 50", std::runtime_error);
+	bool allOnce = true;
+	for (auto& h : hits)
+		allOnce &= h.load() == 1;
+	CHECK_MESSAGE(allOnce, "every other chunk still ran");
+
+	CHECK_THROWS_AS(loom::ParallelFor(0, 64, 8, [](size_t b, size_t) {
+		loom::ParallelFor(0, 64, 8, [b](size_t ib, size_t) {
+			if (b == 32 && ib == 16)
+				throw std::out_of_range("inner");
+		});
+	}), std::out_of_range);
+	CHECK(loom::LiveTaskCount() == 0);
+}
+#endif
 
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
