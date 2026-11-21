@@ -1505,6 +1505,11 @@ TEST_CASE("loom: ParallelFor — automatic chunking rethrows and runs no index t
 	for (auto& h : hits)
 		atMostOnce &= h.load() <= 1;
 	CHECK(atMostOnce);
+	// Automatic chunking counts items, so the task that signalled the last
+	// ones may still be finishing its own bookkeeping as ParallelFor returns.
+	const auto start = std::chrono::steady_clock::now();
+	while (loom::LiveTaskCount() != 0 && std::chrono::steady_clock::now() - start < std::chrono::seconds(2))
+		std::this_thread::yield();
 	CHECK(loom::LiveTaskCount() == 0);
 }
 #endif

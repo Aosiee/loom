@@ -416,7 +416,10 @@ long CurrentOsThreadId();
 // All four answer for the active pool (0/false with none).
 int  WorkerCount();
 bool IsInitialised();
-int  LiveTaskCount();   // allocated slots not yet completed
+// Tasks submitted and not yet finished. A task counts until its bookkeeping
+// is done, which can be a moment after the work it was waited for (an
+// automatically chunked ParallelFor counts items, not tasks).
+int  LiveTaskCount();
 int  PendingTaskCount(); // tasks queued but not started
 
 } // namespace loom
