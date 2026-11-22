@@ -9,6 +9,9 @@
 //   create ns parked         the same loop with every worker parked: the
 //                            bare cost of making a task, nothing competing
 //   ParallelFor/s            items per second through ParallelFor
+// Then a frame-shaped DAG (layers of tiny tasks, each waiting on a few of the
+// layer before), per frame: as a TaskGraph built once, and rebuilt every
+// frame from one counter per task.
 // Usage: loom_bench [tasks] [repeats]
 
 #include "loom/loom.h"
@@ -18,6 +21,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -99,6 +103,68 @@ namespace {
 		return Seconds(start, Clock::now());
 	}
 
+	// The frame DAG: kLayers layers of kWidth nodes, each node after kFanIn
+	// random nodes of the layer before, then one sink after the last layer.
+	constexpr int kLayers = 8, kWidth = 16, kFanIn = 3;
+	constexpr int kNodes = kLayers * kWidth;
+
+	struct FrameDag
+	{
+		std::vector<std::vector<int>> preds; // per node; the sink is node kNodes
+		FrameDag()
+		{
+			std::mt19937 rng(7);
+			preds.resize(kNodes + 1);
+			for (int layer = 1; layer < kLayers; layer++)
+				for (int i = 0; i < kWidth; i++)
+					for (int k = 0; k < kFanIn; k++)
+						preds[layer * kWidth + i].push_back((layer - 1) * kWidth + (int)(rng() % kWidth));
+			for (int i = 0; i < kWidth; i++)
+				preds[kNodes].push_back((kLayers - 1) * kWidth + i);
+		}
+	};
+
+	double GraphFrames(const FrameDag& dag, int frames)
+	{
+		loom::TaskGraph graph;
+		for (int i = 0; i <= kNodes; i++)
+			graph.Add(loom::TaskDesc{ .fn = &Work, .userData = (void*)(uintptr_t)i });
+		for (int i = 0; i <= kNodes; i++)
+			for (int p : dag.preds[(size_t)i])
+				graph.Precede((loom::TaskGraph::Node)p, (loom::TaskGraph::Node)i);
+		const auto start = Clock::now();
+		for (int f = 0; f < frames; f++)
+			loom::Run(graph);
+		return Seconds(start, Clock::now()) / frames;
+	}
+
+	double CounterFrames(const FrameDag& dag, int frames)
+	{
+		std::vector<loom::CounterHandle> done((size_t)kNodes + 1);
+		std::vector<std::vector<loom::CounterHandle>> waits((size_t)kNodes + 1);
+		std::vector<loom::TaskDesc> descs((size_t)kNodes + 1);
+		const auto start = Clock::now();
+		for (int f = 0; f < frames; f++)
+		{
+			for (auto& c : done)
+				c = loom::CreateCounter(1);
+			for (size_t i = 0; i <= (size_t)kNodes; i++)
+			{
+				waits[i].clear();
+				for (int p : dag.preds[i])
+					waits[i].push_back(done[(size_t)p]);
+				descs[i] = loom::TaskDesc{ .fn = &Work, .userData = (void*)(uintptr_t)i, .signals = done[i], .waitsForAll = waits[i] };
+			}
+			loom::Submit(std::span<const loom::TaskDesc>(descs));
+			loom::WaitFor(done[(size_t)kNodes]);
+			for (size_t i = 0; i < (size_t)kNodes; i++)
+				loom::WaitFor(done[i], loom::Help::BlockOnly); // settled, so they can be destroyed
+			for (auto c : done)
+				loom::DestroyCounter(c);
+		}
+		return Seconds(start, Clock::now()) / frames;
+	}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -123,6 +189,20 @@ int main(int argc, char** argv)
 		}
 		std::printf("%8d  %14.0f  %10.1f  %10.1f  %17.1f  %14.0f\n", workers, tasks / bestTotal, bestTotal * 1e9 / tasks,
 			bestCreate * 1e9 / tasks, bestParked * 1e9 / tasks, tasks / bestFor);
+	}
+	std::printf("\nframe DAG: %d tiny tasks in %d layers, %d predecessors each, best of %d runs\n", kNodes + 1, kLayers, kFanIn, repeats);
+	std::printf("%8s  %16s  %18s\n", "workers", "TaskGraph us", "counters us");
+	const FrameDag dag;
+	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		double bestGraph = 1e9, bestCounters = 1e9;
+		for (int r = 0; r < repeats; r++)
+		{
+			bestGraph = std::min(bestGraph, GraphFrames(dag, 2000));
+			bestCounters = std::min(bestCounters, CounterFrames(dag, 2000));
+		}
+		std::printf("%8d  %16.2f  %18.2f\n", workers, bestGraph * 1e6, bestCounters * 1e6);
 	}
 	return 0;
 }
