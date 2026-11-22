@@ -19,6 +19,8 @@
 // limiter, a limiter that never makes a task wait, and one that holds most
 // tasks back), and a frame of ParallelFor work beside long Low-priority
 // background tasks, with the background unlimited or limited to 4 workers.
+// Then futures: 4096 Async results read with Get, against tasks that write
+// their results into an array behind one counter.
 // Usage: loom_bench [tasks] [repeats]
 
 #include "loom/loom.h"
@@ -363,6 +365,45 @@ namespace {
 		return { times[times.size() / 2], times[times.size() * 99 / 100] };
 	}
 
+	// `n` results through futures, or through one counter and an array.
+	double FutureRun(int n)
+	{
+		std::vector<loom::Future<uint64_t>> futures;
+		futures.reserve((size_t)n);
+		const auto start = Clock::now();
+		for (int i = 0; i < n; i++)
+			futures.push_back(loom::Async([i] {
+				Work((void*)(uintptr_t)i);
+				return (uint64_t)i;
+			}));
+		uint64_t sum = 0;
+		for (auto& f : futures)
+			sum += f.Get();
+		futures.clear(); // freeing them is part of the cost
+		const double seconds = Seconds(start, Clock::now());
+		KeepAlive(sum);
+		return seconds;
+	}
+
+	double ArrayRun(int n)
+	{
+		std::vector<uint64_t> results((size_t)n);
+		const auto start = Clock::now();
+		loom::ScopedCounter done(n);
+		for (int i = 0; i < n; i++)
+			loom::Submit([i, out = results.data()] {
+				Work((void*)(uintptr_t)i);
+				out[i] = (uint64_t)i;
+			}, loom::TaskDesc{ .signals = done });
+		loom::WaitFor(done);
+		uint64_t sum = 0;
+		for (uint64_t r : results)
+			sum += r;
+		const double seconds = Seconds(start, Clock::now());
+		KeepAlive(sum);
+		return seconds;
+	}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -440,6 +481,21 @@ int main(int argc, char** argv)
 		row("one task per worker, no limiter", workers, loom::kInvalidLimiter);
 		loom::ScopedLimiter four(4);
 		row("one task per worker, limited to 4", workers, four);
+	}
+
+	std::printf("\nfutures: 4096 results, ns per result\n");
+	std::printf("%8s  %10s  %22s  %6s\n", "workers", "futures", "one counter + array", "ratio");
+	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers, .maxTasks = 1 << 16, .maxCounters = 8192 });
+		const int n = 4096;
+		double futures = 1e9, array = 1e9;
+		for (int r = 0; r < repeats * 20; r++)
+		{
+			futures = std::min(futures, FutureRun(n));
+			array = std::min(array, ArrayRun(n));
+		}
+		std::printf("%8d  %10.1f  %22.1f  %6.2f\n", workers, futures * 1e9 / n, array * 1e9 / n, futures / array);
 	}
 	return 0;
 }
