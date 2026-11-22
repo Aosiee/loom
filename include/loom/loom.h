@@ -29,8 +29,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <new>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -286,6 +288,163 @@ public:
 private:
 	LimiterHandle m_Handle = kInvalidLimiter;
 };
+
+// ---- Futures ------------------------------------------------------------------
+// Async runs a callable as a task and returns a Future for its result: the
+// asset that a load parses, the path a search finds. Get() waits (helping,
+// by default) and returns the value, or rethrows what the callable threw.
+//
+//   loom::Future<Mesh> mesh = loom::Async([path] { return ParseMesh(path); });
+//   ...
+//   Draw(mesh.Get());
+//
+// A future is also a counter: Counter() is zero once the value is ready, so
+// a task can wait for it (TaskDesc::waitsFor, or waitsForAll for several)
+// and read Get() without blocking. Keep the future alive until that task has
+// read it.
+//
+// The callable is stored with the result in one heap allocation, and
+// destroyed as soon as it has run. Dropping a future before its task has run
+// is fine: the task still runs, and frees the result and the counter. A
+// future's task always runs: it ignores Cancel. Each pending future holds
+// one counter (LoomConfig::maxCounters) until it is both finished and
+// dropped, and like a counter it must not outlive the pool.
+//
+// The TaskDesc gives the task's affinity, thread, priority, limiter, waits
+// and profiler fields; its fn, userData and signals must be unset (the
+// future signals its own counter).
+namespace detail {
+	struct FutureStateBase
+	{
+		CounterHandle    counter = kInvalidCounter;
+		std::atomic<int> refs{ 2 }; // the future and its task
+		void (*destroy)(FutureStateBase*) noexcept = nullptr;
+#if defined(__cpp_exceptions)
+		std::exception_ptr error;
+#endif
+	};
+	// Creates the counter and submits `run` with the state as its userData.
+	void StartFuture(FutureStateBase* state, TaskFn run, const TaskDesc& opts);
+	// The task's end: signals the counter, then drops the task's reference.
+	void FinishFuture(FutureStateBase* state) noexcept;
+	// Drops one reference; the last frees the counter and the state.
+	void ReleaseFuture(FutureStateBase* state) noexcept;
+
+	struct NoValue {};
+	template <typename T>
+	struct FutureState : FutureStateBase
+	{
+		std::conditional_t<std::is_void_v<T>, NoValue, std::optional<T>> value;
+	};
+
+	template <typename T, typename F>
+	struct FutureTask final : FutureState<T>
+	{
+		union { F fn; }; // ended by Run, as soon as it has run
+		template <typename A>
+		explicit FutureTask(A&& a) : fn(std::forward<A>(a)) {}
+		~FutureTask() {}
+
+		static void Run(void* p)
+		{
+			FutureTask& t = *static_cast<FutureTask*>(p);
+#if defined(__cpp_exceptions)
+			try
+			{
+#endif
+				if constexpr (std::is_void_v<T>)
+					t.fn();
+				else
+					t.value.emplace(t.fn());
+#if defined(__cpp_exceptions)
+			}
+			catch (...)
+			{
+				t.error = std::current_exception();
+			}
+#endif
+			t.fn.~F();
+			FinishFuture(&t);
+		}
+		static void Destroy(FutureStateBase* b) noexcept { delete static_cast<FutureTask*>(b); }
+	};
+} // namespace detail
+
+template <typename T>
+class Future
+{
+	static_assert(std::is_void_v<T> || (std::is_object_v<T> && !std::is_array_v<T>),
+		"a Future holds a value or nothing: return by value, not by reference");
+
+public:
+	Future() = default;
+	~Future() { Reset(); }
+	Future(Future&& other) noexcept : m_State(std::exchange(other.m_State, nullptr)) {}
+	Future& operator=(Future&& other) noexcept
+	{
+		if (this != &other)
+		{
+			Reset();
+			m_State = std::exchange(other.m_State, nullptr);
+		}
+		return *this;
+	}
+	Future(const Future&) = delete;
+	Future& operator=(const Future&) = delete;
+
+	bool Valid() const { return m_State != nullptr; }
+	// True once the value (or the exception) is there; never waits.
+	bool Ready() const { return Load(m_State->counter) == 0; }
+	// Waits for the value; Get calls it. Rethrows nothing: Get does.
+	void Wait(Help help = Help::WhileWaiting) const { WaitFor(m_State->counter, help); }
+	// Wait with a time limit: true once ready, false if `timeoutMs` passed first.
+	[[nodiscard]] bool TryWait(uint32_t timeoutMs, Help help = Help::WhileWaiting) const
+	{
+		return TryWaitFor(m_State->counter, timeoutMs, help);
+	}
+	// Waits, then returns the value (a reference into the future, valid while
+	// it lives; move from it to take it), or rethrows the callable's
+	// exception. Can be called again: it returns the same value, or throws
+	// the same exception.
+	std::add_lvalue_reference_t<T> Get(Help help = Help::WhileWaiting)
+	{
+		Wait(help);
+#if defined(__cpp_exceptions)
+		if (m_State->error)
+			std::rethrow_exception(m_State->error);
+#endif
+		if constexpr (!std::is_void_v<T>)
+			return *m_State->value;
+	}
+	// Zero once ready: for a task's waitsFor. Valid while the future lives.
+	CounterHandle Counter() const { return m_State ? m_State->counter : kInvalidCounter; }
+	// Drops the future (Valid() is then false); its task, if still to come,
+	// runs anyway.
+	void Reset() noexcept
+	{
+		if (m_State)
+			detail::ReleaseFuture(std::exchange(m_State, nullptr));
+	}
+
+private:
+	explicit Future(detail::FutureState<T>* state) : m_State(state) {}
+	template <typename F> requires std::is_invocable_v<std::decay_t<F>&>
+	friend Future<std::invoke_result_t<std::decay_t<F>&>> Async(F&& fn, const TaskDesc& opts);
+
+	detail::FutureState<T>* m_State = nullptr;
+};
+
+template <typename F> requires std::is_invocable_v<std::decay_t<F>&>
+[[nodiscard]] Future<std::invoke_result_t<std::decay_t<F>&>> Async(F&& fn, const TaskDesc& opts = {})
+{
+	using G = std::decay_t<F>;
+	using T = std::invoke_result_t<G&>;
+	using Task = detail::FutureTask<T, G>;
+	Task* task = new Task(std::forward<F>(fn)); // nothing started yet if this throws
+	task->destroy = &Task::Destroy;
+	detail::StartFuture(task, &Task::Run, opts);
+	return Future<T>(task);
+}
 
 // ---- Isolation ---------------------------------------------------------------
 // Runs fn() as an isolated region. The tasks submitted inside it, and the

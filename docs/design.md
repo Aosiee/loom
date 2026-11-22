@@ -129,6 +129,28 @@ node through a pointer into the graph; copying what it needs into the slot
 instead made the submitter write the slot's second cache line, which slowed
 a wide graph by about a third.
 
+### Futures
+
+`Async` allocates one block holding the callable, room for the result, a
+counter handle and a reference count of two (the future and its task), then
+submits a task with the block as its userData. The task runs the callable,
+stores its result or its exception in the block, destroys the callable and
+signals the counter itself rather than through the task runner, then drops
+its reference. Signalling from inside the task is what lets it drop the
+reference afterwards: whichever of the two lets go last destroys the counter
+and frees the block, so a future can be dropped before its task has run. At
+that point the counter is always settled: either the task's own final signal
+has returned, or the future's wait has. A limited future's task gives its
+unit back just before that signal (the runner would do it only after the
+function returns), so once `Get` returns the limiter is free, as it is for
+a plain task once its counter's wait returns.
+
+`Get` waits on the counter (helping, by default) and rethrows the exception
+from the block, so a future's exception never goes through the counter's
+own error and cancellation. Because the task signals no counter through
+the runner, nothing can skip it: a future's task ignores `Cancel`, and
+always completes its future.
+
 ## Queues
 
 AnyWorker work lives in work-stealing deques, one per worker and one for the

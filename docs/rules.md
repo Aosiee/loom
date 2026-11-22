@@ -85,3 +85,13 @@ that other task never becomes runnable, and helping cannot run it (it waits
 in the limiter, not in a queue). Split the work into tasks that hand on
 through counters (`waitsFor`) instead of one that waits in the middle. A
 limited task may wait for anything else.
+
+## Keep a future alive while anything reads it
+
+A future's value lives in the future, and its counter is destroyed once the
+future is dropped and its task has finished. A task that waits on
+`future.Counter()` and reads `future.Get()` needs the future to outlive it:
+keep the future where both can reach it (a member, or the frame's state),
+and drop it only after that task's own counter has reached zero. Each
+pending future holds one counter, so thousands in flight at once need a
+larger `LoomConfig::maxCounters`.

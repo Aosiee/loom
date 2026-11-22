@@ -2192,6 +2192,174 @@ TEST_CASE("loom: limiters — handles are reused safely and the table size is co
 	}
 }
 
+namespace {
+	int LiveCounters() { return loom::SnapshotThreadStats().counterCount; }
+}
+
+TEST_CASE("loom: futures — values, void, move-only results and repeated Get, any pool")
+{
+	for (int workers : { 0, 1, -1 })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		const int baseline = LiveCounters();
+		{
+			std::vector<loom::Future<int>> squares;
+			for (int i = 0; i < 200; i++)
+				squares.push_back(loom::Async([i] { return i * i; }));
+			std::atomic<int> sideEffect{ 0 };
+			loom::Future<void> done = loom::Async([&] { sideEffect = 7; });
+			loom::Future<std::vector<int>> big = loom::Async([] { return std::vector<int>(1000, 3); });
+			loom::Future<std::unique_ptr<int>> owned = loom::Async([] { return std::make_unique<int>(42); });
+			loom::Future<std::string> text = loom::Async([s = std::string(100, 'x')] { return s + "!"; }); // a non-trivial callable
+
+			for (int i = 0; i < 200; i++)
+				CHECK(squares[(size_t)i].Get() == i * i);
+			CHECK(squares[5].Ready());
+			CHECK(squares[5].Get() == 25); // again: the same value
+			done.Get();
+			CHECK(sideEffect.load() == 7);
+			CHECK(big.Get().size() == 1000);
+			REQUIRE(owned.Get() != nullptr);
+			CHECK(*owned.Get() == 42);
+			std::unique_ptr<int> taken = std::move(owned.Get()); // move out to take it
+			CHECK(*taken == 42);
+			CHECK(text.Get().size() == 101);
+
+			loom::Future<int> moved = std::move(squares[3]);
+			CHECK(!squares[3].Valid());
+			CHECK(squares[3].Counter() == loom::kInvalidCounter);
+			CHECK(moved.Get() == 9);
+			moved = std::move(squares[4]); // drops the old one
+			CHECK(moved.Get() == 16);
+		}
+		CHECK_MESSAGE(LiveCounters() == baseline, "every future's counter is freed");
+	}
+}
+
+TEST_CASE("loom: futures — a dropped future's task still runs, and frees its state")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	const int baseline = LiveCounters();
+	Tracked::live = 0;
+	std::atomic<int> ran{ 0 };
+	{
+		loom::ScopedCounter gate(1);
+		for (int i = 0; i < 50; i++)
+		{
+			Tracked tracked;
+			loom::Future<int> f = loom::Async([tracked, &ran] { (void)tracked; ran++; return 1; }, loom::TaskDesc{ .waitsFor = gate });
+			// Dropped here, before its task can start.
+		}
+		CHECK(ran.load() == 0);
+		CHECK(Tracked::live.load() == 50); // the callables wait with their tasks
+		loom::Signal(gate);
+		while (loom::LiveTaskCount() > 0)
+			std::this_thread::yield();
+	}
+	CHECK(ran.load() == 50);
+	CHECK(Tracked::live.load() == 0);
+	CHECK(LiveCounters() == baseline);
+
+	// Dropped while its task runs, and a Reset after it finished.
+	std::atomic<bool> started{ false }, release{ false };
+	{
+		loom::Future<int> f = loom::Async([&] {
+			started = true;
+			while (!release)
+				std::this_thread::yield();
+			return 3;
+		});
+		while (!started)
+			std::this_thread::yield();
+	}
+	release = true;
+	loom::Future<int> g = loom::Async([] { return 4; });
+	CHECK(g.Get() == 4);
+	g.Reset();
+	CHECK(!g.Valid());
+	while (loom::LiveTaskCount() > 0)
+		std::this_thread::yield();
+	CHECK(LiveCounters() == baseline);
+}
+
+TEST_CASE("loom: futures — a task can wait for futures and read them without blocking")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 3 });
+	const loom::DedicatedId io = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "future-io" });
+	loom::ScopedCounter gate(1);
+	loom::Future<int> a = loom::Async([] { return 20; }, loom::TaskDesc{ .waitsFor = gate });
+	loom::Future<int> b = loom::Async([] { return 22; }, loom::TaskDesc{ .affinity = loom::Affinity::Dedicated, .thread = io });
+	const loom::CounterHandle both[] = { a.Counter(), b.Counter() };
+	// A future of futures: runs once both are ready, reads them, never waits.
+	std::atomic<bool> bothReady{ false };
+	loom::Future<int> sum = loom::Async([&] {
+		bothReady = a.Ready() && b.Ready();
+		return a.Get() + b.Get();
+	}, loom::TaskDesc{ .waitsForAll = both });
+	// A plain task can wait for one too.
+	std::atomic<int> seen{ 0 };
+	loom::ScopedCounter plainDone(1);
+	loom::Submit([&] { seen = a.Get(); }, loom::TaskDesc{ .signals = plainDone, .waitsFor = a.Counter() });
+
+	CHECK(!sum.TryWait(20));
+	CHECK(!a.Ready());
+	loom::Signal(gate);
+	CHECK(sum.Get() == 42);
+	CHECK(bothReady.load());
+	loom::WaitFor(plainDone);
+	CHECK(seen.load() == 20);
+
+	// Main-thread affinity, a priority and a limiter come from the TaskDesc.
+	loom::ScopedLimiter one(1);
+	loom::Future<int> onMain = loom::Async([] { return loom::CurrentThreadIndex(); }, loom::TaskDesc{ .affinity = loom::Affinity::MainThread });
+	loom::Future<int> limited = loom::Async([] { return 5; }, loom::TaskDesc{ .priority = loom::Priority::High, .limiter = one });
+	CHECK(onMain.Get() == 0);
+	CHECK(limited.Get() == 5);
+	CHECK(loom::LimiterHeld(one) == 0);
+	loom::UnregisterDedicatedThread(io);
+}
+
+TEST_CASE("loom: futures — once Get returns, the task holds no limiter unit")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 4 });
+	int held = 0;
+	for (int i = 0; i < 500; i++)
+	{
+		loom::ScopedLimiter limiter(1 + i % 2); // destroyed right after Get: it must be idle
+		loom::Future<int> f = loom::Async([i] { return i; }, loom::TaskDesc{ .limiter = limiter });
+		loom::Future<void> g = loom::Async([] {}, loom::TaskDesc{ .limiter = limiter });
+		CHECK(f.Get() == i);
+		g.Get();
+		held += (int)loom::LimiterHeld(limiter);
+	}
+	CHECK(held == 0);
+}
+
+#if defined(__cpp_exceptions)
+TEST_CASE("loom: futures — Get rethrows the callable's exception, every time")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	const int baseline = LiveCounters();
+	Tracked::live = 0;
+	{
+		Tracked tracked;
+		loom::Future<int> bad = loom::Async([tracked]() -> int { (void)tracked; throw std::runtime_error("parse failed"); });
+		loom::Future<void> badVoid = loom::Async([] { throw std::logic_error("no"); });
+		loom::Future<int> good = loom::Async([] { return 1; });
+		CHECK_THROWS_AS(bad.Get(), std::runtime_error);
+		CHECK_THROWS_AS(bad.Get(), std::runtime_error);
+		CHECK(bad.Ready());
+		bad.Wait(); // waiting does not throw
+		CHECK(bad.TryWait(0));
+		CHECK_THROWS_AS(badVoid.Get(), std::logic_error);
+		CHECK(good.Get() == 1);
+		CHECK(Tracked::live.load() == 1); // the callable's copy is gone once it has run
+	}
+	CHECK(Tracked::live.load() == 0);
+	CHECK(LiveCounters() == baseline);
+}
+#endif
+
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
 	loom::Pool pool; // the suite owns its pool explicitly

@@ -590,6 +590,10 @@ static thread_local ThreadStats*    t_ThreadStats = nullptr;
 // The Isolated region the calling thread is in (0: none). A running task's
 // thread is in that task's region, so its children inherit it.
 static thread_local uint16_t        t_Isolation = 0;
+// The running task's limiter tag (a RunSlot local), so a task that completes
+// its own counter from inside, as a future's does, can give its unit back
+// first. Null outside a task; saved and restored around nested runs.
+static thread_local uint16_t*       t_RunningLimiter = nullptr;
 
 static PoolState& ActivePool()
 {
@@ -742,6 +746,7 @@ static void     RunEntry(PoolState& P, uint32_t entry, WorkerCtx* ctx);
 static void     RecordTaskException(PoolState& P, CounterHandle signals, std::exception_ptr error);
 #endif
 static void     RunTaskFn(PoolState& P, TaskFn fn, void* userData, CounterHandle signals);
+static void     ReleaseRunningUnit(PoolState& P, WorkerCtx* ctx);
 static void     SignalCounter(PoolState& P, CounterHandle h, int n);
 static void     FlushDeferredSignals(PoolState& P, WorkerCtx* ctx);
 static void     WakeForWork(PoolState& P, size_t n);
@@ -2371,6 +2376,48 @@ bool IsCancelled(CounterHandle h)
 	return c && c->cancelled.load(std::memory_order_acquire);
 }
 
+// ---- Futures ---------------------------------------------------------------------
+// A future's task signals its counter itself, at the end of its own run, so
+// that it can then drop its reference: whichever of the future and the task
+// lets go last frees the state, and the counter with it. By then the counter
+// is settled (the task's own final Signal returned, or the future's wait
+// did), so it can be destroyed at once.
+
+namespace detail {
+
+void StartFuture(FutureStateBase* state, TaskFn run, const TaskDesc& opts)
+{
+	assert(opts.fn == nullptr && opts.userData == nullptr && "Async takes the callable; leave fn and userData unset");
+	assert(opts.signals == kInvalidCounter && "a future signals its own counter; leave signals unset");
+	state->counter = CreateCounter(1);
+	TaskDesc desc = opts;
+	desc.fn = run;
+	desc.userData = state;
+	desc.signals = kInvalidCounter;
+	Submit(desc);
+}
+
+void FinishFuture(FutureStateBase* state) noexcept
+{
+	// As a plain task's runner does, the unit goes back before the signal:
+	// once Get returns, the future's task holds none.
+	PoolState& P = ActivePool();
+	ReleaseRunningUnit(P, CurrentCtx(P));
+	SignalCounter(P, state->counter, 1);
+	ReleaseFuture(state);
+}
+
+void ReleaseFuture(FutureStateBase* state) noexcept
+{
+	// acq_rel: the last one sees everything the other wrote (the value).
+	if (state->refs.fetch_sub(1, std::memory_order_acq_rel) != 1)
+		return;
+	DestroyCounter(state->counter);
+	state->destroy(state);
+}
+
+} // namespace detail
+
 // ---- Limiters ------------------------------------------------------------------
 
 LimiterHandle CreateLimiter(uint32_t limit)
@@ -2792,6 +2839,19 @@ static void RunTaskFn(PoolState& P, TaskFn fn, void* userData, CounterHandle sig
 #endif
 }
 
+// Gives back the running task's limiter unit now, or on to the next waiting
+// task, instead of when the task ends. At most once per task.
+static void ReleaseRunningUnit(PoolState& P, WorkerCtx* ctx)
+{
+	uint16_t* const limiter = t_RunningLimiter;
+	if (!limiter || *limiter == 0)
+		return;
+	const uint32_t next = ReleaseUnit(P.limiters[*limiter - 1]);
+	*limiter = 0;
+	if (next != kNoSlot && EnqueueSlot(P, next, ctx))
+		WakeForWork(P, 1);
+}
+
 static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 {
 	// The runner owns the slot until it releases it: no copy, no lock.
@@ -2801,7 +2861,7 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	const CounterHandle signals = t.signals;
 	const uint32_t nameId = t.nameId;
 	const uint8_t window = t.window;
-	const uint16_t limiter = t.limiter;
+	uint16_t limiter = t.limiter; // cleared if the task gives its unit back early
 	TaskFn destroy = nullptr;
 	if (t.owned)
 		std::memcpy(&destroy, t.inlineData + kOwnedDestroyOffset, sizeof destroy);
@@ -2823,10 +2883,13 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	// The task runs in its own region (RunTaskFn catches everything, so the
 	// restore below always happens).
 	const uint16_t outerRegion = t_Isolation;
+	uint16_t* const outerLimiter = t_RunningLimiter;
 	t_Isolation = t.isolation;
+	t_RunningLimiter = &limiter;
 	if (fn && !cancelled)
 		RunTaskFn(P, fn, userData, signals); // an inline callable's userData is the slot: release after
 	t_Isolation = outerRegion;
+	t_RunningLimiter = outerLimiter;
 	// An owned callable dies whether it ran, threw or was skipped, and before
 	// the slot it may live in is released.
 	if (destroy)
