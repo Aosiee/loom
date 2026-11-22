@@ -42,7 +42,12 @@ loom::ParallelFor(0, meshes.size(), 64, [&](size_t begin, size_t end) {
   finishes and wait for one or several before it may start, so a dependency
   graph is a set of counters. `WaitFor` either helps (`Help::WhileWaiting`)
   or blocks (`Help::BlockOnly`), and rethrows an exception a task of that
-  counter threw; `TryWaitFor` does the same with a time limit. `Cancel` skips a counter's tasks that have not started.
+  counter threw; `TryWaitFor` does the same with a time limit. `Cancel`
+  skips a counter's tasks that have not started.
+- **Task graphs** (`TaskGraph`): a dependency graph declared once and run
+  every frame, with no counters to rebuild. A run acts as one task: it can
+  wait on a counter, signals one when done, and reports exceptions and
+  cancellation through it.
 - **Priorities**: `Priority::High` work runs before Normal, and `Low` only
   when nothing else is queued.
 - **Isolation** (`Isolated`): a wait inside an isolated region helps only

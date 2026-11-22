@@ -343,6 +343,78 @@ T ParallelReduce(size_t begin, size_t end, size_t chunkSize, T identity, Map&& m
 	return result;
 }
 
+// ---- Task graphs ------------------------------------------------------------
+// A DAG of tasks built once and run many times: the frame's systems (input,
+// then physics and animation, then culling, then the render submit on the
+// main thread), declared once with their order. A run costs one task per node
+// and one atomic decrement per edge: no counters to create, no counter locks
+// to park on. The order is checked for cycles once, when the graph changes.
+//
+// A run behaves as one task. It starts once `waitsFor` is zero and signals
+// `signals` once, when its last node has finished. A node's exception goes to
+// `signals` (WaitFor rethrows it) and cancels it, as Cancel(signals) does:
+// the nodes not yet started are skipped and the run still completes. (With
+// no `signals`, a node that throws ends the program, as a task does.)
+//
+// A node takes the fn, userData, affinity, thread, priority, nameId and
+// window of its TaskDesc; its counters come from the graph, so `signals` and
+// the waits must be unset. One run at a time per graph (a frame that overlaps
+// the next one uses two graphs), and the graph must not change or be
+// destroyed while it runs.
+namespace detail { struct GraphState; }
+
+class TaskGraph
+{
+public:
+	using Node = uint32_t;
+
+	TaskGraph();
+	~TaskGraph(); // asserts it is not running; destroys its callables
+	TaskGraph(TaskGraph&&) noexcept;
+	TaskGraph& operator=(TaskGraph&&) noexcept;
+	TaskGraph(const TaskGraph&) = delete;
+	TaskGraph& operator=(const TaskGraph&) = delete;
+
+	Node Add(const TaskDesc& desc);
+	// A node that calls a callable on every run. The graph keeps it (one heap
+	// allocation, at Add) and destroys it with the graph or on Clear.
+	template <typename F> requires std::is_invocable_v<std::decay_t<F>&>
+	Node Add(F&& fn, const TaskDesc& opts = {});
+	// `after` starts only once `before` has finished. Listing an edge twice
+	// is harmless.
+	void Precede(Node before, Node after);
+	void Clear();
+
+	size_t NodeCount() const;
+	// True from Submit until the last node has finished (just before the
+	// run's counter is signalled).
+	bool Running() const;
+	// False when the order has a cycle; Submit asserts there is none. A graph
+	// is checked once per change, here or on its next Submit.
+	bool Validate();
+
+private:
+	friend void Submit(TaskGraph&, CounterHandle, CounterHandle);
+	Node AddOwned(void* object, void (*run)(void*), void (*destroy)(void*), const TaskDesc& opts);
+	std::unique_ptr<detail::GraphState> m_State;
+};
+
+template <typename F> requires std::is_invocable_v<std::decay_t<F>&>
+TaskGraph::Node TaskGraph::Add(F&& fn, const TaskDesc& opts)
+{
+	using G = std::decay_t<F>;
+	// Freed here if AddOwned throws; owned by the graph once it returns.
+	std::unique_ptr<G> object(new G(std::forward<F>(fn)));
+	const Node node = AddOwned(object.get(), &detail::InlineTrampoline<G>, &detail::OwnedDestroyHeap<G>, opts);
+	object.release();
+	return node;
+}
+
+// Starts a run and returns at once (see above).
+void Submit(TaskGraph& graph, CounterHandle signals = kInvalidCounter, CounterHandle waitsFor = kInvalidCounter);
+// Runs the graph and waits for it, rethrowing a node's exception.
+void Run(TaskGraph& graph, Help help = Help::WhileWaiting);
+
 // ---- Lanes ------------------------------------------------------------------
 // A lane is a long-lived worker reserved for ONE owner (e.g. a simulation
 // tick) — implemented as a dedicated thread that never steals. Shutdown

@@ -655,6 +655,7 @@ static void     RunEntry(PoolState& P, uint32_t entry, WorkerCtx* ctx);
 #if defined(__cpp_exceptions)
 static void     RecordTaskException(PoolState& P, CounterHandle signals, std::exception_ptr error);
 #endif
+static void     RunTaskFn(PoolState& P, TaskFn fn, void* userData, CounterHandle signals);
 static void     SignalCounter(PoolState& P, CounterHandle h, int n);
 static void     FlushDeferredSignals(PoolState& P, WorkerCtx* ctx);
 static void     WakeForWork(PoolState& P, size_t n);
@@ -1687,6 +1688,302 @@ static void ParallelForFixed(PoolState& P, size_t begin, size_t end, size_t chun
 		~DestroyOnExit() { DestroyCounter(h); }
 	} destroy{ counter };
 	WaitFor(counter);
+}
+
+// ---- Task graphs ---------------------------------------------------------------
+// The graph keeps its nodes and edges as built, and compiles them, once per
+// change, into successor lists (CSR) and in-degrees. A run resets each node's
+// count of unfinished predecessors and queues the roots. A finishing node
+// decrements its successors' counts and queues those that reach zero, then
+// decrements the run's count of unfinished nodes; the node that takes it to
+// zero ends the run. Only ready nodes hold task slots.
+
+namespace detail {
+
+struct GraphState
+{
+	struct NodeDesc
+	{
+		TaskFn      fn = nullptr;
+		void*       userData = nullptr;
+		void      (*destroy)(void*) = nullptr; // an owned callable (Add(F))
+		Affinity    affinity = Affinity::AnyWorker;
+		DedicatedId thread = 0;
+		Priority    priority = Priority::Normal;
+		uint8_t     window = 0;
+		uint32_t    nameId = 0;
+	};
+	// A node's task userData: which graph, which node.
+	struct NodeRef
+	{
+		GraphState* graph = nullptr;
+		uint32_t    index = 0;
+	};
+
+	std::vector<NodeDesc> nodes;
+	std::vector<std::pair<uint32_t, uint32_t>> edges; // (before, after)
+
+	// Compiled from the above; valid while `compiled`.
+	bool compiled = false;
+	bool acyclic = true;
+	std::vector<uint32_t> succBegin; // node i's successors: succ[succBegin[i], succBegin[i + 1])
+	std::vector<uint32_t> succ;
+	std::vector<uint32_t> indegree;
+	std::vector<uint32_t> roots;
+	std::unique_ptr<NodeRef[]> refs;
+	std::unique_ptr<std::atomic<uint32_t>[]> remaining; // per run: predecessors not yet finished
+
+	// Per run.
+	std::atomic<uint32_t> unfinished{ 0 };
+	std::atomic<bool>     running{ false };
+	CounterHandle         signals = kInvalidCounter;
+
+	~GraphState() { DestroyCallables(); }
+
+	void DestroyCallables()
+	{
+		for (NodeDesc& n : nodes)
+			if (n.destroy)
+				n.destroy(n.userData);
+	}
+
+	// Kahn's algorithm: the nodes every edge order allows to run first, and
+	// whether all of them can run at all (no cycle).
+	void Compile()
+	{
+		const uint32_t n = (uint32_t)nodes.size();
+		succBegin.assign(n + 1, 0);
+		indegree.assign(n, 0);
+		for (auto [before, after] : edges)
+		{
+			succBegin[before + 1]++;
+			indegree[after]++;
+		}
+		for (uint32_t i = 0; i < n; i++)
+			succBegin[i + 1] += succBegin[i];
+		succ.resize(edges.size());
+		std::vector<uint32_t> fill(succBegin.begin(), succBegin.end() - 1);
+		for (auto [before, after] : edges)
+			succ[fill[before]++] = after;
+
+		roots.clear();
+		for (uint32_t i = 0; i < n; i++)
+			if (indegree[i] == 0)
+				roots.push_back(i);
+		std::vector<uint32_t> left(indegree);
+		std::vector<uint32_t> ready(roots);
+		uint32_t reached = 0;
+		while (!ready.empty())
+		{
+			const uint32_t i = ready.back();
+			ready.pop_back();
+			reached++;
+			for (uint32_t k = succBegin[i]; k < succBegin[i + 1]; k++)
+				if (--left[succ[k]] == 0)
+					ready.push_back(succ[k]);
+		}
+		acyclic = reached == n;
+
+		refs.reset(new NodeRef[n]);
+		remaining.reset(new std::atomic<uint32_t>[n]);
+		for (uint32_t i = 0; i < n; i++)
+			refs[i] = NodeRef{ this, i };
+		compiled = true;
+	}
+};
+
+} // namespace detail
+
+using detail::GraphState;
+
+static void GraphNodeTask(void* p);
+
+// Gives a ready node a task slot and queues it. True when it went into the pool.
+static bool QueueGraphNode(PoolState& P, GraphState& g, uint32_t i, WorkerCtx* ctx)
+{
+	const GraphState::NodeDesc& n = g.nodes[i];
+	const uint32_t slot = PrepareSlot(P, TaskDesc{ .fn = &GraphNodeTask, .userData = &g.refs[i], .affinity = n.affinity,
+		.thread = n.thread, .nameId = n.nameId, .window = n.window, .priority = n.priority }, ctx);
+	return EnqueueSlot(P, slot, ctx);
+}
+
+static void StartGraphRun(PoolState& P, GraphState& g)
+{
+	const uint32_t n = (uint32_t)g.nodes.size();
+	if (n == 0)
+	{
+		const CounterHandle signals = g.signals;
+		g.running.store(false, std::memory_order_release);
+		if (signals != kInvalidCounter)
+			SignalCounter(P, signals, 1);
+		return;
+	}
+	// Plain stores: queueing a root publishes them to whoever runs it, and
+	// every later node is queued by a thread that ran one of its predecessors.
+	for (uint32_t i = 0; i < n; i++)
+		g.remaining[i].store(g.indegree[i], std::memory_order_relaxed);
+	g.unfinished.store(n, std::memory_order_relaxed);
+	WorkerCtx* ctx = CurrentCtx(P);
+	size_t pooled = 0;
+	for (uint32_t i : g.roots)
+		pooled += QueueGraphNode(P, g, i, ctx) ? 1 : 0;
+	WakeForWork(P, pooled);
+}
+
+static void GraphNodeTask(void* p)
+{
+	const GraphState::NodeRef ref = *static_cast<GraphState::NodeRef*>(p);
+	GraphState& g = *ref.graph;
+	PoolState& P = ActivePool();
+	const CounterHandle signals = g.signals; // fixed for the run
+	const CounterState* counter = signals != kInvalidCounter ? ResolveCounter(P, signals) : nullptr;
+	if (!(counter && counter->cancelled.load(std::memory_order_acquire)))
+	{
+		const GraphState::NodeDesc& n = g.nodes[ref.index];
+		// Caught here, not by RunSlot: the successors are released either way.
+		RunTaskFn(P, n.fn, n.userData, signals);
+	}
+
+	WorkerCtx* ctx = CurrentCtx(P);
+	size_t pooled = 0;
+	for (uint32_t k = g.succBegin[ref.index]; k < g.succBegin[ref.index + 1]; k++)
+	{
+		const uint32_t s = g.succ[k];
+		if (g.remaining[s].fetch_sub(1, std::memory_order_acq_rel) == 1)
+			pooled += QueueGraphNode(P, g, s, ctx) ? 1 : 0;
+	}
+	WakeForWork(P, pooled);
+
+	// The last touch of the graph for every node but the last: once the count
+	// is zero, the graph may be submitted again or destroyed.
+	if (g.unfinished.fetch_sub(1, std::memory_order_acq_rel) != 1)
+		return;
+	g.running.store(false, std::memory_order_release);
+	if (signals != kInvalidCounter)
+		SignalCounter(P, signals, 1);
+}
+
+// Starts a run whose waitsFor was not yet zero, from a task parked on it.
+static void GraphLaunchTask(void* p)
+{
+	StartGraphRun(ActivePool(), *static_cast<GraphState*>(p));
+}
+
+TaskGraph::TaskGraph() : m_State(std::make_unique<GraphState>()) {}
+
+TaskGraph::~TaskGraph()
+{
+	assert((!m_State || !m_State->running.load(std::memory_order_acquire)) && "TaskGraph destroyed while it runs");
+}
+
+TaskGraph::TaskGraph(TaskGraph&&) noexcept = default;
+
+TaskGraph& TaskGraph::operator=(TaskGraph&& other) noexcept
+{
+	assert((!m_State || !m_State->running.load(std::memory_order_acquire)) && "TaskGraph replaced while it runs");
+	m_State = std::move(other.m_State);
+	return *this;
+}
+
+TaskGraph::Node TaskGraph::Add(const TaskDesc& desc)
+{
+	return AddOwned(desc.userData, desc.fn, nullptr, desc);
+}
+
+TaskGraph::Node TaskGraph::AddOwned(void* object, void (*run)(void*), void (*destroy)(void*), const TaskDesc& opts)
+{
+	if (!m_State)
+		m_State = std::make_unique<GraphState>(); // a moved-from graph is empty and usable
+	GraphState& g = *m_State;
+	assert(!g.running.load(std::memory_order_acquire) && "TaskGraph changed while it runs");
+	assert(run && "graph node without a function");
+	assert(opts.signals == kInvalidCounter && opts.waitsFor == kInvalidCounter && opts.waitsForAll.empty()
+		&& "a graph node's counters come from the graph");
+	assert((opts.affinity != Affinity::Dedicated) || opts.thread != kInvalidDedicated);
+	g.nodes.push_back(GraphState::NodeDesc{ .fn = run, .userData = object, .destroy = destroy, .affinity = opts.affinity,
+		.thread = opts.thread, .priority = opts.priority, .window = opts.window, .nameId = opts.nameId });
+	g.compiled = false;
+	return Node(g.nodes.size() - 1);
+}
+
+void TaskGraph::Precede(Node before, Node after)
+{
+	assert(m_State && before < m_State->nodes.size() && after < m_State->nodes.size() && "Precede: no such node");
+	GraphState& g = *m_State;
+	assert(!g.running.load(std::memory_order_acquire) && "TaskGraph changed while it runs");
+	g.edges.emplace_back(before, after);
+	g.compiled = false;
+}
+
+void TaskGraph::Clear()
+{
+	if (!m_State)
+		return;
+	GraphState& g = *m_State;
+	assert(!g.running.load(std::memory_order_acquire) && "TaskGraph changed while it runs");
+	g.DestroyCallables();
+	g.nodes.clear();
+	g.edges.clear();
+	g.compiled = false;
+}
+
+size_t TaskGraph::NodeCount() const
+{
+	return m_State ? m_State->nodes.size() : 0;
+}
+
+bool TaskGraph::Running() const
+{
+	return m_State && m_State->running.load(std::memory_order_acquire);
+}
+
+bool TaskGraph::Validate()
+{
+	if (!m_State)
+		return true;
+	GraphState& g = *m_State;
+	assert(!g.running.load(std::memory_order_acquire) && "TaskGraph compiled while it runs");
+	if (!g.compiled)
+		g.Compile();
+	return g.acyclic;
+}
+
+void Submit(TaskGraph& graph, CounterHandle signals, CounterHandle waitsFor)
+{
+	PoolState& P = ActivePool();
+	if (!graph.m_State)
+		graph.m_State = std::make_unique<GraphState>();
+	GraphState& g = *graph.m_State;
+	assert(!g.running.load(std::memory_order_acquire) && "TaskGraph submitted while a run is in flight");
+	if (!g.compiled)
+		g.Compile();
+	// A cycle's nodes would never run, and the run never finish: fail now,
+	// release builds too, rather than hang.
+	assert(g.acyclic && "TaskGraph has a cycle");
+	if (!g.acyclic)
+	{
+		std::fprintf(stderr, "loom: Submit of a TaskGraph with a cycle\n");
+		std::abort();
+	}
+	g.running.store(true, std::memory_order_relaxed); // published with the first queued node
+	g.signals = signals;
+	if (waitsFor == kInvalidCounter)
+		StartGraphRun(P, g);
+	else
+		Submit(TaskDesc{ .fn = &GraphLaunchTask, .userData = &g, .waitsFor = waitsFor });
+}
+
+void Run(TaskGraph& graph, Help help)
+{
+	const CounterHandle done = CreateCounter(1);
+	// Destroyed on the way out even when WaitFor rethrows (the count is zero).
+	struct DestroyOnExit
+	{
+		CounterHandle h;
+		~DestroyOnExit() { DestroyCounter(h); }
+	} destroy{ done };
+	Submit(graph, done);
+	WaitFor(done, help);
 }
 
 // ---- Lanes ---------------------------------------------------------------------

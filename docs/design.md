@@ -96,6 +96,27 @@ drops its own count: the task becomes runnable at once if all were zero.
 Each counter that reaches zero decrements the count for the tasks parked on
 it, and the decrement that takes it to zero queues the task.
 
+### Task graphs
+
+A `TaskGraph` keeps its nodes and edges as built and compiles them, once per
+change, into successor lists and in-degrees (Kahn's algorithm checks for a
+cycle on the way). A node holds no task slot until it is ready. A run stores
+each node's in-degree as its count of unfinished predecessors, sets the
+graph's count of unfinished nodes, and queues the roots. A node's task runs
+the node's function (unless the run's counter is cancelled), decrements each
+successor's count and queues those it takes to zero, and then decrements the
+unfinished count. That decrement is the node's last touch of the graph: the
+node that takes it to zero clears the running flag and signals the run's
+counter, after which the graph may be run again or destroyed.
+
+So a run costs one task per node and one atomic decrement per edge. Building
+the same order from counters each frame costs a counter per node, created
+and destroyed, a lock of the predecessor's counter for every edge (to park
+on it), and that lock again when each counter releases what it parked. A node catches its own exception, rather than
+leaving it to the task runner, so its successors are released whether it
+ran, threw or was skipped; every node then counts toward the run's end, and
+a failed run still completes.
+
 ## Queues
 
 AnyWorker work lives in work-stealing deques, one per worker and one for the

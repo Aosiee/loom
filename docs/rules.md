@@ -68,3 +68,11 @@ task slot. Anything bigger, or aligned past 16 bytes, costs one heap
 allocation per task. For per-frame work, capture pointers and indices. An
 owned callable is destroyed after its task runs, or when the task is skipped
 by cancellation, before the task signals its counter.
+
+## A graph runs once at a time and does not change while it runs
+
+A `TaskGraph` keeps one set of per-run counts, so a second `Submit` before
+the first run has finished asserts, as does adding a node or an edge, or
+destroying the graph, while it runs. Wait for the run's counter first. A
+frame that overlaps the next one (simulation of frame N+1 while frame N
+renders) uses two graphs.

@@ -9,6 +9,7 @@
 #include "loom/loom.h"
 #include "loom/loom_profiler_shim.h"
 #include <doctest/doctest.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1720,6 +1721,195 @@ TEST_CASE("loom: ParallelReduce — the same bits on every run and with any numb
 		serial += (char)('A' + (i % 26));
 	CHECK(joined == serial);
 	CHECK(loom::ParallelReduce(5, 5, 0, 42, [](size_t, size_t) { return 0; }, [](int a, int b) { return a + b; }) == 42);
+}
+
+// ---- Task graphs ----
+
+namespace {
+	// A random DAG over `n` nodes: edges only go forward in a shuffled order,
+	// so there is never a cycle, and the shuffle keeps node ids out of order.
+	struct RandomDag
+	{
+		std::vector<std::pair<uint32_t, uint32_t>> edges;
+		RandomDag(uint32_t n, uint32_t edgesPerNode, uint32_t seed)
+		{
+			std::mt19937 rng(seed);
+			std::vector<uint32_t> order(n);
+			for (uint32_t i = 0; i < n; i++)
+				order[i] = i;
+			std::shuffle(order.begin(), order.end(), rng);
+			for (uint32_t i = 1; i < n; i++)
+				for (uint32_t k = 0; k < edgesPerNode; k++)
+					edges.emplace_back(order[rng() % i], order[i]);
+		}
+	};
+}
+
+TEST_CASE("loom: graphs — every node runs once per run, after its predecessors, run after run")
+{
+	for (int workers : { 0, 1, -1 })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		const uint32_t N = 300;
+		const RandomDag dag(N, 3, 77);
+		std::atomic<uint32_t> ticket{ 0 };
+		std::vector<std::atomic<uint32_t>> stamp(N), runs(N);
+		loom::TaskGraph graph;
+		for (uint32_t i = 0; i < N; i++)
+			CHECK(graph.Add([&, i] { stamp[i] = ticket++; runs[i]++; }) == i);
+		for (auto [a, b] : dag.edges)
+			graph.Precede(a, b);
+		CHECK(graph.Validate());
+		for (int run = 0; run < 40; run++)
+		{
+			loom::Run(graph);
+			CHECK(!graph.Running());
+			bool ordered = true;
+			for (auto [a, b] : dag.edges)
+				ordered = ordered && stamp[a] < stamp[b];
+			CHECK_MESSAGE(ordered, "workers ", workers, " run ", run, ": a node started before a predecessor finished");
+		}
+		bool once = true;
+		for (auto& r : runs)
+			once = once && r == 40;
+		CHECK_MESSAGE(once, "every node ran exactly once per run");
+		CHECK(loom::LiveTaskCount() >= 0);
+	}
+}
+
+TEST_CASE("loom: graphs — nodes keep their affinity, and one graph runs inside another's node")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	const loom::DedicatedId io = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "graph-io" });
+	std::atomic<int> mainIndex{ -1 }, dedicatedIndex{ -1 };
+	std::atomic<int> innerRuns{ 0 };
+
+	loom::TaskGraph inner;
+	const auto i0 = inner.Add([&] { innerRuns++; });
+	const auto i1 = inner.Add([&] { innerRuns++; });
+	inner.Precede(i0, i1);
+
+	loom::TaskGraph outer;
+	const auto first = outer.Add([&] { loom::Run(inner); }); // a nested run: the worker helps
+	const auto onMain = outer.Add([&] { mainIndex = loom::CurrentThreadIndex(); }, loom::TaskDesc{ .affinity = loom::Affinity::MainThread });
+	const auto onIo = outer.Add([&] { dedicatedIndex = loom::CurrentThreadIndex(); },
+		loom::TaskDesc{ .affinity = loom::Affinity::Dedicated, .thread = io, .priority = loom::Priority::High });
+	outer.Precede(first, onMain);
+	outer.Precede(first, onIo);
+	for (int run = 0; run < 20; run++)
+		loom::Isolated([&] { loom::Run(outer); });
+	CHECK(innerRuns.load() == 40);
+	CHECK(mainIndex.load() == 0);
+	CHECK(dedicatedIndex.load() > 0);
+	loom::UnregisterDedicatedThread(io);
+}
+
+TEST_CASE("loom: graphs — Submit waits for its counter and signals one it may share")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	std::atomic<int> ran{ 0 };
+	loom::TaskGraph graph;
+	const auto a = graph.Add([&] { ran++; });
+	const auto b = graph.Add([&] { ran++; });
+	graph.Precede(a, b);
+
+	loom::ScopedCounter gate(1), done(2); // the run and one plain task
+	loom::Submit(graph, done, gate);
+	loom::Submit([&] { ran += 10; }, loom::TaskDesc{ .signals = done });
+	std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	CHECK_MESSAGE(ran.load() == 10, "no node runs before the gate opens");
+	CHECK(graph.Running());
+	loom::Signal(gate);
+	loom::WaitFor(done);
+	CHECK(ran.load() == 12);
+	CHECK(!graph.Running());
+
+	// An empty graph completes at once, and still signals.
+	loom::TaskGraph empty;
+	loom::ScopedCounter emptyDone(1);
+	loom::Submit(empty, emptyDone);
+	CHECK(loom::TryWaitFor(emptyDone, 1000));
+	loom::Run(empty);
+}
+
+#if defined(__cpp_exceptions)
+TEST_CASE("loom: graphs — an exception or a Cancel skips the nodes not yet started; the graph runs again")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	std::atomic<int> c{ 0 }, d{ 0 };
+	bool throwNow = true;
+	loom::TaskGraph graph;
+	const auto a = graph.Add([] {});
+	const auto b = graph.Add([&] { if (throwNow) throw std::runtime_error("b"); });
+	const auto nc = graph.Add([&] { c++; });
+	const auto nd = graph.Add([&] { d++; });
+	graph.Precede(a, b);
+	graph.Precede(b, nc);
+	graph.Precede(nc, nd);
+	CHECK_THROWS_AS(loom::Run(graph), std::runtime_error);
+	CHECK(c.load() == 0);
+	CHECK(d.load() == 0);
+	CHECK(!graph.Running());
+	throwNow = false;
+	loom::Run(graph);
+	CHECK(c.load() == 1);
+	CHECK(d.load() == 1);
+
+	// Cancel the run's counter while its first node runs.
+	std::atomic<bool> started{ false }, cancelled{ false };
+	loom::TaskGraph slow;
+	const auto s0 = slow.Add([&] {
+		started = true;
+		while (!cancelled)
+			std::this_thread::yield();
+	});
+	std::atomic<int> after{ 0 };
+	for (int i = 0; i < 5; i++)
+		slow.Precede(s0, slow.Add([&] { after++; }));
+	loom::ScopedCounter done(1);
+	loom::Submit(slow, done);
+	while (!started)
+		std::this_thread::yield();
+	loom::Cancel(done);
+	cancelled = true;
+	loom::WaitFor(done);
+	CHECK(after.load() == 0);
+	CHECK(!slow.Running());
+}
+#endif
+
+TEST_CASE("loom: graphs — cycles are found, and callables live as long as the graph")
+{
+	Tracked::live = 0;
+	{
+		loom::TaskGraph graph; // built before any pool: building needs none
+		Tracked tracked;
+		const auto a = graph.Add([tracked] { (void)tracked; });
+		const auto b = graph.Add([tracked] { (void)tracked; });
+		const auto c = graph.Add([tracked] { (void)tracked; });
+		graph.Precede(a, b);
+		graph.Precede(b, c);
+		CHECK(graph.Validate());
+		graph.Precede(c, a);
+		CHECK(!graph.Validate());
+		CHECK(Tracked::live.load() == 4);
+		graph.Clear();
+		CHECK(Tracked::live.load() == 1);
+		CHECK(graph.NodeCount() == 0);
+		CHECK(graph.Validate());
+		graph.Add([tracked] { (void)tracked; });
+		loom::TaskGraph moved(std::move(graph));
+		CHECK(moved.NodeCount() == 1);
+		CHECK(graph.NodeCount() == 0);
+		graph.Add([] {}); // a moved-from graph is empty and usable
+		CHECK(graph.NodeCount() == 1);
+
+		loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+		loom::Run(moved);
+		loom::Run(moved);
+		CHECK(Tracked::live.load() == 2);
+	}
+	CHECK(Tracked::live.load() == 0);
 }
 
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
