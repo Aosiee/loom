@@ -98,24 +98,36 @@ it, and the decrement that takes it to zero queues the task.
 
 ### Task graphs
 
-A `TaskGraph` keeps its nodes and edges as built and compiles them, once per
-change, into successor lists and in-degrees (Kahn's algorithm checks for a
-cycle on the way). A node holds no task slot until it is ready. A run stores
-each node's in-degree as its count of unfinished predecessors, sets the
-graph's count of unfinished nodes, and queues the roots. A node's task runs
-the node's function (unless the run's counter is cancelled), decrements each
-successor's count and queues those it takes to zero, and then decrements the
-unfinished count. That decrement is the node's last touch of the graph: the
-node that takes it to zero clears the running flag and signals the run's
-counter, after which the graph may be run again or destroyed.
+A `TaskGraph` keeps its nodes and edges as built and compiles them once per
+change (Kahn's algorithm checks for a cycle on the way). Nodes with the same
+set of predecessors share one *wait set*: a count of unfinished
+predecessors, decremented once by each of them, whose zero releases all its
+members at once. A dense layer (every node after every node of the layer
+before) then costs one decrement per predecessor on one count, where one
+count per node would take a decrement per edge on as many lines. A set with
+one predecessor has no count: that predecessor releases it directly. A node
+holds no task slot until its set is ready.
 
-So a run costs one task per node and one atomic decrement per edge. Building
-the same order from counters each frame costs a counter per node, created
-and destroyed, a lock of the predecessor's counter for every edge (to park
-on it), and that lock again when each counter releases what it parked. A node catches its own exception, rather than
-leaving it to the task runner, so its successors are released whether it
-ran, threw or was skipped; every node then counts toward the run's end, and
-a failed run still completes.
+A run resets the counts, creates a counter holding the number of nodes,
+parks a small finishing task on it and queues the root set. A node's task
+runs the node's function (unless the caller's counter is cancelled),
+decrements the sets it feeds and queues the members of those it takes to
+zero, then returns; the task runner signals the run's counter, batched per
+thread like any task's signal. The finishing task runs once every node has
+signalled: it destroys the run's counter, clears the running flag and
+signals the caller's counter, after which the graph may run again or be
+destroyed. A node catches its own exception (for the caller's counter)
+rather than leaving it to the runner, and the run's counter is never
+cancelled, so every node's task runs and releases its successors whether the
+node ran, threw or was skipped: a failed run still completes.
+
+Queuing a set is the hot path when a graph is wide: it writes each slot
+straight from the node, adds the set to the live count once, and chains
+runnable AnyWorker Normal members into groups as `Submit(span)` does, so it
+costs less than a `Submit(span)` of the same tasks. A node's task reads its
+node through a pointer into the graph; copying what it needs into the slot
+instead made the submitter write the slot's second cache line, which slowed
+a wide graph by about a third.
 
 ## Queues
 

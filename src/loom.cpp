@@ -11,6 +11,7 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -1691,12 +1692,20 @@ static void ParallelForFixed(PoolState& P, size_t begin, size_t end, size_t chun
 }
 
 // ---- Task graphs ---------------------------------------------------------------
-// The graph keeps its nodes and edges as built, and compiles them, once per
-// change, into successor lists (CSR) and in-degrees. A run resets each node's
-// count of unfinished predecessors and queues the roots. A finishing node
-// decrements its successors' counts and queues those that reach zero, then
-// decrements the run's count of unfinished nodes; the node that takes it to
-// zero ends the run. Only ready nodes hold task slots.
+// The graph keeps its nodes and edges as built and compiles them once per
+// change. Nodes with the same set of predecessors share one *wait set*: one
+// count of unfinished predecessors, decremented once by each, whose zero
+// releases all its members at once. A dense layer (every node after every
+// node of the layer before) then costs one decrement per predecessor, on
+// one count, instead of one per edge on as many counts as there are nodes.
+// The nodes with no predecessor form the root set.
+//
+// A run resets the counts, creates a counter of the run's nodes, parks a
+// finishing task on it and releases the root set. A node's task runs the
+// node, decrements each wait set it feeds and queues the members of those it
+// takes to zero (in groups, as Submit(span) does), and returns: the task
+// runner signals the run's counter, with each thread's usual batching. The
+// finishing task, which runs once every node has signalled, ends the run.
 
 namespace detail {
 
@@ -1719,6 +1728,11 @@ struct GraphState
 		GraphState* graph = nullptr;
 		uint32_t    index = 0;
 	};
+	// Each on its own line: every predecessor of the set writes it.
+	struct alignas(64) WaitCount
+	{
+		std::atomic<uint32_t> remaining{ 0 };
+	};
 
 	std::vector<NodeDesc> nodes;
 	std::vector<std::pair<uint32_t, uint32_t>> edges; // (before, after)
@@ -1726,17 +1740,19 @@ struct GraphState
 	// Compiled from the above; valid while `compiled`.
 	bool compiled = false;
 	bool acyclic = true;
-	std::vector<uint32_t> succBegin; // node i's successors: succ[succBegin[i], succBegin[i + 1])
-	std::vector<uint32_t> succ;
-	std::vector<uint32_t> indegree;
-	std::vector<uint32_t> roots;
+	uint32_t rootSet = 0;
+	std::vector<uint32_t> feedsBegin;  // node i decrements sets feeds[feedsBegin[i], feedsBegin[i + 1])
+	std::vector<uint32_t> feeds;
+	std::vector<uint32_t> setPreds;    // per set: its number of predecessors
+	std::vector<uint32_t> memberBegin; // set w releases members[memberBegin[w], memberBegin[w + 1])
+	std::vector<uint32_t> members;
 	std::unique_ptr<NodeRef[]> refs;
-	std::unique_ptr<std::atomic<uint32_t>[]> remaining; // per run: predecessors not yet finished
+	std::unique_ptr<WaitCount[]> waits; // per run, for the sets with more than one predecessor
 
 	// Per run.
-	std::atomic<uint32_t> unfinished{ 0 };
-	std::atomic<bool>     running{ false };
-	CounterHandle         signals = kInvalidCounter;
+	std::atomic<bool> running{ false };
+	CounterHandle     signals = kInvalidCounter; // the caller's
+	CounterHandle     nodesLeft = kInvalidCounter; // the run's own: one per node
 
 	~GraphState() { DestroyCallables(); }
 
@@ -1747,47 +1763,83 @@ struct GraphState
 				n.destroy(n.userData);
 	}
 
-	// Kahn's algorithm: the nodes every edge order allows to run first, and
-	// whether all of them can run at all (no cycle).
 	void Compile()
 	{
 		const uint32_t n = (uint32_t)nodes.size();
-		succBegin.assign(n + 1, 0);
-		indegree.assign(n, 0);
+		// Each node's predecessors, sorted, without repeats: its set's key.
+		std::vector<std::vector<uint32_t>> preds(n);
 		for (auto [before, after] : edges)
+			preds[after].push_back(before);
+		for (auto& p : preds)
 		{
-			succBegin[before + 1]++;
-			indegree[after]++;
+			std::sort(p.begin(), p.end());
+			p.erase(std::unique(p.begin(), p.end()), p.end());
+		}
+		std::map<std::vector<uint32_t>, uint32_t> setOf;
+		std::vector<uint32_t> nodeSet(n);
+		std::vector<const std::vector<uint32_t>*> setKey;
+		setOf.emplace(std::vector<uint32_t>{}, 0); // the root set is always set 0, maybe empty
+		setKey.push_back(&setOf.begin()->first);
+		for (uint32_t i = 0; i < n; i++)
+		{
+			auto [it, added] = setOf.emplace(preds[i], (uint32_t)setKey.size());
+			if (added)
+				setKey.push_back(&it->first);
+			nodeSet[i] = it->second;
+		}
+		const uint32_t sets = (uint32_t)setKey.size();
+		rootSet = 0;
+
+		setPreds.assign(sets, 0);
+		memberBegin.assign(sets + 1, 0);
+		feedsBegin.assign(n + 1, 0);
+		for (uint32_t w = 0; w < sets; w++)
+		{
+			setPreds[w] = (uint32_t)setKey[w]->size();
+			for (uint32_t p : *setKey[w])
+				feedsBegin[p + 1]++;
 		}
 		for (uint32_t i = 0; i < n; i++)
-			succBegin[i + 1] += succBegin[i];
-		succ.resize(edges.size());
-		std::vector<uint32_t> fill(succBegin.begin(), succBegin.end() - 1);
-		for (auto [before, after] : edges)
-			succ[fill[before]++] = after;
-
-		roots.clear();
+			memberBegin[nodeSet[i] + 1]++;
+		for (uint32_t w = 0; w < sets; w++)
+			memberBegin[w + 1] += memberBegin[w];
 		for (uint32_t i = 0; i < n; i++)
-			if (indegree[i] == 0)
-				roots.push_back(i);
-		std::vector<uint32_t> left(indegree);
-		std::vector<uint32_t> ready(roots);
+			feedsBegin[i + 1] += feedsBegin[i];
+		members.resize(n);
+		feeds.resize(feedsBegin[n]);
+		{
+			std::vector<uint32_t> fill(memberBegin.begin(), memberBegin.end() - 1);
+			for (uint32_t i = 0; i < n; i++)
+				members[fill[nodeSet[i]]++] = i;
+		}
+		{
+			std::vector<uint32_t> fill(feedsBegin.begin(), feedsBegin.end() - 1);
+			for (uint32_t w = 0; w < sets; w++)
+				for (uint32_t p : *setKey[w])
+					feeds[fill[p]++] = w;
+		}
+
+		// Kahn's algorithm over the sets: every node is reached unless there
+		// is a cycle.
+		std::vector<uint32_t> left(setPreds);
+		std::vector<uint32_t> ready(members.begin() + memberBegin[rootSet], members.begin() + memberBegin[rootSet + 1]);
 		uint32_t reached = 0;
 		while (!ready.empty())
 		{
 			const uint32_t i = ready.back();
 			ready.pop_back();
 			reached++;
-			for (uint32_t k = succBegin[i]; k < succBegin[i + 1]; k++)
-				if (--left[succ[k]] == 0)
-					ready.push_back(succ[k]);
+			for (uint32_t k = feedsBegin[i]; k < feedsBegin[i + 1]; k++)
+				if (--left[feeds[k]] == 0)
+					for (uint32_t m = memberBegin[feeds[k]]; m < memberBegin[feeds[k] + 1]; m++)
+						ready.push_back(members[m]);
 		}
 		acyclic = reached == n;
 
 		refs.reset(new NodeRef[n]);
-		remaining.reset(new std::atomic<uint32_t>[n]);
 		for (uint32_t i = 0; i < n; i++)
 			refs[i] = NodeRef{ this, i };
+		waits.reset(new WaitCount[sets]);
 		compiled = true;
 	}
 };
@@ -1798,13 +1850,74 @@ using detail::GraphState;
 
 static void GraphNodeTask(void* p);
 
-// Gives a ready node a task slot and queues it. True when it went into the pool.
-static bool QueueGraphNode(PoolState& P, GraphState& g, uint32_t i, WorkerCtx* ctx)
+// Queues the members of a set that has just become ready. Runnable AnyWorker
+// Normal nodes go in groups, as Submit(span) chains them; the rest one by one.
+// Returns how many entries went into the pool.
+static size_t QueueGraphSet(PoolState& P, GraphState& g, uint32_t set, WorkerCtx* ctx)
 {
-	const GraphState::NodeDesc& n = g.nodes[i];
-	const uint32_t slot = PrepareSlot(P, TaskDesc{ .fn = &GraphNodeTask, .userData = &g.refs[i], .affinity = n.affinity,
-		.thread = n.thread, .nameId = n.nameId, .window = n.window, .priority = n.priority }, ctx);
-	return EnqueueSlot(P, slot, ctx);
+	const uint32_t first = g.memberBegin[set], last = g.memberBegin[set + 1];
+	const uint32_t groupSize = GroupSizeFor(last - first);
+	size_t entries = 0;
+	uint32_t head = kNoSlot, tail = kNoSlot, length = 0;
+	auto pushGroup = [&] {
+		if (length == 0)
+			return;
+		Slot(P, tail).groupNext = kNoSlot;
+		PushPool(P, length > 1 ? (head | kGroupBit) : head, ctx);
+		entries++;
+		length = 0;
+	};
+	// Live from here, before any of them is queued (and can finish): one
+	// add for the set, not one per node.
+	LiveShard(P, ctx).fetch_add(last - first, std::memory_order_relaxed);
+	const CounterHandle nodesLeft = g.nodesLeft;
+	const uint16_t isolation = t_Isolation; // a node belongs to the region it was queued in
+	for (uint32_t m = first; m < last; m++)
+	{
+		const uint32_t i = g.members[m];
+		const GraphState::NodeDesc& n = g.nodes[i];
+		// PrepareSlot's fields, written straight from the node.
+		const uint32_t slot = AllocateSlot(P, ctx);
+		TaskSlot& t = Slot(P, slot);
+		t.fn = &GraphNodeTask;
+		t.userData = &g.refs[i];
+		t.affinity = n.affinity;
+		t.thread = n.thread;
+		t.signals = nodesLeft;
+		t.priority = n.priority;
+		t.owned = false;
+		t.isolation = isolation;
+		t.nameId = n.nameId;
+		t.window = n.window;
+		if (groupSize > 1 && n.affinity == Affinity::AnyWorker && n.priority == Priority::Normal)
+		{
+			if (length == 0)
+				head = slot;
+			else
+				Slot(P, tail).groupNext = slot;
+			tail = slot;
+			if (++length == groupSize)
+				pushGroup();
+		}
+		else
+			entries += EnqueueSlot(P, slot, ctx) ? 1 : 0;
+	}
+	pushGroup();
+	return entries;
+}
+
+// Runs once every node of the run has signalled nodesLeft: ends the run.
+static void GraphFinishTask(void* p)
+{
+	GraphState& g = *static_cast<GraphState*>(p);
+	const CounterHandle signals = g.signals, nodesLeft = g.nodesLeft;
+	// Released by the final signal, which may still be settling the count.
+	WaitFor(nodesLeft, Help::BlockOnly);
+	DestroyCounter(nodesLeft);
+	// The graph's last touch: from here it may be run again or destroyed.
+	g.running.store(false, std::memory_order_release);
+	if (signals != kInvalidCounter)
+		Signal(signals);
 }
 
 static void StartGraphRun(PoolState& P, GraphState& g)
@@ -1818,16 +1931,16 @@ static void StartGraphRun(PoolState& P, GraphState& g)
 			SignalCounter(P, signals, 1);
 		return;
 	}
-	// Plain stores: queueing a root publishes them to whoever runs it, and
-	// every later node is queued by a thread that ran one of its predecessors.
-	for (uint32_t i = 0; i < n; i++)
-		g.remaining[i].store(g.indegree[i], std::memory_order_relaxed);
-	g.unfinished.store(n, std::memory_order_relaxed);
+	// Plain stores: queueing the roots publishes them to whoever runs a
+	// node, and every later node is queued by a thread that ran a predecessor.
+	const uint32_t sets = (uint32_t)g.setPreds.size();
+	for (uint32_t w = 0; w < sets; w++)
+		g.waits[w].remaining.store(g.setPreds[w], std::memory_order_relaxed);
+	g.nodesLeft = CreateCounter((int)n);
+	// High: it only ends the run, and the caller is waiting for that.
+	Submit(TaskDesc{ .fn = &GraphFinishTask, .userData = &g, .waitsFor = g.nodesLeft, .priority = Priority::High });
 	WorkerCtx* ctx = CurrentCtx(P);
-	size_t pooled = 0;
-	for (uint32_t i : g.roots)
-		pooled += QueueGraphNode(P, g, i, ctx) ? 1 : 0;
-	WakeForWork(P, pooled);
+	WakeForWork(P, QueueGraphSet(P, g, g.rootSet, ctx));
 }
 
 static void GraphNodeTask(void* p)
@@ -1840,27 +1953,23 @@ static void GraphNodeTask(void* p)
 	if (!(counter && counter->cancelled.load(std::memory_order_acquire)))
 	{
 		const GraphState::NodeDesc& n = g.nodes[ref.index];
-		// Caught here, not by RunSlot: the successors are released either way.
+		// Caught here and sent to the caller's counter: the run's own counter
+		// is never cancelled, so this task always runs and releases what
+		// follows, whether the node ran, threw or was skipped.
 		RunTaskFn(P, n.fn, n.userData, signals);
 	}
 
 	WorkerCtx* ctx = CurrentCtx(P);
-	size_t pooled = 0;
-	for (uint32_t k = g.succBegin[ref.index]; k < g.succBegin[ref.index + 1]; k++)
+	size_t entries = 0;
+	for (uint32_t k = g.feedsBegin[ref.index]; k < g.feedsBegin[ref.index + 1]; k++)
 	{
-		const uint32_t s = g.succ[k];
-		if (g.remaining[s].fetch_sub(1, std::memory_order_acq_rel) == 1)
-			pooled += QueueGraphNode(P, g, s, ctx) ? 1 : 0;
+		const uint32_t w = g.feeds[k];
+		// A set with one predecessor is ready now: no count to touch.
+		if (g.setPreds[w] == 1 || g.waits[w].remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
+			entries += QueueGraphSet(P, g, w, ctx);
 	}
-	WakeForWork(P, pooled);
-
-	// The last touch of the graph for every node but the last: once the count
-	// is zero, the graph may be submitted again or destroyed.
-	if (g.unfinished.fetch_sub(1, std::memory_order_acq_rel) != 1)
-		return;
-	g.running.store(false, std::memory_order_release);
-	if (signals != kInvalidCounter)
-		SignalCounter(P, signals, 1);
+	WakeForWork(P, entries);
+	// The runner then signals nodesLeft for this node.
 }
 
 // Starts a run whose waitsFor was not yet zero, from a task parked on it.

@@ -1777,6 +1777,61 @@ TEST_CASE("loom: graphs — every node runs once per run, after its predecessors
 	}
 }
 
+TEST_CASE("loom: graphs — dense layers share a wait; mixed affinities and repeated edges in one set")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 3 });
+	// Layer by layer, every node after every node of the layer before: each
+	// layer is one wait set. One member per layer runs on the main thread and
+	// one is High, so a set is queued partly in groups and partly one by one.
+	const int L = 6, W = 40;
+	std::atomic<int> finished[L] = {};
+	std::atomic<bool> early{ false }, offMain{ false };
+	loom::TaskGraph graph;
+	std::vector<loom::TaskGraph::Node> layer[L];
+	for (int l = 0; l < L; l++)
+		for (int i = 0; i < W; i++)
+		{
+			loom::TaskDesc opts;
+			if (i == 0)
+				opts.affinity = loom::Affinity::MainThread;
+			if (i == 1)
+				opts.priority = loom::Priority::High;
+			layer[l].push_back(graph.Add([&, l, i] {
+				if (l > 0 && finished[l - 1].load() != W)
+					early = true;
+				if (i == 0 && loom::CurrentThreadIndex() != 0)
+					offMain = true;
+				finished[l]++;
+			}, opts));
+		}
+	for (int l = 1; l < L; l++)
+		for (auto a : layer[l - 1])
+			for (auto b : layer[l])
+			{
+				graph.Precede(a, b);
+				if (b == layer[l][2])
+					graph.Precede(a, b); // listed twice: still one wait per predecessor
+			}
+	// A tail after the last layer's first node only: a one-predecessor set.
+	std::atomic<int> tail{ 0 };
+	graph.Precede(layer[L - 1][5], graph.Add([&] {
+		if (finished[L - 1].load() == 0)
+			early = true;
+		tail++;
+	}));
+	for (int run = 0; run < 30; run++)
+	{
+		for (auto& f : finished)
+			f = 0;
+		loom::Run(graph);
+		for (int l = 0; l < L; l++)
+			CHECK(finished[l].load() == W);
+	}
+	CHECK_MESSAGE(!early.load(), "a node started before its whole previous layer finished");
+	CHECK(!offMain.load());
+	CHECK(tail.load() == 30);
+}
+
 TEST_CASE("loom: graphs — nodes keep their affinity, and one graph runs inside another's node")
 {
 	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });

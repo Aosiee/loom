@@ -45,7 +45,7 @@ loom::ParallelFor(0, meshes.size(), 64, [&](size_t begin, size_t end) {
   counter threw; `TryWaitFor` does the same with a time limit. `Cancel`
   skips a counter's tasks that have not started.
 - **Task graphs** (`TaskGraph`): a dependency graph declared once and run
-  every frame, with no counters to rebuild. A run acts as one task: it can
+  every frame, without rebuilding counters. A run acts as one task: it can
   wait on a counter, signals one when done, and reports exceptions and
   cancellation through it.
 - **Priorities**: `Priority::High` work runs before Normal, and `Low` only

@@ -346,9 +346,12 @@ T ParallelReduce(size_t begin, size_t end, size_t chunkSize, T identity, Map&& m
 // ---- Task graphs ------------------------------------------------------------
 // A DAG of tasks built once and run many times: the frame's systems (input,
 // then physics and animation, then culling, then the render submit on the
-// main thread), declared once with their order. A run costs one task per node
-// and one atomic decrement per edge: no counters to create, no counter locks
-// to park on. The order is checked for cycles once, when the graph changes.
+// main thread), declared once with their order. Nodes with the same
+// predecessors share one wait, so a run costs one task per node and one
+// atomic decrement per predecessor of each such wait (a layer after a layer:
+// one per node of the layer before), plus one counter and one small task to
+// end the run. Ready nodes are queued in groups, as Submit(span) does. The
+// order is checked for cycles once, when the graph changes.
 //
 // A run behaves as one task. It starts once `waitsFor` is zero and signals
 // `signals` once, when its last node has finished. A node's exception goes to
