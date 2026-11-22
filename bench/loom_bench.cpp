@@ -11,7 +11,10 @@
 //   ParallelFor/s            items per second through ParallelFor
 // Then a frame-shaped DAG (layers of tiny tasks, each waiting on a few of the
 // layer before), per frame: as a TaskGraph built once, and rebuilt every
-// frame from one counter per task.
+// frame from one counter per task. Then four shapes against the cheapest
+// counter form of each (ratio below 1: the graph is faster): independent
+// tasks against Submit(span), a fan out and in, layers each after the whole
+// layer before (a counter per layer), and a chain.
 // Usage: loom_bench [tasks] [repeats]
 
 #include "loom/loom.h"
@@ -21,6 +24,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <random>
 #include <thread>
 #include <vector>
@@ -165,6 +169,119 @@ namespace {
 		return Seconds(start, Clock::now()) / frames;
 	}
 
+	double BestPerFrame(int frames, int repeats, const std::function<void()>& frame)
+	{
+		double best = 1e9;
+		for (int r = 0; r < repeats; r++)
+		{
+			const auto start = Clock::now();
+			for (int i = 0; i < frames; i++)
+				frame();
+			best = std::min(best, Seconds(start, Clock::now()) / frames);
+		}
+		return best * 1e6;
+	}
+
+	loom::TaskDesc WorkDesc(int i, loom::CounterHandle signals = loom::kInvalidCounter, loom::CounterHandle waitsFor = loom::kInvalidCounter)
+	{
+		return loom::TaskDesc{ .fn = &Work, .userData = (void*)(uintptr_t)i, .signals = signals, .waitsFor = waitsFor };
+	}
+
+	void GraphShapes(int workers, int repeats)
+	{
+		auto row = [&](const char* name, double graph, double counters) {
+			std::printf("%-30s  %7d  %10.1f  %11.1f  %6.2f\n", name, workers, graph, counters, graph / counters);
+		};
+		{
+			const int n = 4096;
+			loom::TaskGraph graph;
+			for (int i = 0; i < n; i++)
+				graph.Add(WorkDesc(i));
+			std::vector<loom::TaskDesc> descs(n);
+			row("4096 independent", BestPerFrame(100, repeats, [&] { loom::Run(graph); }), BestPerFrame(100, repeats, [&] {
+				loom::ScopedCounter done(n);
+				for (int i = 0; i < n; i++)
+					descs[(size_t)i] = WorkDesc(i, done);
+				loom::Submit(std::span<const loom::TaskDesc>(descs));
+				loom::WaitFor(done);
+			}));
+		}
+		{
+			const int n = 1024;
+			loom::TaskGraph graph;
+			const auto root = graph.Add(WorkDesc(0)), sink = graph.Add(WorkDesc(1));
+			for (int i = 0; i < n; i++)
+			{
+				const auto node = graph.Add(WorkDesc(i));
+				graph.Precede(root, node);
+				graph.Precede(node, sink);
+			}
+			std::vector<loom::TaskDesc> descs(n);
+			row("1 -> 1024 -> 1", BestPerFrame(500, repeats, [&] { loom::Run(graph); }), BestPerFrame(500, repeats, [&] {
+				loom::ScopedCounter rootDone(1), middleDone(n), done(1);
+				loom::Submit(WorkDesc(0, rootDone));
+				for (int i = 0; i < n; i++)
+					descs[(size_t)i] = WorkDesc(i, middleDone, rootDone);
+				loom::Submit(std::span<const loom::TaskDesc>(descs));
+				loom::Submit(WorkDesc(1, done, middleDone));
+				loom::WaitFor(done);
+			}));
+		}
+		{
+			constexpr int layers = 8, width = 16;
+			loom::TaskGraph graph;
+			for (int i = 0; i < layers * width; i++)
+				graph.Add(WorkDesc(i));
+			for (int l = 1; l < layers; l++)
+				for (int a = 0; a < width; a++)
+					for (int b = 0; b < width; b++)
+						graph.Precede((loom::TaskGraph::Node)((l - 1) * width + a), (loom::TaskGraph::Node)(l * width + b));
+			std::vector<loom::TaskDesc> descs(width);
+			row("8x16, layer after layer", BestPerFrame(500, repeats, [&] { loom::Run(graph); }), BestPerFrame(500, repeats, [&] {
+				loom::CounterHandle layerDone[layers];
+				for (auto& c : layerDone)
+					c = loom::CreateCounter(width);
+				for (int l = 0; l < layers; l++)
+				{
+					for (int i = 0; i < width; i++)
+						descs[(size_t)i] = WorkDesc(i, layerDone[l], l ? layerDone[l - 1] : loom::kInvalidCounter);
+					loom::Submit(std::span<const loom::TaskDesc>(descs));
+				}
+				loom::WaitFor(layerDone[layers - 1]);
+				for (auto c : layerDone)
+				{
+					loom::WaitFor(c, loom::Help::BlockOnly); // settled, so it can be destroyed
+					loom::DestroyCounter(c);
+				}
+			}));
+		}
+		{
+			const int n = 256;
+			loom::TaskGraph graph;
+			for (int i = 0; i < n; i++)
+			{
+				const auto node = graph.Add(WorkDesc(i));
+				if (i)
+					graph.Precede(node - 1, node);
+			}
+			std::vector<loom::TaskDesc> descs(n);
+			std::vector<loom::CounterHandle> done(n);
+			row("chain of 256", BestPerFrame(100, repeats, [&] { loom::Run(graph); }), BestPerFrame(100, repeats, [&] {
+				for (auto& c : done)
+					c = loom::CreateCounter(1);
+				for (int i = 0; i < n; i++)
+					descs[(size_t)i] = WorkDesc(i, done[(size_t)i], i ? done[(size_t)i - 1] : loom::kInvalidCounter);
+				loom::Submit(std::span<const loom::TaskDesc>(descs));
+				loom::WaitFor(done[(size_t)n - 1]);
+				for (auto c : done)
+				{
+					loom::WaitFor(c, loom::Help::BlockOnly);
+					loom::DestroyCounter(c);
+				}
+			}));
+		}
+	}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -203,6 +320,13 @@ int main(int argc, char** argv)
 			bestCounters = std::min(bestCounters, CounterFrames(dag, 2000));
 		}
 		std::printf("%8d  %16.2f  %18.2f\n", workers, bestGraph * 1e6, bestCounters * 1e6);
+	}
+	std::printf("\ngraph shapes against their cheapest counter form, us per run\n");
+	std::printf("%-30s  %7s  %10s  %11s  %6s\n", "shape", "workers", "TaskGraph", "counters", "ratio");
+	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers, .maxTasks = 1 << 16 });
+		GraphShapes(workers, repeats);
 	}
 	return 0;
 }
