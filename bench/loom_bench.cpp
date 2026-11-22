@@ -15,6 +15,10 @@
 // counter form of each (ratio below 1: the graph is faster): independent
 // tasks against Submit(span), a fan out and in, layers each after the whole
 // layer before (a counter per layer), and a chain.
+// Then limiters: what a limited task costs (one Submit per task, with no
+// limiter, a limiter that never makes a task wait, and one that holds most
+// tasks back), and a frame of ParallelFor work beside long Low-priority
+// background tasks, with the background unlimited or limited to 4 workers.
 // Usage: loom_bench [tasks] [repeats]
 
 #include "loom/loom.h"
@@ -26,6 +30,7 @@
 #include <cstdlib>
 #include <functional>
 #include <random>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -282,6 +287,82 @@ namespace {
 		}
 	}
 
+	// What a limiter adds per task: `tasks` tiny tasks, one Submit each.
+	double LimitedRun(int tasks, loom::LimiterHandle limiter)
+	{
+		const auto start = Clock::now();
+		loom::ScopedCounter done(tasks);
+		for (int i = 0; i < tasks; i++)
+			loom::Submit(loom::TaskDesc{ .fn = &Work, .userData = (void*)(uintptr_t)i, .signals = done, .limiter = limiter });
+		loom::WaitFor(done);
+		return Seconds(start, Clock::now());
+	}
+
+	// About a nanosecond an iteration.
+	void Burn(int iterations)
+	{
+		uint64_t x = 1;
+		for (int i = 0; i < iterations; i++)
+			x = x * 6364136223846793005ull + 1442695040888963407ull;
+		KeepAlive(x);
+	}
+
+	// Background work that never runs out: Low tasks of about a millisecond,
+	// each submitting the next until `stop`.
+	struct Background
+	{
+		std::atomic<bool> stop{ false };
+		std::atomic<int>  live{ 0 };
+		loom::LimiterHandle limiter = loom::kInvalidLimiter;
+
+		static void Task(void* p)
+		{
+			Background& b = *static_cast<Background*>(p);
+			Burn(1'000'000);
+			if (!b.stop.load(std::memory_order_relaxed))
+				b.Start();
+			b.live.fetch_sub(1, std::memory_order_release);
+		}
+		void Start()
+		{
+			live.fetch_add(1, std::memory_order_relaxed);
+			loom::Submit(loom::TaskDesc{ .fn = &Task, .userData = this, .priority = loom::Priority::Low, .limiter = limiter });
+		}
+		void Finish()
+		{
+			stop = true;
+			while (live.load(std::memory_order_acquire) > 0)
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	};
+
+	// A frame of 256 items of about 5 us each (1.3 ms of work), started every
+	// 3 ms; returns the median and the slowest 1% of frame times, in us. With
+	// `isolated`, the frame waits in an isolated region, so the waiting thread
+	// never helps with a background task.
+	std::pair<double, double> FramesBeside(int backgroundTasks, loom::LimiterHandle limiter, bool isolated)
+	{
+		Background bg;
+		bg.limiter = limiter;
+		for (int i = 0; i < backgroundTasks; i++)
+			bg.Start();
+		std::vector<double> times;
+		for (int f = 0; f < 300; f++)
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(3));
+			const auto start = Clock::now();
+			auto frame = [] { loom::ParallelFor(0, 256, 1, [](size_t, size_t) { Burn(5'000); }); };
+			if (isolated)
+				loom::Isolated(frame);
+			else
+				frame();
+			times.push_back(Seconds(start, Clock::now()) * 1e6);
+		}
+		bg.Finish();
+		std::sort(times.begin(), times.end());
+		return { times[times.size() / 2], times[times.size() * 99 / 100] };
+	}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -327,6 +408,38 @@ int main(int argc, char** argv)
 	{
 		loom::Pool pool(loom::LoomConfig{ .workerCount = workers, .maxTasks = 1 << 16 });
 		GraphShapes(workers, repeats);
+	}
+
+	std::printf("\nlimiter cost: 4096 tiny tasks, one Submit each, ns per task\n");
+	std::printf("%8s  %12s  %16s  %20s\n", "workers", "no limiter", "limit never hit", "limit workers / 4");
+	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers, .maxTasks = 1 << 16 });
+		loom::ScopedLimiter wide(1u << 20), narrow((uint32_t)std::max(1, workers / 4));
+		const int n = 4096;
+		double none = 1e9, never = 1e9, held = 1e9;
+		for (int r = 0; r < repeats * 20; r++)
+		{
+			none = std::min(none, LimitedRun(n, loom::kInvalidLimiter));
+			never = std::min(never, LimitedRun(n, wide));
+			held = std::min(held, LimitedRun(n, narrow));
+		}
+		std::printf("%8d  %12.1f  %16.1f  %20.1f\n", workers, none * 1e9 / n, never * 1e9 / n, held * 1e9 / n);
+	}
+
+	{
+		const int workers = std::max(1, cores - 1);
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		std::printf("\na frame (256 x 5 us ParallelFor) beside 1 ms Low background tasks, %d workers, us\n", workers);
+		std::printf("%-34s  %8s  %8s  %15s  %12s\n", "background", "median", "p99", "isolated median", "isolated p99");
+		auto row = [&](const char* name, int tasks, loom::LimiterHandle limiter) {
+			const auto plain = FramesBeside(tasks, limiter, false), isolated = FramesBeside(tasks, limiter, true);
+			std::printf("%-34s  %8.0f  %8.0f  %15.0f  %12.0f\n", name, plain.first, plain.second, isolated.first, isolated.second);
+		};
+		row("none", 0, loom::kInvalidLimiter);
+		row("one task per worker, no limiter", workers, loom::kInvalidLimiter);
+		loom::ScopedLimiter four(4);
+		row("one task per worker, limited to 4", workers, four);
 	}
 	return 0;
 }
