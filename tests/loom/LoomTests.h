@@ -1967,6 +1967,231 @@ TEST_CASE("loom: graphs — cycles are found, and callables live as long as the 
 	CHECK(Tracked::live.load() == 0);
 }
 
+namespace {
+	// How many tasks of a limiter run at once, and the most seen.
+	struct Concurrency
+	{
+		std::atomic<int> now{ 0 }, most{ 0 }, ran{ 0 };
+		void Enter()
+		{
+			const int n = ++now;
+			int seen = most.load();
+			while (n > seen && !most.compare_exchange_weak(seen, n)) {}
+		}
+		void Leave() { now--; ran++; }
+	};
+
+	void SpinFor(std::chrono::microseconds d)
+	{
+		const auto until = std::chrono::steady_clock::now() + d;
+		while (std::chrono::steady_clock::now() < until) {}
+	}
+}
+
+TEST_CASE("loom: limiters — never more than the limit at once, every task once, any pool")
+{
+	for (int workers : { 0, 1, -1 })
+	{
+		for (uint32_t limit : { 1u, 3u })
+		{
+			loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+			loom::ScopedLimiter limiter(limit);
+			Concurrency c;
+			constexpr int kTasks = 300;
+			std::vector<std::atomic<int>> runs(kTasks);
+			struct Job { Concurrency* c; std::atomic<int>* runs; };
+			std::vector<Job> jobs(kTasks);
+			auto body = [](void* p) {
+				Job& j = *static_cast<Job*>(p);
+				j.c->Enter();
+				SpinFor(std::chrono::microseconds(30));
+				j.runs->fetch_add(1);
+				j.c->Leave();
+			};
+			loom::ScopedCounter done(kTasks);
+			// A third one by one, a third as one batch, a third through Submit(F).
+			std::vector<loom::TaskDesc> batch;
+			for (int i = 0; i < kTasks; i++)
+			{
+				jobs[(size_t)i] = Job{ &c, &runs[(size_t)i] };
+				const loom::TaskDesc d{ .fn = body, .userData = &jobs[(size_t)i], .signals = done, .limiter = limiter };
+				if (i % 3 == 0)
+					loom::Submit(d);
+				else if (i % 3 == 1)
+					batch.push_back(d);
+				else
+					loom::Submit([&job = jobs[(size_t)i], body] { body(&job); }, loom::TaskDesc{ .signals = done, .limiter = limiter });
+			}
+			loom::Submit(std::span<const loom::TaskDesc>(batch));
+			loom::WaitFor(done);
+			for (auto& r : runs)
+				CHECK(r.load() == 1);
+			CHECK(c.ran.load() == kTasks);
+			CHECK(c.most.load() <= (int)limit);
+			if (workers < 0 && limit > 1)
+				CHECK_MESSAGE(c.most.load() >= 2, "a limit above one still runs tasks side by side");
+			CHECK(loom::LimiterHeld(limiter) == 0);
+			CHECK(loom::LimiterWaiting(limiter) == 0);
+		}
+	}
+}
+
+TEST_CASE("loom: limiters — a limit of one is a serial queue, High first, then in order")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 4 });
+	loom::ScopedLimiter serial(1);
+	std::atomic<bool> release{ false }, blocking{ false };
+	loom::ScopedCounter done(1);
+	loom::Submit([&] {
+		blocking = true;
+		while (!release)
+			std::this_thread::yield();
+	}, loom::TaskDesc{ .signals = done, .limiter = serial });
+	while (!blocking)
+		std::this_thread::yield();
+
+	// Serial: no lock needed, each task finishes before the next is queued.
+	std::vector<int> order;
+	constexpr int kTasks = 50;
+	loom::ScopedCounter queued(kTasks + 1);
+	for (int i = 0; i < kTasks; i++)
+		loom::Submit([&order, i] { order.push_back(i); }, loom::TaskDesc{ .signals = queued, .limiter = serial });
+	loom::Submit([&order] { order.push_back(-1); }, loom::TaskDesc{ .signals = queued, .priority = loom::Priority::High, .limiter = serial });
+	CHECK(loom::LimiterHeld(serial) == 1);
+	CHECK(loom::LimiterWaiting(serial) == kTasks + 1);
+	release = true;
+	loom::WaitFor(queued);
+	loom::WaitFor(done);
+	REQUIRE(order.size() == kTasks + 1);
+	CHECK(order[0] == -1);
+	for (int i = 0; i < kTasks; i++)
+		CHECK(order[(size_t)i + 1] == i);
+}
+
+TEST_CASE("loom: limiters — a task takes its unit only once its counters reach zero")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::ScopedLimiter limiter(1);
+	loom::ScopedCounter gate(1), other(1), gatedDone(1), freeDone(1);
+	std::atomic<int> gatedRan{ 0 };
+	const loom::CounterHandle all[] = { other };
+	loom::Submit([&] { gatedRan++; }, loom::TaskDesc{ .signals = gatedDone, .waitsFor = gate, .waitsForAll = all, .limiter = limiter });
+	CHECK(loom::LimiterHeld(limiter) == 0);
+	// The gated task holds no unit, so this one runs.
+	loom::Submit([] {}, loom::TaskDesc{ .signals = freeDone, .limiter = limiter });
+	CHECK(loom::TryWaitFor(freeDone, 5000));
+	CHECK(gatedRan.load() == 0);
+	loom::Signal(gate);
+	loom::Signal(other);
+	loom::WaitFor(gatedDone);
+	CHECK(gatedRan.load() == 1);
+	CHECK(loom::LimiterHeld(limiter) == 0);
+}
+
+TEST_CASE("loom: limiters — many submitters at once; tasks of every affinity and graph nodes")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 4 });
+	const loom::DedicatedId io = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "limit-io" });
+	loom::ScopedLimiter limiter(2);
+	Concurrency c;
+
+	// Tiny tasks submitted from eight tasks at once: units are taken and
+	// handed over from every thread together.
+	constexpr int kSpawners = 8, kEach = 400;
+	loom::ScopedCounter done(kSpawners * kEach);
+	loom::ScopedCounter spawned(kSpawners);
+	for (int s = 0; s < kSpawners; s++)
+		loom::Submit([&] {
+			for (int i = 0; i < kEach; i++)
+			{
+				const loom::Affinity affinity = i % 50 == 0 ? loom::Affinity::MainThread : loom::Affinity::AnyWorker;
+				if (i % 50 == 25)
+					loom::Submit([&c] { c.Enter(); c.Leave(); }, loom::TaskDesc{ .affinity = loom::Affinity::Dedicated, .thread = io, .signals = done, .limiter = limiter });
+				else
+					loom::Submit([&c] { c.Enter(); c.Leave(); }, loom::TaskDesc{ .affinity = affinity, .signals = done, .limiter = limiter });
+			}
+		}, loom::TaskDesc{ .signals = spawned });
+	loom::WaitFor(spawned);
+	loom::WaitFor(done);
+	CHECK(c.ran.load() == kSpawners * kEach);
+	CHECK(c.most.load() <= 2);
+	CHECK(loom::LimiterHeld(limiter) == 0);
+
+	// Graph nodes: a wide layer under the limit, and nodes without one.
+	Concurrency g;
+	std::atomic<int> unlimited{ 0 };
+	loom::TaskGraph graph;
+	const auto root = graph.Add([] {});
+	for (int i = 0; i < 64; i++)
+	{
+		const auto n = graph.Add([&g] { g.Enter(); SpinFor(std::chrono::microseconds(10)); g.Leave(); }, loom::TaskDesc{ .limiter = limiter });
+		graph.Precede(root, n);
+		graph.Precede(root, graph.Add([&unlimited] { unlimited++; }));
+	}
+	for (int run = 0; run < 10; run++)
+		loom::Run(graph);
+	CHECK(g.ran.load() == 640);
+	CHECK(unlimited.load() == 640);
+	CHECK(g.most.load() <= 2);
+	CHECK(loom::LimiterHeld(limiter) == 0);
+	loom::UnregisterDedicatedThread(io);
+}
+
+TEST_CASE("loom: limiters — a cancelled or throwing task gives its unit back")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::ScopedLimiter limiter(1);
+	std::atomic<bool> started{ false }, release{ false };
+	std::atomic<int> after{ 0 };
+	loom::ScopedCounter done(11);
+	loom::Submit([&] {
+		started = true;
+		while (!release)
+			std::this_thread::yield();
+	}, loom::TaskDesc{ .signals = done, .limiter = limiter });
+	for (int i = 0; i < 10; i++)
+		loom::Submit([&] { after++; }, loom::TaskDesc{ .signals = done, .limiter = limiter });
+	while (!started)
+		std::this_thread::yield();
+	loom::Cancel(done);
+	release = true;
+	loom::WaitFor(done);
+	CHECK(after.load() == 0);
+	CHECK(loom::LimiterHeld(limiter) == 0);
+	CHECK(loom::LimiterWaiting(limiter) == 0);
+
+#if defined(__cpp_exceptions)
+	loom::ScopedCounter failing(3);
+	loom::Submit([] { throw std::runtime_error("limited"); }, loom::TaskDesc{ .signals = failing, .limiter = limiter });
+	loom::Submit([] {}, loom::TaskDesc{ .signals = failing, .limiter = limiter });
+	loom::Submit([] {}, loom::TaskDesc{ .signals = failing, .limiter = limiter });
+	CHECK_THROWS_AS(loom::WaitFor(failing), std::runtime_error);
+	CHECK(loom::LimiterHeld(limiter) == 0);
+	// The unit is free for the next task.
+	loom::ScopedCounter next(1);
+	std::atomic<int> nextRan{ 0 };
+	loom::Submit([&] { nextRan++; }, loom::TaskDesc{ .signals = next, .limiter = limiter });
+	loom::WaitFor(next);
+	CHECK(nextRan.load() == 1);
+#endif
+}
+
+TEST_CASE("loom: limiters — handles are reused safely and the table size is configurable")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 1, .maxLimiters = 3 });
+	for (int round = 0; round < 100; round++)
+	{
+		loom::ScopedLimiter a(1), b(2), c(5);
+		CHECK(a.Get() != b.Get());
+		CHECK(b.Get() != c.Get());
+		CHECK(loom::LimiterHeld(c) == 0);
+		loom::ScopedCounter done(3);
+		for (loom::LimiterHandle h : { a.Get(), b.Get(), c.Get() })
+			loom::Submit([] {}, loom::TaskDesc{ .signals = done, .limiter = h });
+		loom::WaitFor(done);
+	}
+}
+
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
 	loom::Pool pool; // the suite owns its pool explicitly

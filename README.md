@@ -50,6 +50,9 @@ loom::ParallelFor(0, meshes.size(), 64, [&](size_t begin, size_t end) {
   cancellation through it.
 - **Priorities**: `Priority::High` work runs before Normal, and `Low` only
   when nothing else is queued.
+- **Limiters** (`CreateLimiter`): at most N tasks of a kind run at once, so
+  background work (asset decompression, uploads) cannot take every worker;
+  a limit of 1 is a serial queue.
 - **Isolation** (`Isolated`): a wait inside an isolated region helps only
   with that region's tasks, so a frame-critical wait never picks up an
   unrelated long task.

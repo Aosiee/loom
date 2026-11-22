@@ -70,6 +70,7 @@ struct alignas(64) TaskSlot
 	void*         userData = nullptr;                 // 8
 	Affinity      affinity = Affinity::AnyWorker;     // 16
 	uint8_t       window   = 0;                       // 17
+	uint16_t      limiter  = 0;                       // 18: its limiter's index + 1 (0 none)
 	DedicatedId   thread   = 0;                       // 20
 	CounterHandle signals  = kInvalidCounter;         // 24
 	Priority      priority = Priority::Normal;        // 28
@@ -386,6 +387,27 @@ struct alignas(64) CounterState
 	std::atomic<bool>     cancelled{ false }; // Cancel, or a task's exception
 };
 
+// ---- Limiters ------------------------------------------------------------------
+// `count` is the free units less the tasks that wait for one. A task takes a
+// unit with one decrement while it is positive; at zero or below it waits,
+// queueing itself under the lock. A finishing task gives its unit back with
+// one increment, and only when that finds someone waiting (count was
+// negative) does it take the lock and hand the unit over: to the queue's
+// first task, or, when the waiter has decremented but not yet queued itself,
+// as a handoff that the waiter takes instead of queueing.
+
+struct alignas(64) LimiterState
+{
+	std::atomic<int>     count{ 0 };
+	std::mutex           mutex;
+	std::deque<uint32_t> waiting;      // slots, High first, under mutex
+	uint32_t             handoffs = 0; // units left for a waiter not yet queued, under mutex
+	uint32_t             limit = 0;
+	// Read lock-free by ResolveLimiter, as a counter's are.
+	alignas(64) std::atomic<bool> alive{ false };
+	std::atomic<uint32_t> generation{ 0 };
+};
+
 // ---- Dedicated threads --------------------------------------------------------
 
 struct DedicatedState
@@ -457,6 +479,13 @@ struct PoolState
 	std::unique_ptr<CounterState[]> counters;
 	uint32_t                counterCount = 0;
 	std::vector<uint32_t>   freeCounters;
+
+	// Limiters, the same way. The table never moves: a task's slot keeps its
+	// limiter's index.
+	std::mutex              limiterMutex;
+	std::unique_ptr<LimiterState[]> limiters;
+	uint32_t                limiterCount = 0;
+	std::vector<uint32_t>   freeLimiters;
 
 	// false from the first instruction of Shutdown (TryHelp, PumpMainThreadTasks
 	// and IsInitialised then report the pool as down while it drains).
@@ -645,6 +674,62 @@ static CounterState* ResolveCounter(PoolState& P, CounterHandle h)
 	CounterState& c = P.counters[idx];
 	if (!c.alive.load(std::memory_order_relaxed) || CounterGeneration(h) != c.generation.load(std::memory_order_relaxed)) return nullptr;
 	return &c;
+}
+
+// Handle -> state, or null, as ResolveCounter (limiter handles pack the same way).
+static LimiterState* ResolveLimiter(PoolState& P, LimiterHandle h)
+{
+	if (h == kInvalidLimiter) return nullptr;
+	const uint32_t idx = CounterIndex(h);
+	if (idx >= P.limiterCount) return nullptr;
+	LimiterState& l = P.limiters[idx];
+	if (!l.alive.load(std::memory_order_relaxed) || CounterGeneration(h) != l.generation.load(std::memory_order_relaxed)) return nullptr;
+	return &l;
+}
+
+// What a slot stores for a task's limiter: its index + 1, or 0 for none.
+static uint16_t LimiterTag(PoolState& P, LimiterHandle h)
+{
+	if (h == kInvalidLimiter)
+		return 0;
+	LimiterState* l = ResolveLimiter(P, h);
+	assert(l && "task uses an invalid/destroyed limiter");
+	return l ? uint16_t(l - P.limiters.get() + 1) : 0;
+}
+
+// True when the task got a unit; false when it now waits in the limiter.
+static bool AcquireUnit(LimiterState& l, uint32_t slot, Priority priority)
+{
+	if (l.count.fetch_sub(1, std::memory_order_acq_rel) > 0)
+		return true;
+	std::lock_guard<std::mutex> lock(l.mutex);
+	if (l.handoffs > 0)
+	{
+		l.handoffs--;
+		return true;
+	}
+	if (priority == Priority::High)
+		l.waiting.push_front(slot);
+	else
+		l.waiting.push_back(slot);
+	return false;
+}
+
+// Gives a unit back. Returns the waiting task it went to (which must now be
+// queued), or kNoSlot.
+static uint32_t ReleaseUnit(LimiterState& l)
+{
+	if (l.count.fetch_add(1, std::memory_order_acq_rel) >= 0)
+		return kNoSlot;
+	std::lock_guard<std::mutex> lock(l.mutex);
+	if (l.waiting.empty())
+	{
+		l.handoffs++;
+		return kNoSlot;
+	}
+	const uint32_t next = l.waiting.front();
+	l.waiting.pop_front();
+	return next;
 }
 
 // ---- Forward decls --------------------------------------------------------------
@@ -886,6 +971,14 @@ Pool::Pool(const LoomConfig& config)
 		P.freeCounters.reserve(P.counterCount);
 		for (uint32_t i = P.counterCount; i-- > 0;)
 			P.freeCounters.push_back(i); // index 0 is handed out first
+	}
+	{
+		std::lock_guard<std::mutex> lock(P.limiterMutex);
+		P.limiterCount = std::min(std::max(1u, config.maxLimiters), 0xFFFFu); // a slot keeps index + 1 in 16 bits
+		P.limiters = std::make_unique<LimiterState[]>(P.limiterCount);
+		P.freeLimiters.reserve(P.limiterCount);
+		for (uint32_t i = P.limiterCount; i-- > 0;)
+			P.freeLimiters.push_back(i);
 	}
 
 	P.onThreadStart = config.onThreadStart;
@@ -1344,6 +1437,17 @@ static bool EnqueueSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	return false;
 }
 
+// Makes a slot runnable once it holds a unit of its limiter, if it has one;
+// otherwise it waits in the limiter, whose next released unit queues it.
+// True when it went into the pool, as EnqueueSlot.
+static bool ReadySlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
+{
+	const TaskSlot& t = Slot(P, slot);
+	if (t.limiter != 0 && !AcquireUnit(P.limiters[t.limiter - 1], slot, t.priority))
+		return false;
+	return EnqueueSlot(P, slot, ctx);
+}
+
 // A parked task's count of unmet dependencies. It lives in groupNext, which
 // only a runnable task uses (a task with dependencies is never grouped).
 static std::atomic_ref<uint32_t> PendingDeps(PoolState& P, uint32_t slot)
@@ -1361,7 +1465,7 @@ static bool HasDependencies(const TaskDesc& desc)
 static bool DispatchSlot(PoolState& P, uint32_t slot, const TaskDesc& desc, WorkerCtx* ctx)
 {
 	if (!HasDependencies(desc))
-		return EnqueueSlot(P, slot, ctx);
+		return ReadySlot(P, slot, ctx);
 
 	// One hold of our own while registering, so the task cannot be released
 	// (by a counter reaching zero meanwhile) before every counter has it.
@@ -1389,7 +1493,7 @@ static bool DispatchSlot(PoolState& P, uint32_t slot, const TaskDesc& desc, Work
 	// Drop our hold. Whoever takes the count to zero (us, or the last
 	// counter's final signal) enqueues the task, exactly once.
 	if (deps.fetch_sub(1, std::memory_order_acq_rel) == 1)
-		return EnqueueSlot(P, slot, ctx); // every counter was already zero
+		return ReadySlot(P, slot, ctx); // every counter was already zero
 	return false;
 }
 
@@ -1410,6 +1514,7 @@ static uint32_t PrepareSlot(PoolState& P, const TaskDesc& desc, WorkerCtx* ctx)
 	t.isolation = t_Isolation; // a task belongs to the region it was submitted in
 	t.nameId = desc.nameId;
 	t.window = desc.window;
+	t.limiter = LimiterTag(P, desc.limiter);
 	LiveShard(P, ctx).fetch_add(1, std::memory_order_relaxed);
 	return slot;
 }
@@ -1461,7 +1566,8 @@ void Submit(std::span<const TaskDesc> descs)
 	};
 	for (const TaskDesc& d : descs)
 	{
-		if (groupSize > 1 && d.affinity == Affinity::AnyWorker && d.priority == Priority::Normal && !HasDependencies(d))
+		if (groupSize > 1 && d.affinity == Affinity::AnyWorker && d.priority == Priority::Normal && !HasDependencies(d)
+			&& d.limiter == kInvalidLimiter)
 		{
 			assert(d.fn && "task without a function");
 			const uint32_t slot = PrepareSlot(P, d, ctx);
@@ -1721,6 +1827,7 @@ struct GraphState
 		Priority    priority = Priority::Normal;
 		uint8_t     window = 0;
 		uint32_t    nameId = 0;
+		LimiterHandle limiter = kInvalidLimiter;
 	};
 	// A node's task userData: which graph, which node.
 	struct NodeRef
@@ -1889,7 +1996,8 @@ static size_t QueueGraphSet(PoolState& P, GraphState& g, uint32_t set, WorkerCtx
 		t.isolation = isolation;
 		t.nameId = n.nameId;
 		t.window = n.window;
-		if (groupSize > 1 && n.affinity == Affinity::AnyWorker && n.priority == Priority::Normal)
+		t.limiter = LimiterTag(P, n.limiter);
+		if (groupSize > 1 && n.affinity == Affinity::AnyWorker && n.priority == Priority::Normal && t.limiter == 0)
 		{
 			if (length == 0)
 				head = slot;
@@ -1900,7 +2008,7 @@ static size_t QueueGraphSet(PoolState& P, GraphState& g, uint32_t set, WorkerCtx
 				pushGroup();
 		}
 		else
-			entries += EnqueueSlot(P, slot, ctx) ? 1 : 0;
+			entries += ReadySlot(P, slot, ctx) ? 1 : 0;
 	}
 	pushGroup();
 	return entries;
@@ -2010,7 +2118,7 @@ TaskGraph::Node TaskGraph::AddOwned(void* object, void (*run)(void*), void (*des
 		&& "a graph node's counters come from the graph");
 	assert((opts.affinity != Affinity::Dedicated) || opts.thread != kInvalidDedicated);
 	g.nodes.push_back(GraphState::NodeDesc{ .fn = run, .userData = object, .destroy = destroy, .affinity = opts.affinity,
-		.thread = opts.thread, .priority = opts.priority, .window = opts.window, .nameId = opts.nameId });
+		.thread = opts.thread, .priority = opts.priority, .window = opts.window, .nameId = opts.nameId, .limiter = opts.limiter });
 	g.compiled = false;
 	return Node(g.nodes.size() - 1);
 }
@@ -2214,7 +2322,7 @@ static void SignalCounter(PoolState& P, CounterHandle h, int n)
 		// A task parked on several counters runs when the last one releases it.
 		for (uint32_t slot : c->pending)
 			if (PendingDeps(P, slot).fetch_sub(1, std::memory_order_acq_rel) == 1)
-				pooled += EnqueueSlot(P, slot, ctx) ? 1 : 0;
+				pooled += ReadySlot(P, slot, ctx) ? 1 : 0;
 		c->pending.clear();
 		c->count.store(0, std::memory_order_release);
 		for (Waiter* w : c->waiters)
@@ -2261,6 +2369,71 @@ bool IsCancelled(CounterHandle h)
 	const CounterState* c = ResolveCounter(ActivePool(), h);
 	assert(c && "querying an invalid/destroyed counter");
 	return c && c->cancelled.load(std::memory_order_acquire);
+}
+
+// ---- Limiters ------------------------------------------------------------------
+
+LimiterHandle CreateLimiter(uint32_t limit)
+{
+	PoolState& P = ActivePool();
+	assert(limit >= 1 && limit < (uint32_t)INT_MAX && "limiter limit out of range");
+	std::lock_guard<std::mutex> lock(P.limiterMutex);
+	if (P.freeLimiters.empty())
+	{
+		assert(false && "limiter pool exhausted (LoomConfig::maxLimiters)");
+		return kInvalidLimiter;
+	}
+	const uint32_t i = P.freeLimiters.back();
+	P.freeLimiters.pop_back();
+	LimiterState& l = P.limiters[i];
+	l.limit = std::max(1u, limit);
+	l.count.store((int)l.limit, std::memory_order_relaxed);
+	l.alive.store(true, std::memory_order_release);
+	return PackCounter(i, l.generation.load(std::memory_order_relaxed));
+}
+
+void DestroyLimiter(LimiterHandle h)
+{
+	PoolState& P = ActivePool();
+	LimiterState* l = ResolveLimiter(P, h);
+	assert(l && "destroying an invalid/destroyed limiter");
+	if (!l)
+		return;
+	{
+		std::lock_guard<std::mutex> lock(l->mutex);
+		assert(l->count.load(std::memory_order_relaxed) == (int)l->limit && l->waiting.empty() && l->handoffs == 0
+			&& "destroying a limiter whose tasks are live");
+	}
+	std::lock_guard<std::mutex> lock(P.limiterMutex);
+	if (!l->alive.load(std::memory_order_relaxed) || l->generation.load(std::memory_order_relaxed) != CounterGeneration(h))
+	{
+		assert(false && "limiter destroyed twice");
+		return;
+	}
+	l->alive.store(false, std::memory_order_relaxed);
+	const uint32_t next = (l->generation.load(std::memory_order_relaxed) + 1) & 0xFFF;
+	l->generation.store(next == 0 ? 1 : next, std::memory_order_relaxed);
+	P.freeLimiters.push_back(CounterIndex(h));
+}
+
+uint32_t LimiterHeld(LimiterHandle h)
+{
+	LimiterState* l = ResolveLimiter(ActivePool(), h);
+	assert(l && "invalid/destroyed limiter");
+	if (!l)
+		return 0;
+	const int count = l->count.load(std::memory_order_acquire);
+	return count >= 0 ? l->limit - (uint32_t)count : l->limit;
+}
+
+uint32_t LimiterWaiting(LimiterHandle h)
+{
+	LimiterState* l = ResolveLimiter(ActivePool(), h);
+	assert(l && "invalid/destroyed limiter");
+	if (!l)
+		return 0;
+	const int count = l->count.load(std::memory_order_acquire);
+	return count < 0 ? (uint32_t)-count : 0;
 }
 
 int Load(CounterHandle h)
@@ -2628,6 +2801,7 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	const CounterHandle signals = t.signals;
 	const uint32_t nameId = t.nameId;
 	const uint8_t window = t.window;
+	const uint16_t limiter = t.limiter;
 	TaskFn destroy = nullptr;
 	if (t.owned)
 		std::memcpy(&destroy, t.inlineData + kOwnedDestroyOffset, sizeof destroy);
@@ -2658,6 +2832,14 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	if (destroy)
 		destroy(userData);
 	MarkProfilerZone(P, threadIndex, nameId, window, "Task", false, zone);
+	// The unit goes back (or on to the next waiting task) before the signal:
+	// once a WaitFor on the task's counter returns, it holds none.
+	if (limiter != 0)
+	{
+		const uint32_t next = ReleaseUnit(P.limiters[limiter - 1]);
+		if (next != kNoSlot && EnqueueSlot(P, next, ctx))
+			WakeForWork(P, 1);
+	}
 
 	// Live count and slot are given back before the signal: once a WaitFor on
 	// this counter returns, the task no longer counts as live.

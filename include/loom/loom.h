@@ -42,9 +42,11 @@ namespace loom {
 using TaskFn = void (*)(void* userData);
 using DedicatedId = uint32_t;
 using CounterHandle = uint32_t;
+using LimiterHandle = uint32_t;
 
 inline constexpr DedicatedId kInvalidDedicated = ~0u;
 inline constexpr CounterHandle kInvalidCounter = ~0u;
+inline constexpr LimiterHandle kInvalidLimiter = ~0u;
 
 enum class Affinity : uint8_t
 {
@@ -87,6 +89,8 @@ struct TaskDesc
 	// array need not outlive it); a counter may be listed more than once.
 	std::span<const CounterHandle> waitsForAll = {};
 	Priority      priority = Priority::Normal;
+	// Caps how many tasks of this limiter run at once (see CreateLimiter).
+	LimiterHandle limiter  = kInvalidLimiter;
 };
 
 struct LoomConfig
@@ -94,6 +98,7 @@ struct LoomConfig
 	int      workerCount = -1;   // default max(1, hw_concurrency - 1)
 	uint32_t maxTasks    = 4096; // task-slot pool size, rounded up to 4096s (grows with a warning)
 	uint32_t maxCounters = 2048;
+	uint32_t maxLimiters = 64;
 	// Runs first on every worker and dedicated thread (the engine's crash
 	// handler gives each its alternate signal stack here). Optional.
 	void (*onThreadStart)() = nullptr;
@@ -238,6 +243,50 @@ private:
 	CounterHandle m_Handle = kInvalidCounter;
 };
 
+// ---- Concurrency limits -------------------------------------------------------
+// A limiter caps how many of its tasks are in flight at once, so a kind of
+// work cannot take every worker: asset decompression on at most 4 threads
+// while the frame keeps the rest, or uploads that each need one of N staging
+// buffers. A task with TaskDesc::limiter takes one of the limiter's units when
+// it becomes runnable (at Submit, or once its counters reach zero) and gives
+// it back when it finishes. While none is free it waits in the limiter, not
+// in a queue, and the task that finishes hands its unit to the next one:
+// High tasks first, otherwise in the order they became runnable. A limit of 1
+// makes a serial queue.
+//
+// A unit is held from queuing to the end of the run, so at most `limit` of
+// the tasks are queued or running, never more running. Low priority decides
+// when background work may start; a limiter decides how many workers it may
+// hold once it has. Tasks without a limiter pay one untaken branch.
+//
+// A limited task must not wait for another task of its own limiter: with
+// every unit held, that task never becomes runnable. Limited tasks may be of
+// any affinity, may be TaskGraph nodes, and are skipped by Cancel as usual
+// (a skipped or throwing task gives its unit back too).
+LimiterHandle CreateLimiter(uint32_t limit); // limit >= 1; LoomConfig::maxLimiters at once
+void          DestroyLimiter(LimiterHandle); // asserts none of its tasks is live
+// The units held right now (tasks queued or running), and the tasks waiting
+// for one. Snapshots for tests and debug views.
+uint32_t      LimiterHeld(LimiterHandle);
+uint32_t      LimiterWaiting(LimiterHandle);
+
+// RAII wrapper over a limiter handle: destroys on scope exit; non-copyable.
+class ScopedLimiter
+{
+public:
+	ScopedLimiter() = default;
+	explicit ScopedLimiter(uint32_t limit) : m_Handle(CreateLimiter(limit)) {}
+	~ScopedLimiter() { if (m_Handle != kInvalidLimiter) DestroyLimiter(m_Handle); }
+	ScopedLimiter(const ScopedLimiter&) = delete;
+	ScopedLimiter& operator=(const ScopedLimiter&) = delete;
+
+	LimiterHandle Get() const { return m_Handle; }
+	operator LimiterHandle() const { return m_Handle; }
+
+private:
+	LimiterHandle m_Handle = kInvalidLimiter;
+};
+
 // ---- Isolation ---------------------------------------------------------------
 // Runs fn() as an isolated region. The tasks submitted inside it, and the
 // tasks those submit, belong to the region; a WaitFor inside it helps only
@@ -359,8 +408,8 @@ T ParallelReduce(size_t begin, size_t end, size_t chunkSize, T identity, Map&& m
 // the nodes not yet started are skipped and the run still completes. (With
 // no `signals`, a node that throws ends the program, as a task does.)
 //
-// A node takes the fn, userData, affinity, thread, priority, nameId and
-// window of its TaskDesc; its counters come from the graph, so `signals` and
+// A node takes the fn, userData, affinity, thread, priority, limiter, nameId
+// and window of its TaskDesc; its counters come from the graph, so `signals` and
 // the waits must be unset. One run at a time per graph (a frame that overlaps
 // the next one uses two graphs), and the graph must not change or be
 // destroyed while it runs.

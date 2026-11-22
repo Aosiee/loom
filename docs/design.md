@@ -177,6 +177,31 @@ a search skip those queues while they are empty, so Normal work, the
 default, pays nothing for priorities. The main-thread and dedicated queues
 put a High task at the front. Groups are always Normal.
 
+### Limiters
+
+A limiter is a count of free units, a lock and a queue of waiting tasks. A
+task with a limiter takes a unit at the point it becomes runnable: in
+`Submit` when it has no counters to wait for, or when the last of them
+reaches zero; a task parked on a counter holds none. Taking is one
+decrement of the count while it is positive. At zero or below the task waits:
+under the lock it puts itself in the queue (a High task at the front), and
+the slot stays out of every run queue, so no worker pops it only to put it
+back. A finishing task gives its unit back with one increment, before it
+signals its counter, so a `WaitFor` that returns has every unit back. Only
+when the count was negative (someone waits) does it take the lock and hand
+the unit over: it queues the first waiting task itself, onto its own deque.
+A waiter that has decremented but not yet queued itself is covered by a
+*handoff*: the finisher, finding the queue empty, leaves the unit on the
+limiter, and the waiter takes it under the lock instead of queueing.
+
+The unit is held from queuing to the end of the run, so the limit counts
+queued tasks as well as running ones. That is what keeps the waiting tasks
+out of the deques, and it bounds what the work can occupy just as well: a
+held unit whose task sits in a queue is a worker the work is not using.
+Limited tasks are never grouped (each takes its own unit); a task's limiter
+is a 16-bit index in a free byte pair of the slot's first line, so a task
+without one pays a load it already makes and an untaken branch.
+
 ## Sleeping and waking
 
 Every sleep in loom goes through one `Waiter` per thread, a 32-bit word the

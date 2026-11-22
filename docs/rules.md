@@ -76,3 +76,12 @@ the first run has finished asserts, as does adding a node or an edge, or
 destroying the graph, while it runs. Wait for the run's counter first. A
 frame that overlaps the next one (simulation of frame N+1 while frame N
 renders) uses two graphs.
+
+## A limited task must not wait for its own limiter's work
+
+A task holds its limiter's unit while it runs, so a task that waits for
+another task of the same limiter can wait forever: with every unit held,
+that other task never becomes runnable, and helping cannot run it (it waits
+in the limiter, not in a queue). Split the work into tasks that hand on
+through counters (`waitsFor`) instead of one that waits in the middle. A
+limited task may wait for anything else.
