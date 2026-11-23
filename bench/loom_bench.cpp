@@ -23,6 +23,8 @@
 // their results into an array behind one counter.
 // Then continuations: chains of dependent steps written with Then, against
 // the same chains with one counter per step and waitsFor.
+// Then ParallelSort and ParallelInclusiveScan against std::sort and
+// std::inclusive_scan, and what a pipeline costs per item.
 // Usage: loom_bench [tasks] [repeats]
 
 #include "loom/loom.h"
@@ -33,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <numeric>
 #include <random>
 #include <span>
 #include <thread>
@@ -470,6 +473,70 @@ namespace {
 		return seconds;
 	}
 
+	std::vector<uint32_t> RandomKeys(size_t n)
+	{
+		std::vector<uint32_t> v(n);
+		uint32_t x = 2463534242u;
+		for (uint32_t& k : v)
+		{
+			x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+			k = x;
+		}
+		return v;
+	}
+
+	template <typename F>
+	double Best(int repeats, F&& run)
+	{
+		double best = 1e9;
+		for (int r = 0; r < repeats; r++)
+			best = std::min(best, run());
+		return best;
+	}
+
+	double SortRun(const std::vector<uint32_t>& keys, bool parallel)
+	{
+		std::vector<uint32_t> v = keys;
+		const auto start = Clock::now();
+		if (parallel)
+			loom::ParallelSort(v.begin(), v.end());
+		else
+			std::sort(v.begin(), v.end());
+		const double seconds = Seconds(start, Clock::now());
+		KeepAlive(v[v.size() / 2]);
+		return seconds;
+	}
+
+	double ScanRun(const std::vector<uint64_t>& in, std::vector<uint64_t>& out, bool parallel)
+	{
+		const auto start = Clock::now();
+		if (parallel)
+			loom::ParallelInclusiveScan(in.begin(), in.end(), out.begin(), uint64_t(0));
+		else
+			std::inclusive_scan(in.begin(), in.end(), out.begin(), std::plus<>{}, uint64_t(0));
+		const double seconds = Seconds(start, Clock::now());
+		KeepAlive(out.back());
+		return seconds;
+	}
+
+	// A three-stage pipeline (source, parallel, serial) whose stages do
+	// `work` iterations of Work each; ns per item.
+	double PipelineRun(int items, uint32_t inFlight, int work)
+	{
+		struct Item { uint64_t v = 0; };
+		int produced = 0;
+		uint64_t sum = 0;
+		loom::Pipeline<Item> p(inFlight);
+		p.Source([&](Item& it) { it.v = (uint64_t)produced; return produced++ < items; })
+		 .Parallel([work](Item& it) { for (int k = 0; k < work; k++) Work((void*)(uintptr_t)(it.v + k)); })
+		 .Serial([&](Item& it) { sum += it.v; });
+		const auto start = Clock::now();
+		p.Run();
+		const double seconds = Seconds(start, Clock::now());
+		KeepAlive(sum);
+		return seconds * 1e9 / items;
+	}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -578,6 +645,42 @@ int main(int argc, char** argv)
 		}
 		const double perStep = 1e9 / (chains * steps);
 		std::printf("%8d  %10.1f  %22.1f  %6.2f\n", workers, then * perStep, counters * perStep, then / counters);
+	}
+
+	// Scans are bound by memory bandwidth once the data leaves the cache: an
+	// 8 MB array that stays in it, and a 128 MB one that does not.
+	const std::vector<uint32_t> keys = RandomKeys(4000000);
+	std::vector<uint64_t> smallIn(1 << 20), smallOut(smallIn.size()), bigIn(16 << 20), bigOut(bigIn.size());
+	for (size_t i = 0; i < bigIn.size(); i++)
+		bigIn[i] = i * 2654435761u % 1000;
+	std::copy(bigIn.begin(), bigIn.begin() + (std::ptrdiff_t)smallIn.size(), smallIn.begin());
+	std::printf("\nsort: %zu random 32-bit keys; inclusive scan of 64-bit sums, 8 MB and 128 MB; ms, best of %d\n", keys.size(), repeats);
+	std::printf("%8s  %10s  %13s  %8s  %13s  %13s  %8s  %13s  %13s  %8s\n", "workers", "std::sort", "ParallelSort", "speedup",
+		"std 8 MB", "loom 8 MB", "speedup", "std 128 MB", "loom 128 MB", "speedup");
+	const double serialSort = Best(repeats, [&] { return SortRun(keys, false); });
+	const double serialSmall = Best(repeats * 4, [&] { return ScanRun(smallIn, smallOut, false); });
+	const double serialBig = Best(repeats, [&] { return ScanRun(bigIn, bigOut, false); });
+	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		const double sort = Best(repeats, [&] { return SortRun(keys, true); });
+		const double small = Best(repeats * 4, [&] { return ScanRun(smallIn, smallOut, true); });
+		const double big = Best(repeats, [&] { return ScanRun(bigIn, bigOut, true); });
+		std::printf("%8d  %10.1f  %13.1f  %7.1fx  %13.2f  %13.2f  %7.1fx  %13.1f  %13.1f  %7.1fx\n", workers, serialSort * 1e3, sort * 1e3,
+			serialSort / sort, serialSmall * 1e3, small * 1e3, serialSmall / small, serialBig * 1e3, big * 1e3, serialBig / big);
+	}
+
+	std::printf("\npipeline: source, parallel and serial stage, 20000 items; ns per item, best of %d\n", repeats);
+	std::printf("%8s  %10s  %16s  %18s\n", "workers", "in flight", "empty stages", "100-Work middle");
+	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		for (uint32_t inFlight : { 4u, 64u })
+		{
+			const double empty = Best(repeats, [&] { return PipelineRun(20000, inFlight, 0); });
+			const double busy = Best(repeats, [&] { return PipelineRun(20000, inFlight, 100); });
+			std::printf("%8d  %10u  %16.1f  %18.1f\n", workers, inFlight, empty, busy);
+		}
 	}
 	return 0;
 }
