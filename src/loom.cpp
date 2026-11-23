@@ -363,10 +363,11 @@ private:
 
 // ---- Counters ------------------------------------------------------------------
 // `count` holds the user's count PLUS ONE while it is nonzero: the decrement
-// that takes the user's count to zero leaves 1 behind, releases the parked
-// tasks and wakes the waiters under the lock, and only then stores 0. So
-// nobody sees zero (and destroys or reuses the counter) before that final
-// signaller is done with it. 0 means "zero and settled".
+// that takes the user's count to zero leaves 1 behind, then, under the lock,
+// stores 0, releases the parked tasks and wakes the waiters. A task released
+// that way, or a waiter, may see zero before the final signaller has let go
+// of the lock, so DestroyCounter takes the lock first: the counter outlives
+// that signaller. 0 means "zero and settled".
 
 struct alignas(64) CounterState
 {
@@ -2024,8 +2025,8 @@ static void GraphFinishTask(void* p)
 {
 	GraphState& g = *static_cast<GraphState*>(p);
 	const CounterHandle signals = g.signals, nodesLeft = g.nodesLeft;
-	// Released by the final signal, which may still be settling the count.
-	WaitFor(nodesLeft, Help::BlockOnly);
+	// Released by the final signal, which settled the count first; the
+	// destroy waits for that signaller to let go of the counter.
 	DestroyCounter(nodesLeft);
 	// The graph's last touch: from here it may be run again or destroyed.
 	g.running.store(false, std::memory_order_release);
@@ -2319,17 +2320,20 @@ static void SignalCounter(PoolState& P, CounterHandle h, int n)
 	if (before - n != 1)
 		return;
 
-	// The final signal: release the parked tasks and the waiters, then settle.
+	// The final signal: settle, then release the parked tasks and the waiters.
+	// Settling first means a released task, which may run on another thread
+	// before this lock is dropped, already reads the count as zero. Anyone
+	// who sees zero and destroys the counter waits for this lock.
 	WorkerCtx* ctx = CurrentCtx(P);
 	size_t pooled = 0;
 	{
 		std::lock_guard<std::mutex> lock(c->mutex);
+		c->count.store(0, std::memory_order_release);
 		// A task parked on several counters runs when the last one releases it.
 		for (uint32_t slot : c->pending)
 			if (PendingDeps(P, slot).fetch_sub(1, std::memory_order_acq_rel) == 1)
 				pooled += ReadySlot(P, slot, ctx) ? 1 : 0;
 		c->pending.clear();
-		c->count.store(0, std::memory_order_release);
 		for (Waiter* w : c->waiters)
 			Wake(*w, kWokeRecheck);
 		c->waiters.clear();

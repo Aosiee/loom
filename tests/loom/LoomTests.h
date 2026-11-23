@@ -2196,6 +2196,28 @@ namespace {
 	int LiveCounters() { return loom::SnapshotThreadStats().counterCount; }
 }
 
+TEST_CASE("loom: counters — a task released by a counter already sees it at zero")
+{
+	// The final signal releases many parked tasks one by one; the first ones
+	// can start on other workers while it is still releasing the rest.
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 4 });
+	std::atomic<int> notZero{ 0 };
+	for (int round = 0; round < 200; round++)
+	{
+		loom::ScopedCounter gate(1);
+		constexpr int kParked = 64;
+		loom::ScopedCounter done(kParked);
+		for (int i = 0; i < kParked; i++)
+			loom::Submit([&notZero, g = gate.Get()] {
+				if (loom::Load(g) != 0)
+					notZero++;
+			}, loom::TaskDesc{ .signals = done, .waitsFor = gate });
+		loom::Signal(gate);
+		loom::WaitFor(done);
+	}
+	CHECK(notZero.load() == 0);
+}
+
 TEST_CASE("loom: futures — values, void, move-only results and repeated Get, any pool")
 {
 	for (int workers : { 0, 1, -1 })

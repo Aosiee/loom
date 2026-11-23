@@ -47,11 +47,15 @@ nobody waits on it, then bumps the generation, so a stale handle never reaches
 a re-used entry.
 
 `Signal` is one atomic decrement. Only the decrement that reaches zero takes
-the counter's lock: it releases the tasks parked on the counter (`waitsFor`),
-wakes its waiters, and only then publishes zero. The stored value is the
-count plus one while it is nonzero, so the final signaller leaves 1 behind
-until it is done; nobody can observe zero, and destroy or re-use the counter,
-while that signaller still touches it (`Load` reports the settling 1 as 1).
+the counter's lock: it publishes zero, then releases the tasks parked on the
+counter (`waitsFor`) and wakes its waiters. Zero comes first so that a
+released task, which may start on another thread at once, sees the counter
+it waited for as zero (a future it waited for is `Ready`, and `Get` returns
+without waiting). The stored value is the count plus one while it is
+nonzero, so between the decrement and the lock the final signaller leaves 1
+behind (`Load` reports it as 1). Someone who sees zero can destroy the
+counter while that signaller still holds the lock: `DestroyCounter` takes
+the lock first, so it waits for the signaller to finish.
 
 ### Deferred task signals
 
