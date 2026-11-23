@@ -68,6 +68,10 @@ loom::ParallelFor(0, meshes.size(), 64, [&](size_t begin, size_t end) {
 - **Introspection**: `SnapshotThreadStats()` for a thread-pool view, and
   profiler hooks (`loom_profiler_shim.h`) for wait/help states and per-task
   zones.
+- **Debug dump** (`DebugDump`, `CaptureDebugState`): when a wait does not
+  return, what each thread is running and waiting on, every live counter
+  with the tasks parked on it and who sleeps on it, and every limiter's
+  waiting tasks, with hints for the common mistakes.
 
 The rules that keep this safe (no helping while holding a lock, no blocking
 IO on workers, no ambient thread-local assumptions) are in

@@ -335,6 +335,32 @@ participants are woken to reach their own park points. Queued work stays
 queued. `UnparkAll` releases them all. A host uses this to change code or
 data no thread may be running, such as a live code patch.
 
+## Debug dump
+
+Each pool thread, and the main thread, keeps a small record of what it is
+doing on a cache line of its own: the innermost task it runs (name id,
+counter, limiter unit), how many tasks it is inside, and the innermost wait
+with the time it began. Only that thread writes it, with relaxed stores; a
+task run while helping saves the outer values and puts them back. That is a
+few stores per task and one clock read per wait. A thread outside the pool
+has no record, but each sleeper notes its thread index in its `Waiter`, so
+it still shows up asleep on the counter it waits for.
+
+`CaptureDebugState` reads those records, then walks the counter and limiter
+tables under their table locks, and each live entry under its own lock: the
+tasks parked on a counter or waiting for a limiter are listed in a lock
+they cannot leave without, so their slots are stable while it reads them.
+Every lock is taken with a try-lock that gives up after about two
+milliseconds and marks that part busy, so a capture never hangs on a thread
+stuck holding a lock. Nothing is frozen while it reads; it is a picture
+taken piece by piece.
+
+`FormatDebugState` prints the capture and adds hints for what it can
+recognise: something waits but nothing runs or is queued (a missing
+`Signal` or `Submit`), main-thread tasks queued while the main thread
+neither waits nor pumps, and a task holding a limiter's unit that waits
+while tasks of that limiter wait for a unit.
+
 ## Shutdown
 
 `Shutdown` drains first: with every thread still running, the calling

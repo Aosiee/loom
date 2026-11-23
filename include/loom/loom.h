@@ -913,6 +913,89 @@ struct PoolSnapshot
 
 PoolSnapshot SnapshotThreadStats();
 
+// ---- Debug dump ---------------------------------------------------------------
+// Why does a wait not return? CaptureDebugState records what every pool
+// thread (and the main thread) is running or waiting on, every live counter
+// with the tasks parked on it and the threads asleep on it, and every
+// limiter with the tasks waiting for a unit. DebugDump formats that as text.
+//
+// Call it from any thread while the pool lives: a watchdog thread, after a
+// TryWaitFor timed out, or from a debugger. It takes each lock briefly and,
+// rather than hang on a lock held by a stuck thread, marks what it could not
+// read as busy. Things keep moving while it reads, so it is a best-effort
+// picture, not one instant.
+//
+// Tasks are known by their TaskDesc::nameId; pass a TaskNameFn (the
+// profiler's name table) to print names instead of ids. The text shows a
+// counter as c<index>.<generation> and a limiter as l<index>.<generation>,
+// and threads by their CurrentThreadIndex in brackets.
+struct DebugTask
+{
+	uint32_t      nameId   = 0;
+	Priority      priority = Priority::Normal;
+	Affinity      affinity = Affinity::AnyWorker;
+	LimiterHandle limiter  = kInvalidLimiter;
+};
+
+struct DebugThread
+{
+	int         index = 0;
+	std::string name;
+	bool        isMain = false;
+	uint64_t    tasksRun = 0;   // compare two captures to see whether it moves
+	int         queueDepth = 0; // a dedicated thread's own queue
+	// The tasks this thread is inside: more than one when a wait inside a
+	// task ran another while helping. The innermost one's name and counter.
+	int           running = 0;
+	uint32_t      runningName = 0;
+	CounterHandle runningSignals = kInvalidCounter;
+	LimiterHandle runningLimiter = kInvalidLimiter; // the unit the innermost task holds
+	// The innermost WaitFor or TryWaitFor this thread is in, and for how long.
+	CounterHandle waitingOn = kInvalidCounter;
+	double        waitingSeconds = 0.0;
+};
+
+struct DebugCounter
+{
+	CounterHandle handle = kInvalidCounter;
+	int  count = 0;
+	bool cancelled = false;
+	bool failed = false;  // a task signalling it threw
+	bool busy = false;    // its lock was held throughout: parked and waiters unread
+	std::vector<DebugTask> parked; // tasks waiting for it to reach zero (the first 64)
+	int  parkedTotal = 0;
+	std::vector<int> waiters;      // thread indices asleep in a wait on it
+};
+
+struct DebugLimiter
+{
+	LimiterHandle handle = kInvalidLimiter;
+	uint32_t limit = 0;
+	uint32_t held = 0;
+	bool     busy = false;
+	std::vector<DebugTask> waiting; // tasks waiting for a unit (the first 64)
+	int      waitingTotal = 0;
+};
+
+struct DebugState
+{
+	std::vector<DebugThread>  threads; // the main thread first
+	std::vector<DebugCounter> counters;
+	std::vector<DebugLimiter> limiters;
+	int liveTasks = 0;
+	int queued = 0;       // in the AnyWorker queues (every priority)
+	int queuedHigh = 0;
+	int queuedLow = 0;
+	int mainQueued = 0;   // waiting for the main thread to pump or wait
+	bool busy = false;    // some table could not be read at all
+};
+
+using TaskNameFn = const char* (*)(uint32_t nameId);
+
+DebugState  CaptureDebugState();
+std::string FormatDebugState(const DebugState&, TaskNameFn nameOf = nullptr);
+std::string DebugDump(TaskNameFn nameOf = nullptr); // both of the above
+
 // ---- Parking ----------------------------------------------------------------
 // Stops every pool thread (the workers, the dedicated threads, the lanes) at
 // a known point: each finishes its current task, records its own stack and

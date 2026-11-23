@@ -2606,6 +2606,226 @@ TEST_CASE("loom: continuations — an error skips the rest of the chain and reac
 }
 #endif
 
+namespace {
+	const char* DumpTestName(uint32_t id)
+	{
+		switch (id)
+		{
+		case 11: return "draw";
+		case 22: return "physics";
+		case 33: return "decode";
+		default: return nullptr;
+		}
+	}
+
+	// Captures until `ready` holds for a capture (up to 10 s), returning the last.
+	template <typename F>
+	loom::DebugState CaptureWhen(F ready)
+	{
+		const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		loom::DebugState s = loom::CaptureDebugState();
+		while (!ready(s) && std::chrono::steady_clock::now() < until)
+		{
+			std::this_thread::yield();
+			s = loom::CaptureDebugState();
+		}
+		return s;
+	}
+
+	const loom::DebugCounter* FindCounter(const loom::DebugState& s, loom::CounterHandle h)
+	{
+		for (const loom::DebugCounter& c : s.counters)
+			if (c.handle == h)
+				return &c;
+		return nullptr;
+	}
+
+	const loom::DebugThread* FindRunning(const loom::DebugState& s, uint32_t nameId)
+	{
+		for (const loom::DebugThread& t : s.threads)
+			if (t.running > 0 && t.runningName == nameId)
+				return &t;
+		return nullptr;
+	}
+}
+
+TEST_CASE("loom: debug dump — a stuck wait, the tasks parked on it and who sleeps on it")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	CHECK(loom::CaptureDebugState().threads.front().isMain);
+
+	loom::ScopedCounter gate(1), done(3), inner(1);
+	for (int i = 0; i < 3; i++)
+		loom::Submit([] {}, loom::TaskDesc{ .signals = done, .waitsFor = gate, .nameId = 11 });
+	// A task that waits inside itself, and a thread outside the pool waiting.
+	loom::Submit([g = gate.Get()] { loom::WaitFor(g, loom::Help::BlockOnly); }, loom::TaskDesc{ .signals = inner, .nameId = 22 });
+	std::atomic<int> outside{ -1 };
+	std::thread waiter([&] {
+		outside = loom::CurrentThreadIndex();
+		loom::WaitFor(done.Get(), loom::Help::BlockOnly);
+	});
+
+	const loom::DebugState s = CaptureWhen([&](const loom::DebugState& st) {
+		const loom::DebugCounter* d = FindCounter(st, done.Get());
+		const loom::DebugThread* t = FindRunning(st, 22);
+		return d && !d->waiters.empty() && t && t->waitingOn == gate.Get();
+	});
+	const loom::DebugCounter* g = FindCounter(s, gate.Get());
+	const loom::DebugCounter* d = FindCounter(s, done.Get());
+	const loom::DebugThread* t = FindRunning(s, 22);
+	REQUIRE(g);
+	REQUIRE(d);
+	REQUIRE(t);
+	CHECK(g->count == 1);
+	CHECK(g->parkedTotal == 3);
+	REQUIRE(g->parked.size() == 3);
+	CHECK(g->parked[0].nameId == 11);
+	CHECK(std::find(g->waiters.begin(), g->waiters.end(), t->index) != g->waiters.end()); // the task's own wait sleeps
+	CHECK(d->count == 3);
+	CHECK(d->waiters == std::vector<int>{ outside.load() });
+	CHECK(t->runningSignals == inner.Get());
+	CHECK(t->waitingSeconds >= 0.0);
+	CHECK(!t->isMain);
+
+	const std::string text = loom::FormatDebugState(s, &DumpTestName);
+	CHECK(text.find("3 parked: 'draw' x3") != std::string::npos);
+	CHECK(text.find("running 'physics'") != std::string::npos);
+	CHECK(text.find("asleep on it: [" + std::to_string(outside.load()) + "]") != std::string::npos);
+	CHECK(loom::FormatDebugState(s).find("task#11 x3") != std::string::npos); // no names: ids
+
+	loom::Signal(gate);
+	waiter.join();
+	loom::WaitFor(inner);
+	const loom::DebugState after = CaptureWhen([](const loom::DebugState& st) {
+		for (const loom::DebugThread& th : st.threads)
+			if (th.running > 0)
+				return false;
+		return true;
+	});
+	CHECK(FindRunning(after, 22) == nullptr);
+	CHECK(FindCounter(after, gate.Get())->count == 0);
+	CHECK(FindCounter(after, gate.Get())->parkedTotal == 0);
+}
+
+TEST_CASE("loom: debug dump — hints for a missing signal, unpumped main work and a limiter waiting on itself")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	{
+		// Nobody will signal this: only a thread outside the pool waits.
+		loom::ScopedCounter never(1);
+		std::thread waiter([&] { loom::WaitFor(never.Get(), loom::Help::BlockOnly); });
+		CaptureWhen([&](const loom::DebugState& st) {
+			const loom::DebugCounter* c = FindCounter(st, never.Get());
+			return c && !c->waiters.empty();
+		});
+		CHECK(loom::DebugDump().find("hint: nothing is running or queued") != std::string::npos);
+		loom::Signal(never);
+		waiter.join();
+	}
+	{
+		loom::ScopedCounter onMain(1);
+		loom::Submit([] {}, loom::TaskDesc{ .affinity = loom::Affinity::MainThread, .signals = onMain });
+		const std::string text = loom::DebugDump();
+		CHECK(text.find("for the main thread 1") != std::string::npos);
+		CHECK(text.find("hint: main-thread tasks are queued") != std::string::npos);
+		loom::WaitFor(onMain);
+	}
+	{
+		// A limited task waiting for work of its own limiter: stuck until released.
+		loom::ScopedLimiter one(1);
+		loom::ScopedCounter outerDone(1), innerDone(1);
+		std::atomic<bool> release{ false };
+		loom::Submit([&] {
+			loom::Submit([] {}, loom::TaskDesc{ .signals = innerDone, .nameId = 33, .limiter = one });
+			while (!release && !loom::TryWaitFor(innerDone, 1, loom::Help::BlockOnly))
+			{
+			}
+		}, loom::TaskDesc{ .signals = outerDone, .nameId = 22, .limiter = one });
+		const loom::DebugState s = CaptureWhen([&](const loom::DebugState& st) {
+			const loom::DebugThread* t = FindRunning(st, 22);
+			return t && t->waitingOn == innerDone.Get() && !st.limiters.empty() && st.limiters[0].waitingTotal == 1;
+		});
+		REQUIRE(s.limiters.size() == 1);
+		CHECK(s.limiters[0].handle == one.Get());
+		CHECK(s.limiters[0].held == 1);
+		REQUIRE(s.limiters[0].waiting.size() == 1);
+		CHECK(s.limiters[0].waiting[0].nameId == 33);
+		CHECK(s.limiters[0].waiting[0].limiter == one.Get());
+		const loom::DebugThread* t = FindRunning(s, 22);
+		REQUIRE(t);
+		CHECK(t->runningLimiter == one.Get());
+		const std::string text = loom::FormatDebugState(s, &DumpTestName);
+		CHECK(text.find("1 waiting: 'decode'") != std::string::npos);
+		CHECK(text.find("a limited task must not wait for its own limiter's work") != std::string::npos);
+		release = true;
+		loom::WaitFor(outerDone);
+		loom::WaitFor(innerDone);
+	}
+}
+
+TEST_CASE("loom: debug dump — main thread waits and nested tasks, no pool, capture under load")
+{
+	CHECK(loom::CaptureDebugState().threads.empty()); // no pool
+	CHECK(loom::DebugDump().find("0 tasks live") != std::string::npos);
+	{
+		// No workers: the main thread runs everything, inside its own wait.
+		loom::Pool pool(loom::LoomConfig{ .workerCount = 0 });
+		loom::DebugState seen, back;
+		loom::ScopedCounter outer(1);
+		loom::Submit([&] {
+			loom::ScopedCounter nested(1);
+			loom::Submit([&] { seen = loom::CaptureDebugState(); }, loom::TaskDesc{ .signals = nested, .nameId = 11 });
+			loom::WaitFor(nested);
+			back = loom::CaptureDebugState(); // the nested task and the wait are over
+		}, loom::TaskDesc{ .signals = outer, .nameId = 22 });
+		loom::WaitFor(outer);
+		REQUIRE(!seen.threads.empty());
+		const loom::DebugThread& m = seen.threads.front();
+		CHECK(m.isMain);
+		CHECK(m.running == 2);       // the outer task, and the one its wait ran
+		CHECK(m.runningName == 11);  // the innermost
+		CHECK(m.waitingOn != loom::kInvalidCounter);
+		CHECK(loom::FormatDebugState(seen, &DumpTestName).find("running 'draw' (signals") != std::string::npos);
+		REQUIRE(!back.threads.empty());
+		CHECK(back.threads.front().running == 1);
+		CHECK(back.threads.front().runningName == 22);
+		CHECK(back.threads.front().waitingOn == outer.Get()); // the main thread's own wait, which ran the task
+		const loom::DebugState after = loom::CaptureDebugState();
+		CHECK(after.threads.front().running == 0);
+		CHECK(after.threads.front().waitingOn == loom::kInvalidCounter);
+		CHECK(after.threads.front().tasksRun >= 2);
+	}
+	{
+		// Captures racing a busy pool: counters, limiters, futures and waits
+		// come and go while another thread reads them.
+		loom::Pool pool(loom::LoomConfig{});
+		std::atomic<bool> stop{ false };
+		std::atomic<int> captures{ 0 };
+		std::thread reader([&] {
+			while (!stop)
+			{
+				(void)loom::DebugDump(&DumpTestName);
+				captures++;
+			}
+		});
+		loom::ScopedLimiter four(4);
+		for (int round = 0; round < 200; round++)
+		{
+			loom::ScopedCounter gate(1), done(64);
+			for (int i = 0; i < 64; i++)
+				loom::Submit([&] { (void)loom::Load(gate); }, loom::TaskDesc{ .signals = done, .waitsFor = gate, .nameId = 11, .limiter = i % 2 ? four.Get() : loom::kInvalidLimiter });
+			loom::Future<int> f = loom::Async([] { return 1; }).Then([](int& v) { return v + 1; });
+			loom::Signal(gate);
+			loom::WaitFor(done);
+			CHECK(f.Get() == 2);
+		}
+		while (captures.load() < 10)
+			std::this_thread::yield();
+		stop = true;
+		reader.join();
+	}
+}
+
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
 	loom::Pool pool; // the suite owns its pool explicitly

@@ -7,6 +7,7 @@
 #include <climits>
 #include <cstddef>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -150,6 +151,7 @@ struct Waiter
 {
 	std::atomic<uint32_t> word{ kArmed };
 	bool isWorker = false; // a worker's idle sleep (not a helper's)
+	int threadIndex = -1;  // who sleeps here, for the debug dump (set before registering)
 #if !LOOM_FUTEX
 	std::mutex              mutex;
 	std::condition_variable cv;
@@ -452,12 +454,28 @@ struct alignas(64) WorkerCtx
 	int           deferredCount = 0;
 };
 
+// What a thread is doing, for CaptureDebugState: written only by its own
+// thread with relaxed stores, on a line of its own, and read by whoever
+// captures. A task run inside a helping wait saves the outer values and
+// puts them back, so the innermost task and wait are the ones shown.
+struct alignas(64) ThreadDebug
+{
+	std::atomic<uint64_t>      tasksRun{ 0 };
+	std::atomic<int>           running{ 0 };
+	std::atomic<uint32_t>      runningName{ 0 };
+	std::atomic<CounterHandle> runningSignals{ kInvalidCounter };
+	std::atomic<uint16_t>      runningLimiter{ 0 }; // the limiter's index + 1, as in the slot
+	std::atomic<CounterHandle> waitingOn{ kInvalidCounter };
+	std::atomic<int64_t>       waitingSince{ 0 };   // steady_clock ticks
+};
+
 struct alignas(64) PaddedStats
 {
 	ThreadStats s;
 	// s.name points here: the row outlives the thread (a dedicated thread's
 	// own name string dies when it is unregistered).
 	std::string name;
+	ThreadDebug debug;
 };
 
 // ---- The pool state --------------------------------------------------------------
@@ -539,6 +557,9 @@ struct PoolState
 	std::vector<std::unique_ptr<PaddedStats>> threadStats;
 	std::vector<std::thread> workers;
 	int                     workerCount = 0;
+	// The main thread has no stats row; its debug record lives here.
+	ThreadDebug             mainDebug;
+	int                     mainThreadIndex = 0;
 
 	// Runs first on every pool thread.
 	void (*onThreadStart)() = nullptr;
@@ -588,6 +609,8 @@ static thread_local WorkerCtx*      t_WorkerCtx = nullptr;
 static thread_local DedicatedState* t_CurrentDedicated = nullptr;
 // A pool thread's stats row (workers and dedicated threads; null elsewhere).
 static thread_local ThreadStats*    t_ThreadStats = nullptr;
+// That row's debug record (null elsewhere; the main thread's is in the pool).
+static thread_local ThreadDebug*    t_Debug = nullptr;
 // The Isolated region the calling thread is in (0: none). A running task's
 // thread is in that task's region, so its children inherit it.
 static thread_local uint16_t        t_Isolation = 0;
@@ -615,6 +638,16 @@ static WorkerCtx* CurrentCtx(PoolState& P)
 }
 
 static DedicatedState* CurrentDedicated() { return t_CurrentDedicated; }
+
+// The calling thread's debug record: a pool thread's own, the main
+// thread's, or none (a thread outside the pool shows up only as a sleeper
+// on the counters it waits for).
+static ThreadDebug* DebugRow(PoolState& P, WorkerCtx* ctx)
+{
+	if (t_Debug)
+		return t_Debug;
+	return ctx && ctx->isMain ? &P.mainDebug : nullptr;
+}
 
 // The region a wait on this thread is isolated to. None without workers:
 // nobody else could run the work outside it.
@@ -755,7 +788,7 @@ static bool     TryHelpIn(PoolState& P);
 static void     ParkHere(PoolState& P, int index, const char* name);
 static void     WorkerLoop(PoolState& P, WorkerCtx& ctx);
 static void     DedicatedLoop(PoolState& P, DedicatedState& d);
-static ThreadStats* RegisterThreadStats(PoolState& P, int index, const char* name);
+static PaddedStats* RegisterThreadStats(PoolState& P, int index, const char* name);
 
 // ---- Slot storage -------------------------------------------------------------------
 
@@ -962,7 +995,7 @@ Pool::Pool(const LoomConfig& config)
 	// The initializing thread claims index 0 BEFORE the workers spawn; the
 	// allocator is monotonic across pools (a dead worker's index is never
 	// reused - restarting at 0 would hand a fresh worker the main thread's 0).
-	(void)CurrentThreadIndex();
+	P.mainThreadIndex = CurrentThreadIndex();
 
 	{
 		std::lock_guard<std::mutex> lock(P.growMutex);
@@ -2530,6 +2563,7 @@ static void SleepOnCounter(PoolState& P, CounterState& c, bool help, Deadline de
 		std::lock_guard<std::mutex> lock(c.mutex);
 		if (c.count.load(std::memory_order_acquire) == 0)
 			return;
+		w.threadIndex = CurrentThreadIndex();
 		c.waiters.push_back(&w);
 	}
 
@@ -2614,6 +2648,16 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 	WorkerCtx* ctx = CurrentCtx(P);
 	FlushDeferredSignals(P, ctx); // this thread's own finished tasks may be what we wait for
 	MarkProfilerState(P, threadIndex, 0); // waiting
+	ThreadDebug* const debug = DebugRow(P, ctx);
+	CounterHandle outerWait = kInvalidCounter;
+	int64_t outerSince = 0;
+	if (debug)
+	{
+		outerWait = debug->waitingOn.load(std::memory_order_relaxed);
+		outerSince = debug->waitingSince.load(std::memory_order_relaxed);
+		debug->waitingSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+		debug->waitingOn.store(h, std::memory_order_relaxed);
+	}
 	// Untimed, until zero: Shutdown drains before it stops anything, so a
 	// wait never needs to give up early.
 	bool reached = true;
@@ -2642,6 +2686,11 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 	// Never return to the caller holding signals: it may block on anything.
 	FlushDeferredSignals(P, ctx);
 	MarkProfilerState(P, threadIndex, 2); // wait over
+	if (debug)
+	{
+		debug->waitingOn.store(outerWait, std::memory_order_relaxed);
+		debug->waitingSince.store(outerSince, std::memory_order_relaxed);
+	}
 #if defined(__cpp_exceptions)
 	if (reached && c->failed.load(std::memory_order_acquire))
 	{
@@ -2907,8 +2956,30 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	uint16_t* const outerLimiter = t_RunningLimiter;
 	t_Isolation = t.isolation;
 	t_RunningLimiter = &limiter;
+	ThreadDebug* const debug = DebugRow(P, ctx);
+	uint32_t outerName = 0;
+	CounterHandle outerSignals = kInvalidCounter;
+	uint16_t outerDebugLimiter = 0;
+	if (debug)
+	{
+		outerName = debug->runningName.load(std::memory_order_relaxed);
+		outerSignals = debug->runningSignals.load(std::memory_order_relaxed);
+		outerDebugLimiter = debug->runningLimiter.load(std::memory_order_relaxed);
+		debug->runningName.store(nameId, std::memory_order_relaxed);
+		debug->runningSignals.store(signals, std::memory_order_relaxed);
+		debug->runningLimiter.store(limiter, std::memory_order_relaxed);
+		debug->running.store(debug->running.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+	}
 	if (fn && !cancelled)
 		RunTaskFn(P, fn, userData, signals); // an inline callable's userData is the slot: release after
+	if (debug)
+	{
+		debug->running.store(debug->running.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
+		debug->runningName.store(outerName, std::memory_order_relaxed);
+		debug->runningSignals.store(outerSignals, std::memory_order_relaxed);
+		debug->runningLimiter.store(outerDebugLimiter, std::memory_order_relaxed);
+		debug->tasksRun.store(debug->tasksRun.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+	}
 	t_Isolation = outerRegion;
 	t_RunningLimiter = outerLimiter;
 	// An owned callable dies whether it ran, threw or was skipped, and before
@@ -3045,8 +3116,10 @@ static void WorkerLoop(PoolState& P, WorkerCtx& ctx)
 	// history on it, and the profiler's lane names benefit too).
 	static thread_local char t_name[32];
 	std::snprintf(t_name, sizeof(t_name), "loom-worker-%d", index);
-	ThreadStats* stats = RegisterThreadStats(P, index, t_name);
+	PaddedStats* row = RegisterThreadStats(P, index, t_name);
+	ThreadStats* stats = &row->s;
 	t_ThreadStats = stats;
+	t_Debug = &row->debug;
 	if (stats)
 		SetOsThreadName(stats->name);
 
@@ -3127,17 +3200,17 @@ static void WorkerLoop(PoolState& P, WorkerCtx& ctx)
 
 // The row for a thread index, created on first use. A thread index is never
 // reused, so an existing row with the index is this thread's own.
-static ThreadStats* RegisterThreadStats(PoolState& P, int index, const char* name)
+static PaddedStats* RegisterThreadStats(PoolState& P, int index, const char* name)
 {
 	std::lock_guard<std::mutex> lock(P.statsMutex);
 	for (auto& t : P.threadStats)
 		if (t->s.index == index)
-			return &t->s;
+			return t.get();
 	auto stats = std::make_unique<PaddedStats>();
 	stats->s.index = index;
 	stats->name = name ? name : "";
 	stats->s.name = stats->name.c_str();
-	ThreadStats* raw = &stats->s;
+	PaddedStats* raw = stats.get();
 	P.threadStats.push_back(std::move(stats));
 	return raw;
 }
@@ -3208,8 +3281,10 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 	const int index = CurrentThreadIndex(); // reserve this thread's index
 	d.threadIndex.store(index, std::memory_order_relaxed);
 	const char* name = d.name.empty() ? "loom-dedicated" : d.name.c_str();
-	ThreadStats* stats = RegisterThreadStats(P, index, name);
+	PaddedStats* row = RegisterThreadStats(P, index, name);
+	ThreadStats* stats = &row->s;
 	t_ThreadStats = stats;
+	t_Debug = &row->debug;
 	SetOsThreadName(d.name.c_str());
 	const bool steals = d.idle == DedicatedConfig::Idle::StealFromPool;
 	Waiter& w = t_Waiter;
@@ -3474,6 +3549,351 @@ std::vector<ParkedThread> ParkedThreads()
 	PoolState& P = ActivePool();
 	std::lock_guard<std::mutex> lock(P.parkMutex);
 	return P.parked;
+}
+
+// ---- Debug dump ---------------------------------------------------------------
+// Meant for a pool that may be stuck, so it never waits long for a lock: a
+// thread stuck while holding one must not take the dump down with it.
+
+static bool LockBriefly(std::mutex& m)
+{
+	const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+	do
+	{
+		if (m.try_lock())
+			return true;
+		std::this_thread::yield();
+	} while (std::chrono::steady_clock::now() < until);
+	return false;
+}
+
+static constexpr size_t kDebugListMax = 64;
+
+static LimiterHandle LimiterOfTag(PoolState& P, uint16_t tag)
+{
+	if (tag == 0 || tag > P.limiterCount)
+		return kInvalidLimiter;
+	return PackCounter(tag - 1u, P.limiters[tag - 1u].generation.load(std::memory_order_relaxed));
+}
+
+// A slot that is parked on a counter or waiting for a limiter: nobody runs or
+// frees it while the lock it is listed under is held.
+static DebugTask DebugTaskOf(PoolState& P, uint32_t slot)
+{
+	const TaskSlot& t = Slot(P, slot);
+	DebugTask task;
+	task.nameId = t.nameId;
+	task.priority = t.priority;
+	task.affinity = t.affinity;
+	task.limiter = LimiterOfTag(P, t.limiter);
+	return task;
+}
+
+static void ReadThreadDebug(PoolState& P, const ThreadDebug& d, int64_t now, DebugThread& out)
+{
+	out.tasksRun = d.tasksRun.load(std::memory_order_relaxed);
+	out.running = d.running.load(std::memory_order_relaxed);
+	if (out.running > 0)
+	{
+		out.runningName = d.runningName.load(std::memory_order_relaxed);
+		out.runningSignals = d.runningSignals.load(std::memory_order_relaxed);
+		out.runningLimiter = LimiterOfTag(P, d.runningLimiter.load(std::memory_order_relaxed));
+	}
+	out.waitingOn = d.waitingOn.load(std::memory_order_relaxed);
+	if (out.waitingOn != kInvalidCounter)
+	{
+		const int64_t since = d.waitingSince.load(std::memory_order_relaxed);
+		out.waitingSeconds = std::chrono::duration<double>(std::chrono::steady_clock::duration(std::max<int64_t>(0, now - since))).count();
+	}
+}
+
+DebugState CaptureDebugState()
+{
+	DebugState s;
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	if (!pool)
+		return s;
+	PoolState& P = *pool;
+	const int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+
+	DebugThread mainThread;
+	mainThread.index = P.mainThreadIndex;
+	mainThread.name = "main";
+	mainThread.isMain = true;
+	ReadThreadDebug(P, P.mainDebug, now, mainThread);
+	s.threads.push_back(std::move(mainThread));
+	if (LockBriefly(P.statsMutex))
+	{
+		for (auto& row : P.threadStats)
+		{
+			DebugThread t;
+			t.index = row->s.index;
+			t.name = row->name;
+			ReadThreadDebug(P, row->debug, now, t);
+			s.threads.push_back(std::move(t));
+		}
+		P.statsMutex.unlock();
+	}
+	else
+		s.busy = true;
+	if (LockBriefly(P.dedicatedMutex))
+	{
+		for (auto& d : P.dedicated)
+		{
+			if (!LockBriefly(d->mutex))
+				continue;
+			const int depth = (int)d->queue.size();
+			d->mutex.unlock();
+			const int index = d->threadIndex.load(std::memory_order_relaxed);
+			for (DebugThread& t : s.threads)
+				if (!t.isMain && t.index == index)
+					t.queueDepth = depth;
+		}
+		P.dedicatedMutex.unlock();
+	}
+	else
+		s.busy = true;
+
+	// Counters, under the table lock so none is created or destroyed midway.
+	if (LockBriefly(P.counterMutex))
+	{
+		for (uint32_t i = 0; i < P.counterCount; i++)
+		{
+			CounterState& c = P.counters[i];
+			if (!c.alive.load(std::memory_order_relaxed))
+				continue;
+			DebugCounter dc;
+			dc.handle = PackCounter(i, c.generation.load(std::memory_order_relaxed));
+			const int v = c.count.load(std::memory_order_acquire);
+			dc.count = v > 1 ? v - 1 : v;
+			dc.cancelled = c.cancelled.load(std::memory_order_relaxed);
+			dc.failed = c.failed.load(std::memory_order_relaxed);
+			if (LockBriefly(c.mutex))
+			{
+				dc.parkedTotal = (int)c.pending.size();
+				for (size_t k = 0; k < c.pending.size() && k < kDebugListMax; k++)
+					dc.parked.push_back(DebugTaskOf(P, c.pending[k]));
+				for (const Waiter* w : c.waiters)
+					dc.waiters.push_back(w->threadIndex);
+				c.mutex.unlock();
+			}
+			else
+				dc.busy = true;
+			s.counters.push_back(std::move(dc));
+		}
+		P.counterMutex.unlock();
+	}
+	else
+		s.busy = true;
+
+	if (LockBriefly(P.limiterMutex))
+	{
+		for (uint32_t i = 0; i < P.limiterCount; i++)
+		{
+			LimiterState& l = P.limiters[i];
+			if (!l.alive.load(std::memory_order_relaxed))
+				continue;
+			DebugLimiter dl;
+			dl.handle = PackCounter(i, l.generation.load(std::memory_order_relaxed));
+			dl.limit = l.limit;
+			const int count = l.count.load(std::memory_order_acquire);
+			dl.held = count >= 0 ? l.limit - (uint32_t)count : l.limit;
+			if (LockBriefly(l.mutex))
+			{
+				dl.waitingTotal = (int)l.waiting.size();
+				for (size_t k = 0; k < l.waiting.size() && k < kDebugListMax; k++)
+					dl.waiting.push_back(DebugTaskOf(P, l.waiting[k]));
+				l.mutex.unlock();
+			}
+			else
+				dl.busy = true;
+			s.limiters.push_back(std::move(dl));
+		}
+		P.limiterMutex.unlock();
+	}
+	else
+		s.busy = true;
+
+	s.liveTasks = (int)LiveTasksIn(P);
+	s.queued = PoolQueueDepth(P);
+	s.queuedHigh = P.queuedHigh.load(std::memory_order_relaxed);
+	s.queuedLow = P.queuedLow.load(std::memory_order_relaxed);
+	if (LockBriefly(P.mainMutex))
+	{
+		s.mainQueued = (int)P.mainQueue.size();
+		P.mainMutex.unlock();
+	}
+	else
+		s.busy = true;
+	return s;
+}
+
+namespace {
+
+struct TextOut
+{
+	std::string text;
+	void Line(const char* fmt, ...)
+	{
+		char buf[512];
+		va_list args;
+		va_start(args, fmt);
+		std::vsnprintf(buf, sizeof buf, fmt, args);
+		va_end(args);
+		text += buf;
+	}
+};
+
+std::string Plural(long long n, const char* word)
+{
+	return std::to_string(n) + " " + word + (n == 1 ? "" : "s");
+}
+
+std::string HandleText(char kind, uint32_t h)
+{
+	char buf[32];
+	std::snprintf(buf, sizeof buf, "%c%u.%u", kind, CounterIndex(h), CounterGeneration(h));
+	return buf;
+}
+
+std::string TaskNameText(uint32_t nameId, TaskNameFn nameOf)
+{
+	if (nameId == 0)
+		return "unnamed";
+	if (nameOf)
+		if (const char* name = nameOf(nameId))
+			return std::string("'") + name + "'";
+	return "task#" + std::to_string(nameId);
+}
+
+// "'draw' x3, task#17 x2": tasks grouped by name, in order of first appearance.
+std::string TaskListText(const std::vector<DebugTask>& tasks, int total, TaskNameFn nameOf)
+{
+	std::vector<std::pair<uint32_t, int>> groups;
+	for (const DebugTask& t : tasks)
+	{
+		auto it = std::find_if(groups.begin(), groups.end(), [&](const auto& g) { return g.first == t.nameId; });
+		if (it == groups.end())
+			groups.push_back({ t.nameId, 1 });
+		else
+			it->second++;
+	}
+	std::string text;
+	for (size_t i = 0; i < groups.size() && i < 8; i++)
+	{
+		if (!text.empty())
+			text += ", ";
+		text += TaskNameText(groups[i].first, nameOf);
+		if (groups[i].second > 1)
+			text += " x" + std::to_string(groups[i].second);
+	}
+	if (groups.size() > 8 || total > (int)tasks.size())
+		text += ", ...";
+	return text;
+}
+
+} // namespace
+
+std::string FormatDebugState(const DebugState& s, TaskNameFn nameOf)
+{
+	TextOut out;
+	out.Line("loom: %s live; queued %d (high %d, low %d), for the main thread %d%s\n", Plural(s.liveTasks, "task").c_str(),
+		s.queued, s.queuedHigh, s.queuedLow, s.mainQueued, s.busy ? "; some tables were busy and are missing" : "");
+
+	out.Line("threads:\n");
+	bool anyRunning = false, anyWaiting = false, dedicatedQueued = false;
+	const DebugThread* mainThread = nullptr;
+	for (const DebugThread& t : s.threads)
+	{
+		if (t.isMain)
+			mainThread = &t;
+		anyRunning = anyRunning || t.running > 0;
+		anyWaiting = anyWaiting || t.waitingOn != kInvalidCounter;
+		dedicatedQueued = dedicatedQueued || t.queueDepth > 0;
+		std::string what;
+		if (t.running > 0)
+		{
+			what = "running " + TaskNameText(t.runningName, nameOf);
+			if (t.runningSignals != kInvalidCounter)
+				what += " (signals " + HandleText('c', t.runningSignals) + ")";
+			if (t.runningLimiter != kInvalidLimiter)
+				what += " (holds a unit of " + HandleText('l', t.runningLimiter) + ")";
+			if (t.running > 1)
+				what += ", inside " + std::to_string(t.running - 1) + " more";
+		}
+		if (t.waitingOn != kInvalidCounter)
+		{
+			char buf[96];
+			std::snprintf(buf, sizeof buf, "waiting %.3f s on %s", t.waitingSeconds, HandleText('c', t.waitingOn).c_str());
+			if (!what.empty())
+				what = std::string(buf) + ", meanwhile " + what;
+			else
+				what = buf;
+		}
+		if (what.empty())
+			what = "idle";
+		out.Line("  [%d] %s: %s; ran %s", t.index, t.name.c_str(), what.c_str(), Plural((long long)t.tasksRun, "task").c_str());
+		if (t.queueDepth > 0)
+			out.Line("; %d queued for it", t.queueDepth);
+		out.Line("\n");
+	}
+
+	out.Line("counters (%zu live):\n", s.counters.size());
+	for (const DebugCounter& c : s.counters)
+	{
+		out.Line("  %s: count %d%s%s", HandleText('c', c.handle).c_str(), c.count, c.cancelled ? ", cancelled" : "",
+			c.failed ? ", a task threw" : "");
+		if (c.busy)
+			out.Line("; busy");
+		if (c.parkedTotal > 0)
+			out.Line("; %d parked: %s", c.parkedTotal, TaskListText(c.parked, c.parkedTotal, nameOf).c_str());
+		if (!c.waiters.empty())
+		{
+			std::string who;
+			for (int w : c.waiters)
+				who += (who.empty() ? "[" : ", [") + std::to_string(w) + "]";
+			out.Line("; asleep on it: %s", who.c_str());
+		}
+		out.Line("\n");
+	}
+
+	if (!s.limiters.empty())
+	{
+		out.Line("limiters (%zu live):\n", s.limiters.size());
+		for (const DebugLimiter& l : s.limiters)
+		{
+			out.Line("  %s: limit %u, held %u", HandleText('l', l.handle).c_str(), l.limit, l.held);
+			if (l.busy)
+				out.Line("; busy");
+			if (l.waitingTotal > 0)
+				out.Line("; %d waiting: %s", l.waitingTotal, TaskListText(l.waiting, l.waitingTotal, nameOf).c_str());
+			out.Line("\n");
+		}
+	}
+
+	// The common ways a wait never returns that the capture can see. A
+	// thread outside the pool shows up only asleep on a counter.
+	for (const DebugCounter& c : s.counters)
+		anyWaiting = anyWaiting || !c.waiters.empty();
+	if (anyWaiting && !anyRunning && s.queued == 0 && s.mainQueued == 0 && !dedicatedQueued)
+		out.Line("hint: nothing is running or queued, so the counters waited on are waiting for a Signal or a Submit that has not happened\n");
+	if (s.mainQueued > 0 && mainThread && mainThread->waitingOn == kInvalidCounter && mainThread->running == 0)
+		out.Line("hint: main-thread tasks are queued; they run only while the main thread waits (helping) or calls PumpMainThreadTasks\n");
+	for (const DebugLimiter& l : s.limiters)
+	{
+		if (l.held < l.limit || l.waitingTotal == 0)
+			continue;
+		for (const DebugThread& t : s.threads)
+			if (t.running > 0 && t.runningLimiter == l.handle && t.waitingOn != kInvalidCounter)
+				out.Line("hint: [%d] holds a unit of %s and waits while %s for that limiter; a limited task must not wait for its own limiter's work\n",
+					t.index, HandleText('l', l.handle).c_str(), (Plural(l.waitingTotal, "task") + (l.waitingTotal == 1 ? " waits" : " wait")).c_str());
+	}
+	return out.text;
+}
+
+std::string DebugDump(TaskNameFn nameOf)
+{
+	return FormatDebugState(CaptureDebugState(), nameOf);
 }
 
 // ---- The profiler shim's hooks (loom_profiler_shim.h) ----------------------------
