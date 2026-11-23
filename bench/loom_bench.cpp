@@ -21,6 +21,8 @@
 // background tasks, with the background unlimited or limited to 4 workers.
 // Then futures: 4096 Async results read with Get, against tasks that write
 // their results into an array behind one counter.
+// Then continuations: chains of dependent steps written with Then, against
+// the same chains with one counter per step and waitsFor.
 // Usage: loom_bench [tasks] [repeats]
 
 #include "loom/loom.h"
@@ -404,6 +406,70 @@ namespace {
 		return seconds;
 	}
 
+	// Chains of `steps` dependent tasks, each step reading the one before:
+	// written with Then, and by hand with one counter per step and waitsFor.
+	double ThenChainRun(int chains, int steps)
+	{
+		std::vector<loom::Future<uint64_t>> ends;
+		ends.reserve((size_t)chains);
+		const auto start = Clock::now();
+		for (int c = 0; c < chains; c++)
+		{
+			loom::Future<uint64_t> f = loom::Async([c] {
+				Work((void*)(uintptr_t)c);
+				return (uint64_t)c;
+			});
+			for (int s = 1; s < steps; s++)
+				f = f.Then([](uint64_t& v) {
+					Work((void*)(uintptr_t)v);
+					return v + 1;
+				});
+			ends.push_back(std::move(f));
+		}
+		uint64_t sum = 0;
+		for (auto& f : ends)
+			sum += f.Get();
+		ends.clear();
+		const double seconds = Seconds(start, Clock::now());
+		KeepAlive(sum);
+		return seconds;
+	}
+
+	double CounterChainRun(int chains, int steps)
+	{
+		std::vector<uint64_t> values((size_t)chains * (size_t)steps);
+		std::vector<loom::CounterHandle> counters((size_t)chains * (size_t)steps);
+		const auto start = Clock::now();
+		for (int c = 0; c < chains; c++)
+		{
+			loom::CounterHandle prev = loom::kInvalidCounter;
+			for (int s = 0; s < steps; s++)
+			{
+				const size_t at = (size_t)c * (size_t)steps + (size_t)s;
+				counters[at] = loom::CreateCounter(1);
+				const uint64_t* in = s > 0 ? &values[at - 1] : nullptr;
+				loom::Submit([out = &values[at], in, c] {
+					const uint64_t v = in ? *in + 1 : (uint64_t)c;
+					Work((void*)(uintptr_t)v);
+					*out = v;
+				}, loom::TaskDesc{ .signals = counters[at], .waitsFor = prev });
+				prev = counters[at];
+			}
+		}
+		uint64_t sum = 0;
+		for (int c = 0; c < chains; c++)
+		{
+			const size_t last = (size_t)c * (size_t)steps + (size_t)steps - 1;
+			loom::WaitFor(counters[last]);
+			sum += values[last];
+		}
+		for (loom::CounterHandle h : counters)
+			loom::DestroyCounter(h);
+		const double seconds = Seconds(start, Clock::now());
+		KeepAlive(sum);
+		return seconds;
+	}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -496,6 +562,22 @@ int main(int argc, char** argv)
 			array = std::min(array, ArrayRun(n));
 		}
 		std::printf("%8d  %10.1f  %22.1f  %6.2f\n", workers, futures * 1e9 / n, array * 1e9 / n, futures / array);
+	}
+
+	const int chains = 512, steps = 8;
+	std::printf("\ncontinuations: %d chains of %d steps, ns per step\n", chains, steps);
+	std::printf("%8s  %10s  %22s  %6s\n", "workers", "Then", "counter per step", "ratio");
+	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers, .maxTasks = 1 << 16, .maxCounters = 8192 });
+		double then = 1e9, counters = 1e9;
+		for (int r = 0; r < repeats * 20; r++)
+		{
+			then = std::min(then, ThenChainRun(chains, steps));
+			counters = std::min(counters, CounterChainRun(chains, steps));
+		}
+		const double perStep = 1e9 / (chains * steps);
+		std::printf("%8d  %10.1f  %22.1f  %6.2f\n", workers, then * perStep, counters * perStep, then / counters);
 	}
 	return 0;
 }
