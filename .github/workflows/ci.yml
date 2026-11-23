@@ -1,0 +1,82 @@
+# Builds loom and runs its suite in each configuration it is checked in
+# before a release: GCC and Clang, Debug and Release, the portable sleep
+# instead of the futex, and the address, undefined-behaviour and thread
+# sanitizers. A last job builds loom as an engine embeds it, without
+# exceptions and without the suite.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: gcc release,          cxx: g++,     type: Release }
+          - { name: gcc debug,            cxx: g++,     type: Debug }
+          - { name: gcc release no-futex, cxx: g++,     type: Release,        flags: -DLOOM_NO_FUTEX=ON }
+          - { name: clang release,        cxx: clang++, type: Release }
+          - { name: address sanitizer,    cxx: g++,     type: RelWithDebInfo, flags: -DLOOM_SANITIZE=address }
+          - { name: ub sanitizer,         cxx: g++,     type: RelWithDebInfo, flags: -DLOOM_SANITIZE=undefined }
+          - { name: thread sanitizer,     cxx: g++,     type: RelWithDebInfo, flags: -DLOOM_SANITIZE=thread }
+          - { name: thread sanitizer no-futex, cxx: g++, type: RelWithDebInfo, flags: -DLOOM_SANITIZE=thread -DLOOM_NO_FUTEX=ON }
+    steps:
+      - uses: actions/checkout@v4
+
+      # The sanitizers' shadow memory does not fit beside the runner's
+      # default address randomisation.
+      - name: Reduce address randomisation
+        if: contains(matrix.flags, 'LOOM_SANITIZE')
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: |
+          ${{ matrix.cxx }} --version
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.type }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} ${{ matrix.flags }}
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Test
+        env:
+          TSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/tsan.supp
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: timeout 20m build/loom_tests
+
+  embedded:
+    name: embedded, no exceptions
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build loom without exceptions or the suite
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLOOM_BUILD_TESTS=OFF -DCMAKE_CXX_FLAGS=-fno-exceptions
+          cmake --build build -j "$(nproc)"
+
+      # The test hooks belong to loom's own test build only.
+      - name: Check the library has no test hooks
+        run: |
+          if nm -C build/libloom.a | grep -q SetTestHook; then
+            echo "libloom.a built without the suite still has test hooks"
+            exit 1
+          fi
+
+      - name: Build and run the no-exceptions checks
+        run: |
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -fno-exceptions -Iinclude \
+            tests/no_exceptions.cpp build/libloom.a -pthread -o build/no_exceptions
+          build/no_exceptions
