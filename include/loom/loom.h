@@ -27,9 +27,12 @@
 // counters that lock only on their final signal; docs/design.md has the
 // details. Shutdown is drain-or-assert: abandoned queued tasks are a bug.
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <exception>
+#include <functional>
+#include <iterator>
 #include <memory>
 #include <new>
 #include <optional>
@@ -782,6 +785,342 @@ T ParallelReduce(size_t begin, size_t end, size_t chunkSize, T identity, Map&& m
 	for (T& partial : partials)
 		result = combine(std::move(result), std::move(partial));
 	return result;
+}
+
+int WorkerCount(); // see Introspection below
+
+// ---- ParallelInclusiveScan / ParallelExclusiveScan ---------------------------
+// Prefix "sums" over [first, last) into `out` (which may be `first` itself):
+// inclusive, out[i] = init op in[0] op ... op in[i]; exclusive, out[i] = init
+// op in[0] op ... op in[i-1], so out[0] = init. Like std::inclusive_scan and
+// std::exclusive_scan with an initial value: `op` must be associative, and
+// it is applied in a different grouping than a serial loop. The grouping
+// depends only on the length, never on the worker count or timing, so the
+// same inputs give the same bits (a floating-point sum included). Chunks of
+// about 256 KB go in rounds: each chunk of a round is reduced, the totals
+// are combined on the calling thread, then each chunk is scanned from its
+// offset while the round is still in the cache. A range of under two chunks
+// is scanned serially. Exceptions propagate as in ParallelFor.
+namespace detail {
+template <bool Inclusive, typename InIt, typename OutIt, typename T, typename Op>
+void ParallelScan(InIt first, InIt last, OutIt out, T init, Op& op)
+{
+	const size_t n = (size_t)std::distance(first, last);
+	if (n == 0)
+		return;
+	auto scanRange = [&](size_t b, size_t e, T acc) {
+		for (size_t i = b; i < e; i++)
+		{
+			if constexpr (Inclusive)
+			{
+				acc = op(std::move(acc), first[i]);
+				out[i] = acc;
+			}
+			else
+			{
+				T value = first[i]; // read before the write: out may be first
+				out[i] = acc;
+				acc = op(std::move(acc), std::move(value));
+			}
+		}
+	};
+	// Chunks of about 256 KB of input, fixed by the length alone.
+	using V = std::iter_value_t<InIt>;
+	const size_t chunkSize = std::max<size_t>(1024, (256u << 10) / std::max<size_t>(1, sizeof(V)));
+	if (n < 2 * chunkSize)
+	{
+		scanRange(0, n, std::move(init));
+		return;
+	}
+	const size_t chunks = (n - 1) / chunkSize + 1;
+	// A round of chunks is reduced, then scanned while it is still in the
+	// shared cache, so the input comes from memory about once, not twice.
+	const size_t round = std::min<size_t>(32, 2 * ((size_t)std::max(1, WorkerCount()) + 1));
+	std::vector<std::optional<T>> totals(round);
+	std::optional<T> offset;
+	offset.emplace(std::move(init));
+	for (size_t c0 = 0; c0 < chunks; c0 += round)
+	{
+		const size_t c1 = std::min(chunks, c0 + round);
+		const size_t b0 = c0 * chunkSize, b1 = std::min(n, c1 * chunkSize);
+		ParallelFor(b0, b1, chunkSize, [&](size_t b, size_t e) {
+			T acc = first[b];
+			for (size_t i = b + 1; i < e; i++)
+				acc = op(std::move(acc), first[i]);
+			totals[b / chunkSize - c0].emplace(std::move(acc));
+		});
+		std::vector<std::optional<T>> offsets(c1 - c0);
+		for (size_t c = c0; c < c1; c++)
+		{
+			offsets[c - c0].emplace(*offset);
+			offset.emplace(op(std::move(*offset), std::move(*totals[c - c0])));
+		}
+		ParallelFor(b0, b1, chunkSize, [&](size_t b, size_t e) {
+			scanRange(b, e, std::move(*offsets[b / chunkSize - c0]));
+		});
+	}
+}
+} // namespace detail
+
+template <typename InIt, typename OutIt, typename T, typename Op = std::plus<>>
+	requires std::random_access_iterator<InIt> && std::random_access_iterator<OutIt>
+void ParallelInclusiveScan(InIt first, InIt last, OutIt out, T init, Op op = {})
+{
+	detail::ParallelScan<true>(first, last, out, std::move(init), op);
+}
+
+template <typename InIt, typename OutIt, typename T, typename Op = std::plus<>>
+	requires std::random_access_iterator<InIt> && std::random_access_iterator<OutIt>
+void ParallelExclusiveScan(InIt first, InIt last, OutIt out, T init, Op op = {})
+{
+	detail::ParallelScan<false>(first, last, out, std::move(init), op);
+}
+
+// ---- ParallelSort ---------------------------------------------------------------
+// Sorts [first, last) with comp (std::less by default), like std::sort: not
+// stable, elements only moved and swapped. A range of 128K elements or more
+// (whose moves cannot throw) is first moved into buckets between sampled
+// splitters, in parallel, through a buffer of the same size. Each bucket, or
+// a smaller range, is then a parallel quicksort: each piece is split three
+// ways around a median-of-three pivot (less, equal, greater, so many equal
+// keys stay fast), the larger outer part handed to a new task and the
+// smaller split on, and a small piece goes to std::sort. Too deep a split
+// falls back to std::sort for that piece, so a bad input cannot go
+// quadratic. Every split depends only on the data and the length, never on
+// the worker count or timing: the same input sorts to the same order.
+//
+// The pieces never wait for each other: they count the elements they finish
+// down on one counter, which only the caller waits for (helping), so a sort
+// inside a task is fine and holds one counter however large it is. If comp
+// throws, the remaining pieces stop and ParallelSort rethrows the first
+// exception once they have. As after std::sort (which sorts the small
+// pieces), the range then holds valid elements in no particular order: a
+// throw inside std::sort can leave one value copied over another. Nothing
+// is leaked or destroyed twice. Ranges of 2^31 elements or more are sorted
+// by std::sort.
+namespace detail {
+
+template <typename Comp>
+struct SortJob
+{
+	Comp*             comp = nullptr;
+	CounterHandle     done = kInvalidCounter; // elements not yet in their final place
+	size_t            leaf = 0;
+	std::atomic<bool> failed{ false };
+#if defined(__cpp_exceptions)
+	std::atomic<bool>  errorTaken{ false }; // the first failing piece stores `error`
+	std::exception_ptr error;               // read once `done` is zero
+#endif
+};
+
+template <typename It, typename Comp>
+void SortTask(SortJob<Comp>& job, It first, It last, int depth)
+{
+	Comp& comp = *job.comp;
+#if defined(__cpp_exceptions)
+	try
+	{
+#endif
+		for (;;)
+		{
+			const size_t n = (size_t)(last - first);
+			if (n <= job.leaf || depth <= 0 || job.failed.load(std::memory_order_relaxed))
+			{
+				if (!job.failed.load(std::memory_order_relaxed))
+					std::sort(first, last, comp);
+				first = last; // nothing left of this piece, should Signal be what throws
+				Signal(job.done, (int)n);
+				return;
+			}
+			depth--;
+			// The median of the first, middle and last element, moved to the front.
+			It a = first, b = first + (std::ptrdiff_t)(n / 2), c = last - 1;
+			if (comp(*b, *a)) std::swap(a, b);
+			if (comp(*c, *b)) { std::swap(b, c); if (comp(*b, *a)) std::swap(a, b); }
+			std::iter_swap(first, b);
+			const auto& pivot = *first; // not moved: the partitions below start after it
+			const It lessEnd = std::partition(first + 1, last, [&](const auto& x) { return comp(x, pivot); });
+			const It equalEnd = std::partition(lessEnd, last, [&](const auto& x) { return !comp(pivot, x); });
+			std::iter_swap(first, lessEnd - 1); // the pivot joins the equal ones
+			const It lessLast = lessEnd - 1;
+			// [first, lessLast) < pivot <= [lessLast, equalEnd) <= pivot < [equalEnd, last)
+			const bool lessLarger = (lessLast - first) >= (last - equalEnd);
+			const It bigFirst = lessLarger ? first : equalEnd, bigLast = lessLarger ? lessLast : last;
+			const It smallFirst = lessLarger ? equalEnd : first, smallLast = lessLarger ? last : lessLast;
+			if (bigLast - bigFirst > 0)
+				Submit([&job, bigFirst, bigLast, depth] { SortTask(job, bigFirst, bigLast, depth); });
+			// The equal run is in place; the smaller part is split on here, so
+			// this loop at least halves its piece each time.
+			const int placed = (int)(equalEnd - lessLast);
+			first = smallFirst;
+			last = smallLast;
+			if (last - first == 0)
+			{
+				Signal(job.done, placed); // may be the last: the job may be gone after it
+				return;
+			}
+			Signal(job.done, placed); // not the last: this piece's elements are still counted
+		}
+#if defined(__cpp_exceptions)
+	}
+	catch (...)
+	{
+		if (!job.errorTaken.exchange(true, std::memory_order_acq_rel))
+			job.error = std::current_exception();
+		job.failed.store(true, std::memory_order_relaxed);
+		if (last - first > 0)
+			Signal(job.done, (int)(last - first)); // this piece's elements, never to be placed now
+	}
+#endif
+}
+
+// Sorts the pieces [bounds[k], bounds[k+1]) of [first, ...) in parallel and waits.
+template <typename It, typename Comp>
+void SortPieces(It first, const size_t* bounds, size_t pieces, Comp& comp, int depth, size_t leaf)
+{
+	const size_t n = bounds[pieces] - bounds[0];
+	if (n == 0)
+		return;
+	SortJob<Comp> job;
+	job.comp = &comp;
+	job.leaf = leaf;
+	ScopedCounter done((int)n);
+	job.done = done.Get();
+	for (size_t k = 0; k < pieces; k++)
+	{
+		const It b = first + (std::ptrdiff_t)bounds[k], e = first + (std::ptrdiff_t)bounds[k + 1];
+		if (e - b > 0)
+			Submit([&job, b, e, depth] { SortTask(job, b, e, depth); });
+	}
+	WaitFor(done);
+#if defined(__cpp_exceptions)
+	if (job.error)
+		std::rethrow_exception(job.error);
+#endif
+}
+
+// A sample sort, for a large range: the elements are moved into buckets
+// between splitters picked from fixed positions, the buckets are sorted in
+// the buffer as quicksort pieces (so a bucket of many equal keys is still
+// fast), and everything is moved back. The comparisons run only while
+// counting and sorting, never while elements are moved, so when comp throws
+// every element is in the range or the buffer, and the buffer is moved back
+// and destroyed.
+template <typename It, typename Comp>
+void SampleSort(It first, size_t n, Comp& comp, int depth, size_t leaf)
+{
+	using T = std::iter_value_t<It>;
+	const size_t buckets = std::clamp<size_t>(n / 16384, 2, 1024);
+	constexpr size_t kOversample = 8;
+	// Splitters by position, sorted by the elements they point at: no copies.
+	std::vector<size_t> sample(buckets * kOversample);
+	for (size_t k = 0; k < sample.size(); k++)
+		sample[k] = (k * n + n / 2) / sample.size();
+	std::sort(sample.begin(), sample.end(), [&](size_t a, size_t b) { return comp(first[a], first[b]); });
+	std::vector<size_t> splitters(buckets - 1);
+	for (size_t b = 0; b + 1 < buckets; b++)
+		splitters[b] = sample[(b + 1) * kOversample];
+	// An element goes after every splitter it is not less than.
+	auto bucketOf = [&](const T& x) {
+		size_t lo = 0, hi = splitters.size();
+		while (lo < hi)
+		{
+			const size_t mid = (lo + hi) / 2;
+			if (comp(x, first[splitters[mid]]))
+				hi = mid;
+			else
+				lo = mid + 1;
+		}
+		return lo;
+	};
+	const size_t chunkSize = std::max<size_t>(8192, (n - 1) / 256 + 1);
+	const size_t chunks = (n - 1) / chunkSize + 1;
+	std::vector<uint16_t> ids(n);
+	std::vector<size_t> counts(chunks * buckets, 0); // chunk-major
+	ParallelFor(0, n, chunkSize, [&](size_t b, size_t e) {
+		size_t* mine = &counts[(b / chunkSize) * buckets];
+		for (size_t i = b; i < e; i++)
+		{
+			const size_t k = bucketOf(first[i]);
+			ids[i] = (uint16_t)k;
+			mine[k]++;
+		}
+	});
+	// Each chunk's place in each bucket: buckets in order, chunks in order.
+	std::vector<size_t> bounds(buckets + 1, 0);
+	{
+		size_t at = 0;
+		for (size_t k = 0; k < buckets; k++)
+		{
+			bounds[k] = at;
+			for (size_t c = 0; c < chunks; c++)
+			{
+				const size_t count = counts[c * buckets + k];
+				counts[c * buckets + k] = at;
+				at += count;
+			}
+		}
+		bounds[buckets] = at;
+	}
+	struct Free { void operator()(T* p) const { ::operator delete(static_cast<void*>(p), std::align_val_t(alignof(T))); } };
+	std::unique_ptr<T, Free> buffer(static_cast<T*>(::operator new(n * sizeof(T), std::align_val_t(alignof(T)))));
+	T* const buf = buffer.get();
+	ParallelFor(0, n, chunkSize, [&](size_t b, size_t e) {
+		size_t* place = &counts[(b / chunkSize) * buckets];
+		for (size_t i = b; i < e; i++)
+			::new (static_cast<void*>(buf + place[ids[i]]++)) T(std::move(first[i]));
+	});
+	auto moveBack = [&] {
+		ParallelFor(0, n, chunkSize, [&](size_t b, size_t e) {
+			for (size_t i = b; i < e; i++)
+			{
+				first[i] = std::move(buf[i]);
+				buf[i].~T();
+			}
+		});
+	};
+#if defined(__cpp_exceptions)
+	try
+	{
+		SortPieces(buf, bounds.data(), buckets, comp, depth, leaf);
+	}
+	catch (...)
+	{
+		moveBack(); // every buffered element back in the range, the buffer destroyed
+		throw;
+	}
+#else
+	SortPieces(buf, bounds.data(), buckets, comp, depth, leaf);
+#endif
+	moveBack();
+}
+} // namespace detail
+
+template <typename It, typename Comp = std::less<>>
+	requires std::random_access_iterator<It>
+void ParallelSort(It first, It last, Comp comp = {})
+{
+	const size_t n = (size_t)(last - first);
+	const size_t leaf = std::max<size_t>(2048, n / 512); // from the length alone: the order never depends on the pool
+	if (n <= leaf || n >= (size_t)INT32_MAX)
+	{
+		std::sort(first, last, comp);
+		return;
+	}
+	int depth = 0;
+	for (size_t k = n; k > 1; k >>= 1)
+		depth += 2; // twice log2(n), as introsort allows
+	// A large range is split into buckets in parallel first: the first
+	// partitions of a quicksort would run on one thread.
+	using T = std::iter_value_t<It>;
+	if constexpr (std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_assignable_v<T>)
+		if (n >= (size_t(1) << 17))
+		{
+			detail::SampleSort(first, n, comp, depth, leaf);
+			return;
+		}
+	const size_t bounds[2] = { 0, n };
+	detail::SortPieces(first, bounds, 1, comp, depth, leaf);
 }
 
 // ---- Task graphs ------------------------------------------------------------

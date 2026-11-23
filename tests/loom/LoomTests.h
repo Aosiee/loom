@@ -19,6 +19,7 @@
 #include <random>
 #include <set>
 #include <cstring>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -1427,6 +1428,8 @@ namespace {
 		Tracked() { live++; }
 		Tracked(const Tracked&) { live++; }
 		Tracked(Tracked&&) noexcept { live++; }
+		Tracked& operator=(const Tracked&) = default; // assigning makes no new object
+		Tracked& operator=(Tracked&&) noexcept = default;
 		~Tracked() { live--; }
 	};
 }
@@ -2466,6 +2469,166 @@ TEST_CASE("loom: per-thread storage — move-only, over-aligned, threads outside
 		}
 		CHECK(Tracked::live.load() == 0); // destroyed with the PerThread
 	}
+}
+
+TEST_CASE("loom: ParallelInclusiveScan / ParallelExclusiveScan — match std, in place, reproducible")
+{
+	for (int workers : { 0, 1, -1 })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		for (size_t n : { size_t(0), size_t(1), size_t(100), size_t(8191), size_t(8192), size_t(100000), size_t(1000003) })
+		{
+			std::vector<int64_t> in(n);
+			for (size_t i = 0; i < n; i++)
+				in[i] = (int64_t)((i * 2654435761u) % 1000) - 500;
+			std::vector<int64_t> want(n), got(n, -1);
+			std::inclusive_scan(in.begin(), in.end(), want.begin(), std::plus<>{}, int64_t(7));
+			loom::ParallelInclusiveScan(in.begin(), in.end(), got.begin(), int64_t(7));
+			CHECK(got == want);
+			std::exclusive_scan(in.begin(), in.end(), want.begin(), int64_t(7));
+			loom::ParallelExclusiveScan(in.begin(), in.end(), got.begin(), int64_t(7));
+			CHECK(got == want);
+			std::vector<int64_t> inPlace = in; // out == first
+			loom::ParallelExclusiveScan(inPlace.begin(), inPlace.end(), inPlace.begin(), int64_t(7));
+			CHECK(inPlace == want);
+		}
+		// Associative but not commutative: composing affine maps x -> a*x + b (mod a prime).
+		struct Affine { uint64_t a = 1, b = 0; bool operator==(const Affine&) const = default; };
+		auto compose = [](Affine f, Affine g) { // f, then g
+			constexpr uint64_t p = 1000000007;
+			return Affine{ g.a * f.a % p, (g.a * f.b + g.b) % p };
+		};
+		std::vector<Affine> maps(300000);
+		for (size_t i = 0; i < maps.size(); i++)
+			maps[i] = Affine{ 1 + i % 13, i % 17 };
+		std::vector<Affine> want(maps.size()), got(maps.size());
+		std::inclusive_scan(maps.begin(), maps.end(), want.begin(), compose, Affine{});
+		loom::ParallelInclusiveScan(maps.begin(), maps.end(), got.begin(), Affine{}, compose);
+		CHECK(got == want);
+	}
+	// Floating point: the same bits whatever the pool.
+	std::vector<double> in(500000);
+	for (size_t i = 0; i < in.size(); i++)
+		in[i] = 1.0 / (double)(i + 1) * ((i % 3) ? 1.0 : -1e-3);
+	std::vector<std::vector<double>> results;
+	for (int workers : { 0, 1, 3, -1 })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		std::vector<double> out(in.size());
+		loom::ParallelInclusiveScan(in.begin(), in.end(), out.begin(), 0.0);
+		results.push_back(std::move(out));
+	}
+	for (size_t r = 1; r < results.size(); r++)
+		CHECK(std::memcmp(results[r].data(), results[0].data(), in.size() * sizeof(double)) == 0);
+#if defined(__cpp_exceptions)
+	{
+		loom::Pool pool(loom::LoomConfig{});
+		std::vector<int> v(200000, 1);
+		v[150000] = -1;
+		std::vector<int> out(v.size());
+		auto checked = [](int acc, int x) { if (x < 0) throw std::runtime_error("bad value"); return acc + x; };
+		CHECK_THROWS_AS(loom::ParallelInclusiveScan(v.begin(), v.end(), out.begin(), 0, checked), std::runtime_error);
+	}
+#endif
+}
+
+TEST_CASE("loom: ParallelSort — matches std::sort on awkward inputs, any pool, same order every time")
+{
+	auto shapes = [](size_t n) {
+		std::vector<std::vector<int>> inputs;
+		std::vector<int> random(n), sorted(n), reversed(n), equal(n, 42), few(n), organ(n);
+		uint32_t x = 2463534242u;
+		for (size_t i = 0; i < n; i++)
+		{
+			x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+			random[i] = (int)(x % 1000000);
+			sorted[i] = (int)i;
+			reversed[i] = (int)(n - i);
+			few[i] = (int)(x % 4);
+			organ[i] = (int)(i < n / 2 ? i : n - i);
+		}
+		for (auto* v : { &random, &sorted, &reversed, &equal, &few, &organ })
+			inputs.push_back(*v);
+		return inputs;
+	};
+	for (int workers : { 0, 1, -1 })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		for (size_t n : { size_t(0), size_t(1), size_t(2), size_t(2047), size_t(2049), size_t(100000), size_t(1000000) })
+			for (std::vector<int>& v : shapes(n))
+			{
+				std::vector<int> want = v;
+				std::sort(want.begin(), want.end());
+				loom::ParallelSort(v.begin(), v.end());
+				CHECK(v == want);
+			}
+		std::vector<int> down = shapes(300000)[0];
+		std::vector<int> want = down;
+		std::sort(want.begin(), want.end(), std::greater<>{});
+		loom::ParallelSort(down.begin(), down.end(), std::greater<>{});
+		CHECK(down == want);
+
+		// Move-only elements, and strings.
+		std::vector<std::unique_ptr<int>> owned;
+		for (int i = 0; i < 50000; i++)
+			owned.push_back(std::make_unique<int>((i * 7919) % 50000));
+		loom::ParallelSort(owned.begin(), owned.end(), [](const auto& a, const auto& b) { return *a < *b; });
+		bool inOrder = true;
+		for (size_t i = 0; i < owned.size(); i++)
+			inOrder = inOrder && *owned[i] == (int)i;
+		CHECK(inOrder);
+		std::vector<std::string> words;
+		for (int i = 0; i < 40000; i++)
+			words.push_back(std::to_string((int64_t)i * 104729 % 40000));
+		std::vector<std::string> wantWords = words;
+		std::sort(wantWords.begin(), wantWords.end());
+		loom::ParallelSort(words.begin(), words.end());
+		CHECK(words == wantWords);
+	}
+	// Not stable, but the same order of equal keys whatever the pool: sort by
+	// key alone and compare where each original index ended up.
+	std::vector<std::vector<std::pair<int, int>>> orders;
+	for (int workers : { 0, 1, 3, -1 })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		std::vector<std::pair<int, int>> v(400000);
+		for (int i = 0; i < (int)v.size(); i++)
+			v[(size_t)i] = { (i * 31) % 97, i };
+		loom::ParallelSort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+		orders.push_back(std::move(v));
+	}
+	for (size_t r = 1; r < orders.size(); r++)
+		CHECK(orders[r] == orders[0]);
+#if defined(__cpp_exceptions)
+	{
+		loom::Pool pool(loom::LoomConfig{});
+		// Failing while counting into buckets, while sorting a bucket, and in a
+		// range too small for buckets. As after std::sort the order is then
+		// unspecified, but every element is still one live object: none leaked
+		// from the buffer, none destroyed twice.
+		struct Keyed { int key = 0; Tracked tracked; };
+		for (auto [n, failAt] : { std::pair<size_t, int>{ 400000, 100000 }, { 400000, 3000000 }, { 100000, 500000 } })
+		{
+			const int liveBefore = Tracked::live.load();
+			{
+				const std::vector<int> keys = shapes(n)[0];
+				std::vector<Keyed> v(n);
+				for (size_t i = 0; i < n; i++)
+					v[i].key = keys[i];
+				std::atomic<int> calls{ 0 };
+				auto failing = [&](const Keyed& a, const Keyed& b) {
+					if (++calls == failAt)
+						throw std::runtime_error("comparison failed");
+					return a.key < b.key;
+				};
+				CHECK_THROWS_AS(loom::ParallelSort(v.begin(), v.end(), failing), std::runtime_error);
+				CHECK(v.size() == n);
+				CHECK(Tracked::live.load() == liveBefore + (int)n);
+			}
+			CHECK(Tracked::live.load() == liveBefore);
+		}
+	}
+#endif
 }
 
 TEST_CASE("loom: futures — values, void, move-only results and repeated Get, any pool")

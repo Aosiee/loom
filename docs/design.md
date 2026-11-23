@@ -335,6 +335,43 @@ the chunk size, if given), keeps one partial per chunk, and folds the
 partials in index order on the calling thread. Nothing about the result
 depends on timing or the number of workers.
 
+### Scans
+
+A scan reduces each chunk, combines the chunk totals into offsets on the
+calling thread, and scans each chunk from its offset. Chunks are about
+256 KB of input, fixed by the length, so the grouping, and with it every
+bit of the result, never depends on the pool. They go in rounds of up to 32
+chunks, reduced and then scanned while the round is still in the shared
+cache, so the input comes from memory about once. A scan of an array that
+does not fit in the cache is bound by memory bandwidth, and in loom_bench
+it is no faster than `std::inclusive_scan`; one that fits gains with the
+workers.
+
+### Sorting
+
+`ParallelSort` on 128K elements or more (whose moves cannot throw) starts as
+a sample sort. Splitters are elements at fixed positions, sorted by index
+so nothing is copied. A parallel pass counts each chunk's elements per
+bucket, keeping each element's bucket in a 16-bit id. The counts give each
+chunk its place in each bucket, and a second pass moves the elements into
+a buffer of the same size. The comparator runs only while counting and
+sorting, so if it throws, every element is in the range or in the buffer,
+and the buffer is moved back. As after `std::sort`, which sorts the small
+pieces, the range is then valid but in no particular order.
+
+Each bucket, or a smaller range as a whole, is then sorted as quicksort
+pieces. A piece is split three ways around a median-of-three pivot; the
+larger outer part becomes a new task and the smaller is split on in the same
+loop. The pieces never wait for each other. As with `ParallelFor`,
+completion is counted in elements: one counter starts at the length, each
+split signals its run of pivot-equal elements, and each small piece signals
+its length once `std::sort` has placed it. Only the caller waits, so a sort
+holds one counter and no nested waits however large it is. A piece whose
+comparator throws records the error and still signals its elements, so the
+count reaches zero and the sort rethrows. Leaf size, buckets and splits
+depend on the data and the length only, so the order of equal keys is the
+same whatever the pool.
+
 ### Per-thread storage
 
 `PerThread<T>` is two levels of cells indexed by `CurrentThreadIndex`, a
