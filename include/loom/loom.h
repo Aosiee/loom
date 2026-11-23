@@ -45,13 +45,17 @@
 namespace loom {
 
 using TaskFn = void (*)(void* userData);
-using DedicatedId = uint32_t;
-using CounterHandle = uint32_t;
-using LimiterHandle = uint32_t;
 
-inline constexpr DedicatedId kInvalidDedicated = ~0u;
-inline constexpr CounterHandle kInvalidCounter = ~0u;
-inline constexpr LimiterHandle kInvalidLimiter = ~0u;
+// Handles are distinct types, so one kind cannot be passed where another is
+// expected (a limiter to WaitFor, say). Each holds 32 bits, compares with ==
+// and !=, and converts to and from uint32_t only with a cast.
+enum class CounterHandle : uint32_t {};
+enum class LimiterHandle : uint32_t {};
+enum class DedicatedId : uint32_t {};
+
+inline constexpr DedicatedId   kInvalidDedicated{ ~0u };
+inline constexpr CounterHandle kInvalidCounter{ ~0u };
+inline constexpr LimiterHandle kInvalidLimiter{ ~0u };
 
 enum class Affinity : uint8_t
 {
@@ -82,13 +86,14 @@ struct TaskDesc
 	TaskFn        fn       = nullptr;
 	void*         userData = nullptr;   // caller-owned until completion
 	Affinity      affinity = Affinity::AnyWorker;
-	DedicatedId   thread   = {};        // required iff Dedicated
+	DedicatedId   thread   = kInvalidDedicated; // required iff Dedicated
 	CounterHandle signals  = kInvalidCounter; // decremented by 1 on completion; receives the task's exception
 	CounterHandle waitsFor = kInvalidCounter; // runnable when it hits 0
 	// Profiler metadata, passed through to the zone hook untouched: an
-	// interned name id (0 = unnamed) and a window-slot tag.
-	uint32_t      nameId   = 0;
-	uint8_t       window   = 0;
+	// interned name id (0 = unnamed) and a tag of the host's choosing (the
+	// engine's window slot, say).
+	uint32_t      nameId      = 0;
+	uint8_t       profilerTag = 0;
 	// More counters to wait for: the task becomes runnable once waitsFor and
 	// every counter here have reached zero. Read only during Submit (the
 	// array need not outlive it); a counter may be listed more than once.
@@ -98,7 +103,7 @@ struct TaskDesc
 	LimiterHandle limiter  = kInvalidLimiter;
 };
 
-struct LoomConfig
+struct PoolConfig
 {
 	int      workerCount = -1;   // default max(1, hw_concurrency - 1)
 	uint32_t maxTasks    = 4096; // task-slot pool size, rounded up to 4096s (grows with a warning)
@@ -126,7 +131,7 @@ struct PoolState;
 class Pool
 {
 public:
-	explicit Pool(const LoomConfig& config = {});
+	explicit Pool(const PoolConfig& config = {});
 	~Pool(); // Shutdown(), then frees the state
 	Pool(const Pool&) = delete;
 	Pool& operator=(const Pool&) = delete;
@@ -136,7 +141,7 @@ public:
 	// which should be the main thread), and every WaitFor completes. Then
 	// joins the workers and dedicated threads and uninstalls the pool.
 	// Drain-or-assert: tasks that could never run, held lanes and live tasks
-	// assert (see LoomConfig::shutdownTimeoutMs).
+	// assert (see PoolConfig::shutdownTimeoutMs).
 	void Shutdown();
 
 private:
@@ -219,7 +224,7 @@ bool           AddToCounter(CounterHandle, int n = 1);
 // other threads (a worker applies its finished tasks' signals to a counter in
 // one go, at the latest when it runs out of work at hand or runs a task of
 // another counter); it never runs ahead, and WaitFor is never delayed by it.
-int            Load(CounterHandle);
+int            Count(CounterHandle);
 // Returns when the count reaches zero. If a task that signals this counter
 // threw, WaitFor then rethrows the first such exception (every WaitFor on the
 // counter does, until it is destroyed); the throw cancelled the counter, so
@@ -277,20 +282,20 @@ private:
 // every unit held, that task never becomes runnable. Limited tasks may be of
 // any affinity, may be TaskGraph nodes, and are skipped by Cancel as usual
 // (a skipped or throwing task gives its unit back too).
-LimiterHandle CreateLimiter(uint32_t limit); // limit >= 1; LoomConfig::maxLimiters at once
+LimiterHandle CreateLimiter(uint32_t limit); // limit >= 1; PoolConfig::maxLimiters at once
 void          DestroyLimiter(LimiterHandle); // asserts none of its tasks is live
 // The units held right now (tasks queued or running), and the tasks waiting
 // for one. Snapshots for tests and debug views.
-uint32_t      LimiterHeld(LimiterHandle);
-uint32_t      LimiterWaiting(LimiterHandle);
+uint32_t      HeldUnits(LimiterHandle);
+uint32_t      WaitingTasks(LimiterHandle);
 
 // Changes the limit while tasks use the limiter, from any thread. Raising it
 // starts waiting tasks at once. Lowering it never stops a task: free units go
 // at once, held ones as their tasks finish, and no task takes a unit until
-// fewer than the new limit are held. LimiterHeld can exceed the limit
+// fewer than the new limit are held. HeldUnits can exceed the limit
 // meanwhile.
-void          SetLimiterLimit(LimiterHandle, uint32_t limit); // limit >= 1
-uint32_t      LimiterLimit(LimiterHandle);
+void          SetLimit(LimiterHandle, uint32_t limit); // limit >= 1
+uint32_t      Limit(LimiterHandle);
 
 // Which of its limiter's units the running task holds: an index in
 // [0, limit), the same for the whole run and different from every other task
@@ -302,7 +307,7 @@ uint32_t      LimiterLimit(LimiterHandle);
 // or above it (until enough tasks have finished); size buffers for the
 // highest limit used. A future's task has none once its value is ready.
 inline constexpr uint32_t kNoUnit = ~0u;
-uint32_t      LimiterUnit();
+uint32_t      CurrentLimiterUnit();
 
 // RAII wrapper over a limiter handle: destroys on scope exit; non-copyable.
 class ScopedLimiter
@@ -356,7 +361,7 @@ private:
 // continuation reading it have all let go. Dropping a future before its
 // value is there is fine: the task still runs. A future's task always runs:
 // it ignores Cancel. Each pending future holds one counter
-// (LoomConfig::maxCounters), and like a counter it must not outlive the pool.
+// (PoolConfig::maxCounters), and like a counter it must not outlive the pool.
 //
 // The TaskDesc of Async and Then gives the task's affinity, thread,
 // priority, limiter, waitsForAll and profiler fields; fn, userData and
@@ -521,9 +526,9 @@ public:
 	Future(const Future&) = delete;
 	Future& operator=(const Future&) = delete;
 
-	bool Valid() const { return m_State != nullptr; }
+	bool IsValid() const { return m_State != nullptr; }
 	// True once the value (or the error) is there; never waits.
-	bool Ready() const { return Load(m_State->counter) == 0; }
+	bool IsReady() const { return Count(m_State->counter) == 0; }
 	// Waits for the value; Get calls it. Rethrows nothing: Get does.
 	void Wait(Help help = Help::WhileWaiting) const { WaitFor(m_State->counter, help); }
 	// Wait with a time limit: true once ready, false if `timeoutMs` passed first.
@@ -566,7 +571,7 @@ public:
 	}
 	// Zero once ready: for a task's waitsFor. Valid while the future lives.
 	CounterHandle Counter() const { return m_State ? m_State->counter : kInvalidCounter; }
-	// Drops the future (Valid() is then false); its task, if still to come,
+	// Drops the future (IsValid() is then false); its task, if still to come,
 	// runs anyway.
 	void Reset() noexcept
 	{
@@ -1269,10 +1274,10 @@ private:
 // no `signals`, a node that throws ends the program, as a task does.)
 //
 // A node takes the fn, userData, affinity, thread, priority, limiter, nameId
-// and window of its TaskDesc; its counters come from the graph, so `signals` and
-// the waits must be unset. One run at a time per graph (a frame that overlaps
-// the next one uses two graphs), and the graph must not change or be
-// destroyed while it runs.
+// and profilerTag of its TaskDesc; its counters come from the graph, so
+// `signals` and the waits must be unset. One run at a time per graph (a frame
+// that overlaps the next one uses two graphs), and the graph must not change
+// or be destroyed while it runs.
 namespace detail { struct GraphState; }
 
 class TaskGraph
@@ -1300,7 +1305,7 @@ public:
 	size_t NodeCount() const;
 	// True from Submit until the last node has finished (just before the
 	// run's counter is signalled).
-	bool Running() const;
+	bool IsRunning() const;
 	// False when the order has a cycle; Submit asserts there is none. A graph
 	// is checked once per change, here or on its next Submit.
 	bool Validate();
@@ -1331,8 +1336,8 @@ void Run(TaskGraph& graph, Help help = Help::WhileWaiting);
 // A lane is a long-lived worker reserved for ONE owner (e.g. a simulation
 // tick) — implemented as a dedicated thread that never steals. Shutdown
 // joins lanes like every dedicated thread and asserts none are still held.
-using LaneId = uint32_t;
-inline constexpr LaneId kInvalidLane = ~0u;
+using LaneId = DedicatedId; // a lane's tasks name it in TaskDesc::thread
+inline constexpr LaneId kInvalidLane = kInvalidDedicated;
 
 LaneId AcquireLane(const char* name);
 void   ReleaseLane(LaneId lane);
@@ -1491,7 +1496,7 @@ struct ThreadStats
 	const char* name = "";     // owned by the pool, valid until Shutdown
 	std::atomic<ThreadState> state{ ThreadState::Idle };
 	std::atomic<uint64_t> tasksRun{ 0 };  // every task this thread ran
-	std::atomic<uint64_t> helpedRun{ 0 }; // the ones it ran while waiting (state Helping)
+	std::atomic<uint64_t> tasksHelped{ 0 }; // the ones it ran while waiting (state Helping)
 	int         queueDepth = 0; // snapshot of the owned queue (0 = shared pool)
 };
 
@@ -1502,26 +1507,26 @@ struct ThreadStatsView
 	std::string name;
 	ThreadState state = ThreadState::Idle;
 	uint64_t    tasksRun = 0;
-	uint64_t    helpedRun = 0;
+	uint64_t    tasksHelped = 0;
 	int         queueDepth = 0;
 };
 
 struct PoolSnapshot
 {
 	std::vector<ThreadStatsView> threads; // pool workers + dedicated threads
-	int         anyQueueDepth = 0;     // the shared AnyWorker run queue
+	int         queueDepth = 0;        // the shared AnyWorker run queue
 	int         mainQueueDepth = 0;    // the main-affinity queue
 	int         liveTasks = 0;
 	int         pendingTasks = 0;
 	int         counterCount = 0;
 };
 
-PoolSnapshot SnapshotThreadStats();
+PoolSnapshot SnapshotPool();
 
 // ---- Debug dump ---------------------------------------------------------------
 // Why does a wait not return? CaptureDebugState records what every pool
 // thread (and the main thread) is running or waiting on, every live counter
-// with the tasks parked on it and the threads asleep on it, and every
+// with the tasks waiting for it and the threads asleep on it, and every
 // limiter with the tasks waiting for a unit. DebugDump formats that as text.
 //
 // Call it from any thread while the pool lives: a watchdog thread, after a
@@ -1551,8 +1556,8 @@ struct DebugThread
 	int         queueDepth = 0; // a dedicated thread's own queue
 	// The tasks this thread is inside: more than one when a wait inside a
 	// task ran another while helping. The innermost one's name and counter.
-	int           running = 0;
-	uint32_t      runningName = 0;
+	int           runningDepth = 0;
+	uint32_t      runningNameId = 0;
 	CounterHandle runningSignals = kInvalidCounter;
 	LimiterHandle runningLimiter = kInvalidLimiter; // the unit the innermost task holds
 	// The innermost WaitFor or TryWaitFor this thread is in, and for how long.
@@ -1566,10 +1571,10 @@ struct DebugCounter
 	int  count = 0;
 	bool cancelled = false;
 	bool failed = false;  // a task signalling it threw
-	bool busy = false;    // its lock was held throughout: parked and waiters unread
-	std::vector<DebugTask> parked; // tasks waiting for it to reach zero (the first 64)
-	int  parkedTotal = 0;
-	std::vector<int> waiters;      // thread indices asleep in a wait on it
+	bool busy = false;    // its lock was held throughout: waiting and sleepers unread
+	std::vector<DebugTask> waiting; // tasks waiting for it to reach zero (the first 64)
+	int  waitingTotal = 0;
+	std::vector<int> sleepers;      // thread indices asleep in a wait on it
 };
 
 struct DebugLimiter
@@ -1588,10 +1593,10 @@ struct DebugState
 	std::vector<DebugCounter> counters;
 	std::vector<DebugLimiter> limiters;
 	int liveTasks = 0;
-	int queued = 0;       // in the AnyWorker queues (every priority)
-	int queuedHigh = 0;
-	int queuedLow = 0;
-	int mainQueued = 0;   // waiting for the main thread to pump or wait
+	int queueDepth = 0;     // in the AnyWorker queues (every priority)
+	int highQueueDepth = 0;
+	int lowQueueDepth = 0;
+	int mainQueueDepth = 0; // waiting for the main thread to pump or wait
 	bool busy = false;    // some table could not be read at all
 };
 
@@ -1624,7 +1629,7 @@ void UnparkAll();
 using ParkWakeFn = void (*)(void* user);
 int  RegisterParkParticipant(ParkWakeFn wake, void* user);
 void UnregisterParkParticipant(int id);
-bool ParkRequested();
+bool IsParkRequested();
 void ParkPoint(const char* name);
 // Valid between a successful ParkAll and UnparkAll.
 std::vector<ParkedThread> ParkedThreads();
@@ -1636,7 +1641,7 @@ long CurrentOsThreadId();
 // ---- Introspection (tests / debug) -----------------------------------------
 // All four answer for the active pool (0/false with none).
 int  WorkerCount();
-bool IsInitialised();
+bool HasActivePool();
 // Tasks submitted and not yet finished. A task counts until its bookkeeping
 // is done, which can be a moment after the work it was waited for (an
 // automatically chunked ParallelFor counts items, not tasks).

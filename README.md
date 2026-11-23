@@ -67,7 +67,7 @@ loom::ScopedLimiter decoders(4);
 std::vector<StagingBuffer> staging(4);
 loom::ScopedCounter decoded((int)assets.size());
 for (Asset& a : assets)
-    loom::Submit([&] { Decode(a, staging[loom::LimiterUnit()]); },
+    loom::Submit([&] { Decode(a, staging[loom::CurrentLimiterUnit()]); },
                  { .signals = decoded, .priority = loom::Priority::Low, .limiter = decoders });
 loom::WaitFor(decoded);
 ```
@@ -136,6 +136,9 @@ counter and limiter is doing.
   skips a counter's tasks that have not started. `AddToCounter` raises a
   count that has not reached zero, so work that finds more work as it runs
   (a tree walk) needs one counter and one wait.
+- **Handles** (`CounterHandle`, `LimiterHandle`, `DedicatedId`) are each
+  their own type, so passing a limiter where a counter belongs does not
+  compile.
 - **Task graphs** (`TaskGraph`): a dependency graph declared once and run
   every frame, without rebuilding counters. A run acts as one task: it can
   wait on a counter, signals one when done, and reports exceptions and
@@ -148,8 +151,8 @@ counter and limiter is doing.
   future for a value that comes from outside loom, such as an IO callback.
 - **Limiters** (`CreateLimiter`): at most N tasks of a kind run at once, so
   background work (asset decompression, uploads) cannot take every worker;
-  a limit of 1 is a serial queue. `LimiterUnit()` tells a task which of the
-  N units it holds (one staging buffer each), and `SetLimiterLimit` changes
+  a limit of 1 is a serial queue. `CurrentLimiterUnit()` tells a task which
+  of the N units it holds (one staging buffer each), and `SetLimit` changes
   N while the work runs.
 - **Isolation** (`Isolated`): a wait inside an isolated region helps only
   with that region's tasks, so a frame-critical wait never picks up an
@@ -167,12 +170,12 @@ counter and limiter is doing.
   result per thread, made on first use, merged once the work is done.
 - **Parking** (`ParkAll` / `UnparkAll`) stops every pool thread at a known
   point with its stack recorded: the hook a live code reloader needs.
-- **Introspection**: `SnapshotThreadStats()` for a thread-pool view, and
+- **Introspection**: `SnapshotPool()` for a thread-pool view, and
   profiler hooks (`loom_profiler_shim.h`) for wait/help states and per-task
   zones.
 - **Debug dump** (`DebugDump`, `CaptureDebugState`): when a wait does not
   return, what each thread is running and waiting on, every live counter
-  with the tasks parked on it and who sleeps on it, and every limiter's
+  with the tasks waiting for it and who sleeps on it, and every limiter's
   waiting tasks, with hints for the common mistakes.
 
 The rules that keep this safe (no helping while holding a lock, no blocking

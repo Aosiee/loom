@@ -34,6 +34,16 @@
 namespace loom::detail { using TestHookFn = void (*)(int point); void SetTestHook(TestHookFn fn); }
 #endif
 
+// Each kind of handle is its own type: none converts to another, to an
+// integer or from one, so passing the wrong one does not compile.
+static_assert(!std::is_convertible_v<loom::LimiterHandle, loom::CounterHandle>);
+static_assert(!std::is_convertible_v<loom::CounterHandle, loom::LimiterHandle>);
+static_assert(!std::is_convertible_v<loom::DedicatedId, loom::CounterHandle>);
+static_assert(!std::is_convertible_v<loom::CounterHandle, loom::DedicatedId>);
+static_assert(!std::is_convertible_v<uint32_t, loom::CounterHandle>);
+static_assert(!std::is_convertible_v<loom::CounterHandle, uint32_t>);
+static_assert(std::is_same_v<loom::LaneId, loom::DedicatedId>); // a lane is a dedicated thread
+
 namespace loom { namespace tests {
 
 namespace {
@@ -41,7 +51,7 @@ namespace {
 void SpinUntil(int target, CounterHandle c, int timeoutMs)
 {
 	auto start = std::chrono::steady_clock::now();
-	while (loom::Load(c) != target)
+	while (loom::Count(c) != target)
 	{
 		if (std::chrono::duration_cast<std::chrono::milliseconds>(
 			std::chrono::steady_clock::now() - start).count() > timeoutMs)
@@ -71,14 +81,14 @@ BasicResults RunBasicScenario()
 	for (int i = 0; i < N; i++)
 	{
 		loom::Submit([&runs]() { runs++; },
-			loom::TaskDesc{ nullptr, nullptr, loom::Affinity::AnyWorker, 0, done, loom::kInvalidCounter });
+			loom::TaskDesc{ nullptr, nullptr, loom::Affinity::AnyWorker, {}, done, loom::kInvalidCounter });
 	}
 	loom::WaitFor(done);
 	r.exactlyOnce = (runs.load() == N);
-	r.drained = (loom::Load(done) == 0);
+	r.drained = (loom::Count(done) == 0);
 	loom::DestroyCounter(done);
 	pool.Shutdown();
-	r.quiesced = !loom::IsInitialised();
+	r.quiesced = !loom::HasActivePool();
 	return r;
 }
 
@@ -110,10 +120,10 @@ TEST_CASE("loom: stress — 10k tasks ran exactly once")
 	{
 		if (rng() % 2)
 			loom::Submit([&runs]() { runs++; },
-				loom::TaskDesc{ nullptr, nullptr, loom::Affinity::AnyWorker, 0, done, loom::kInvalidCounter });
+				loom::TaskDesc{ nullptr, nullptr, loom::Affinity::AnyWorker, {}, done, loom::kInvalidCounter });
 		else
 			loom::Submit(loom::TaskDesc{ [](void* p) { (*(std::atomic<int>*)p)++; },
-				&runs, loom::Affinity::AnyWorker, 0, done, loom::kInvalidCounter });
+				&runs, loom::Affinity::AnyWorker, {}, done, loom::kInvalidCounter });
 	}
 	loom::WaitFor(done);
 	CHECK_MESSAGE(runs.load() == N, "stress: 10k tasks ran exactly once");
@@ -147,15 +157,15 @@ DagResults RunDagScenario()
 		CounterHandle mine = loom::CreateCounter(initial);
 		counters.push_back(mine);
 		loom::Submit(loom::TaskDesc{ [](void* p) { (*(std::atomic<int>*)p)++; },
-			&ran, loom::Affinity::AnyWorker, 0, leaf, waitOn });
+			&ran, loom::Affinity::AnyWorker, {}, leaf, waitOn });
 	}
 	// Release the initial counts so the whole DAG unblocks.
 	for (CounterHandle c : counters)
-		while (loom::Load(c) > 0)
+		while (loom::Count(c) > 0)
 			loom::Signal(c);
 	SpinUntil(0, leaf, 10000);
 	r.everyTaskRan = (ran.load() == N);
-	r.leafZero = (loom::Load(leaf) == 0);
+	r.leafZero = (loom::Count(leaf) == 0);
 	for (CounterHandle c : counters) loom::DestroyCounter(c);
 	loom::DestroyCounter(leaf);
 	pool.Shutdown();
@@ -194,7 +204,7 @@ AffinityResults RunAffinityScenario()
 				if (std::this_thread::get_id() != mainId) mainOnMain = false;
 				mainRan = true;
 			},
-			loom::TaskDesc{ nullptr, nullptr, loom::Affinity::MainThread, 0, mainDone, loom::kInvalidCounter });
+			loom::TaskDesc{ nullptr, nullptr, loom::Affinity::MainThread, {}, mainDone, loom::kInvalidCounter });
 	}
 	loom::PumpMainThreadTasks();
 	r.mainRanOnMain = mainRan && mainOnMain;
@@ -268,7 +278,7 @@ HelpResults RunHelpScenario()
 			mainTaskRan = true;
 			if (std::this_thread::get_id() != mainId) onMain = false;
 		},
-		loom::TaskDesc{ nullptr, nullptr, loom::Affinity::MainThread, 0, gate, loom::kInvalidCounter });
+		loom::TaskDesc{ nullptr, nullptr, loom::Affinity::MainThread, {}, gate, loom::kInvalidCounter });
 
 	loom::WaitFor(gate);
 	r.mainTaskRan = mainTaskRan;
@@ -319,9 +329,9 @@ TEST_CASE("loom: inline Submit(F) ran via a BlockOnly wait")
 	std::atomic<int> n{ 0 };
 	CounterHandle done = loom::CreateCounter(2);
 	loom::Submit([&n]() { n += 5; },
-		loom::TaskDesc{ nullptr, nullptr, loom::Affinity::AnyWorker, 0, done, loom::kInvalidCounter });
+		loom::TaskDesc{ nullptr, nullptr, loom::Affinity::AnyWorker, {}, done, loom::kInvalidCounter });
 	loom::Submit([&n]() { n += 7; },
-		loom::TaskDesc{ nullptr, nullptr, loom::Affinity::AnyWorker, 0, done, loom::kInvalidCounter });
+		loom::TaskDesc{ nullptr, nullptr, loom::Affinity::AnyWorker, {}, done, loom::kInvalidCounter });
 	loom::WaitFor(done, loom::Help::BlockOnly);
 	CHECK_MESSAGE(n.load() == 12, "inline Submit(F) ran via a BlockOnly wait");
 	loom::DestroyCounter(done);
@@ -339,7 +349,7 @@ TEST_CASE("loom: shutdown under load — all tasks completed")
 	for (int i = 0; i < N; i++)
 	{
 		loom::Submit([&runs]() { runs++; },
-			loom::TaskDesc{ nullptr, nullptr, loom::Affinity::AnyWorker, 0, done, loom::kInvalidCounter });
+			loom::TaskDesc{ nullptr, nullptr, loom::Affinity::AnyWorker, {}, done, loom::kInvalidCounter });
 	}
 	loom::WaitFor(done);
 	loom::DestroyCounter(done);
@@ -424,10 +434,10 @@ TEST_CASE("loom: ScopedCounter — RAII fan-in and generation-safe re-acquire")
 		for (int i = 0; i < N; i++)
 		{
 			loom::Submit(loom::TaskDesc{ Noop, nullptr, loom::Affinity::AnyWorker,
-				0, done.Get(), loom::kInvalidCounter });
+				{}, done.Get(), loom::kInvalidCounter });
 		}
 		loom::WaitFor(done);
-		CHECK(loom::Load(done) == 0);
+		CHECK(loom::Count(done) == 0);
 	} // destroyed here (no assert)
 
 	// The next counter gets a different handle even if the slot is reused
@@ -507,7 +517,7 @@ TEST_CASE("loom: lanes — exclusive reservation, lifecycle, shutdown wait")
 // dedicated threads, lanes, participants) at its loop top; queued work waits.
 TEST_CASE("loom: park — every thread parks with its stack, queued work waits, unpark resumes")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 3 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 3 });
 	loom::LaneId lane = loom::AcquireLane("park-lane");
 
 	// A participant outside the pool: a thread that waits on its own cv.
@@ -529,7 +539,7 @@ TEST_CASE("loom: park — every thread parks with its stack, queued work waits, 
 		{
 			{
 				std::unique_lock<std::mutex> lock(part.m);
-				part.cv.wait_for(lock, std::chrono::milliseconds(200), [&] { return part.stop.load() || loom::ParkRequested(); });
+				part.cv.wait_for(lock, std::chrono::milliseconds(200), [&] { return part.stop.load() || loom::IsParkRequested(); });
 			}
 			loom::ParkPoint("park-outsider");
 		}
@@ -542,7 +552,7 @@ TEST_CASE("loom: park — every thread parks with its stack, queued work waits, 
 		std::thread& thread;
 		~StopOutsider()
 		{
-			if (loom::ParkRequested())
+			if (loom::IsParkRequested())
 				loom::UnparkAll();
 			part.stop = true;
 			{
@@ -567,7 +577,7 @@ TEST_CASE("loom: park — every thread parks with its stack, queued work waits, 
 	std::atomic<int> ran{ 0 };
 	CounterHandle done = loom::CreateCounter(16);
 	for (int i = 0; i < 16; i++)
-		loom::Submit([&ran]() { ran++; }, loom::TaskDesc{ nullptr, nullptr, loom::Affinity::AnyWorker, 0, done, loom::kInvalidCounter });
+		loom::Submit([&ran]() { ran++; }, loom::TaskDesc{ nullptr, nullptr, loom::Affinity::AnyWorker, {}, done, loom::kInvalidCounter });
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	CHECK(ran.load() == 0); // nothing runs while parked
 
@@ -597,7 +607,7 @@ TEST_CASE("loom: park — every thread parks with its stack, queued work waits, 
 // request set again), uncounted by the second - a 2 s timeout about 1 run in 40.
 TEST_CASE("loom: park — back-to-back park/unpark rounds never strand a thread")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 4 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 4 });
 	loom::LaneId lane = loom::AcquireLane("park-rounds-lane");
 	int failedRound = -1;
 	for (int round = 0; round < 500 && failedRound < 0; round++)
@@ -705,7 +715,7 @@ TEST_CASE("loom: batch submit — grouped tasks run exactly once from any thread
 
 TEST_CASE("loom: deferred signals — TryHelp never returns holding signals another thread waits for")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 0 }); // only the main thread runs tasks
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 0 }); // only the main thread runs tasks
 	loom::ScopedCounter done(8);
 	for (int i = 0; i < 8; i++)
 		loom::Submit(loom::TaskDesc{ .fn = &Noop, .signals = done });
@@ -724,13 +734,13 @@ TEST_CASE("loom: deferred signals — TryHelp never returns holding signals anot
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
 	CHECK_MESSAGE(finished.load(), "the BlockOnly waiter saw zero after the last TryHelp");
 	if (!finished)
-		(void)loom::Load(done); // apply anything held back, so the join cannot hang
+		(void)loom::Count(done); // apply anything held back, so the join cannot hang
 	waiter.join();
 }
 
 TEST_CASE("loom: deferred signals — a long task of another counter does not delay a finished one")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 	loom::ScopedCounter quick(1), slow(1);
 	// The worker steals oldest-first: the quick task, then the long one.
 	loom::Submit(loom::TaskDesc{ .fn = &Noop, .signals = quick });
@@ -745,7 +755,7 @@ TEST_CASE("loom: deferred signals — a long task of another counter does not de
 
 TEST_CASE("loom: deferred signals — a task polling its own counter sees its predecessors' signals")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 	const int Quick = 16;
 	loom::ScopedCounter done(Quick + 1);
 	std::atomic<bool> sawOnlyItself{ false };
@@ -759,7 +769,7 @@ TEST_CASE("loom: deferred signals — a task polling its own counter sees its pr
 		const auto start = std::chrono::steady_clock::now();
 		while (std::chrono::steady_clock::now() - start < std::chrono::seconds(2))
 		{
-			if (loom::Load(p.done) == 1)
+			if (loom::Count(p.done) == 1)
 			{
 				*p.saw = true;
 				return;
@@ -787,7 +797,7 @@ TEST_CASE("loom: deferred signals — interleaved counters in grouped batches al
 	for (int k = Counters; k-- > 0;)
 	{
 		loom::WaitFor(counters[(size_t)k]);
-		CHECK(loom::Load(counters[(size_t)k]) == 0);
+		CHECK(loom::Count(counters[(size_t)k]) == 0);
 	}
 	CHECK(ran.load() == Counters * PerCounter);
 	for (loom::CounterHandle c : counters)
@@ -799,7 +809,7 @@ TEST_CASE("loom: deferred signals — interleaved counters in grouped batches al
 // outside threads without one) while the pool grows past its first chunk.
 TEST_CASE("loom: slots — recycling and growth under every submitter keep every task exactly once")
 {
-	loom::Pool pool(loom::LoomConfig{ .maxTasks = 1 }); // one chunk, so the bursts below grow it
+	loom::Pool pool(loom::PoolConfig{ .maxTasks = 1 }); // one chunk, so the bursts below grow it
 	auto bump = [](void* p) { static_cast<std::atomic<int>*>(p)->fetch_add(1, std::memory_order_relaxed); };
 	const int Rounds = 3, PerSource = 12000;
 	for (int round = 0; round < Rounds; round++)
@@ -868,7 +878,7 @@ TEST_CASE("loom: slots — recycling and growth under every submitter keep every
 #if defined(__linux__)
 TEST_CASE("loom: thread names — a long name is cut to the OS limit, loom keeps it whole")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 	const char* longName = "a-dedicated-thread-name-26";
 	loom::DedicatedId ded = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = longName });
 	char osName[64] = {};
@@ -879,7 +889,7 @@ TEST_CASE("loom: thread names — a long name is cut to the OS limit, loom keeps
 	CHECK(std::string(osName) == std::string(longName).substr(0, 15));
 
 	bool statsHaveFullName = false;
-	for (const auto& t : loom::SnapshotThreadStats().threads)
+	for (const auto& t : loom::SnapshotPool().threads)
 		statsHaveFullName |= t.name == longName;
 	CHECK_MESSAGE(statsHaveFullName, "the pool's thread stats keep the full name");
 	loom::UnregisterDedicatedThread(ded);
@@ -888,7 +898,7 @@ TEST_CASE("loom: thread names — a long name is cut to the OS limit, loom keeps
 
 TEST_CASE("loom: thread stats — helping is counted and shown, rows outlive their threads")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 	struct Probe { std::atomic<int> sawHelping{ 0 }; loom::CounterHandle kids = loom::kInvalidCounter; } probe;
 	loom::ScopedCounter outerDone(1);
 	// One worker runs the outer task, which waits for 8 children on its own
@@ -901,7 +911,7 @@ TEST_CASE("loom: thread stats — helping is counted and shown, rows outlive the
 			k = loom::TaskDesc{ .fn = [](void* u) {
 				Probe& pr = *static_cast<Probe*>(u);
 				const int me = loom::CurrentThreadIndex();
-				for (const auto& t : loom::SnapshotThreadStats().threads)
+				for (const auto& t : loom::SnapshotPool().threads)
 					if (t.index == me && t.state == loom::ThreadState::Helping)
 						pr.sawHelping++;
 			}, .userData = &p, .signals = p.kids };
@@ -913,12 +923,12 @@ TEST_CASE("loom: thread stats — helping is counted and shown, rows outlive the
 
 	CHECK_MESSAGE(probe.sawHelping.load() == 8, "every child saw its thread as Helping");
 	bool found = false;
-	for (const auto& t : loom::SnapshotThreadStats().threads)
+	for (const auto& t : loom::SnapshotPool().threads)
 	{
 		if (t.name.rfind("loom-worker", 0) != 0)
 			continue;
 		found = true;
-		CHECK(t.helpedRun == 8);
+		CHECK(t.tasksHelped == 8);
 		CHECK(t.tasksRun == 9);
 		CHECK(t.state != loom::ThreadState::Helping);
 	}
@@ -931,14 +941,14 @@ TEST_CASE("loom: thread stats — helping is counted and shown, rows outlive the
 	loom::WaitFor(dedDone);
 	loom::UnregisterDedicatedThread(ded);
 	bool rowKept = false;
-	for (const auto& t : loom::SnapshotThreadStats().threads)
+	for (const auto& t : loom::SnapshotPool().threads)
 		rowKept |= t.name == "stats-ded";
 	CHECK(rowKept);
 }
 
 TEST_CASE("loom: thread stats — two dedicated threads with one name keep their own queue depths")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 	const loom::DedicatedId busy = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "twin" });
 	const loom::DedicatedId quiet = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "twin" });
 	struct Gate { std::atomic<bool> open{ false }; } gate;
@@ -955,7 +965,7 @@ TEST_CASE("loom: thread stats — two dedicated threads with one name keep their
 	for (int tries = 0; tries < 2000 && twins.size() != 2; tries++)
 	{
 		twins.clear();
-		for (const auto& t : loom::SnapshotThreadStats().threads)
+		for (const auto& t : loom::SnapshotPool().threads)
 			if (t.name == "twin")
 				twins.push_back(t);
 		if (twins.size() != 2)
@@ -976,7 +986,7 @@ TEST_CASE("loom: thread stats — two dedicated threads with one name keep their
 TEST_CASE("loom: TryWaitFor — times out, returns early on zero, and rethrows")
 {
 	using Clock = std::chrono::steady_clock;
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	for (loom::Help help : { loom::Help::WhileWaiting, loom::Help::BlockOnly })
 	{
 		loom::ScopedCounter never(1);
@@ -1009,7 +1019,7 @@ TEST_CASE("loom: TryWaitFor — times out, returns early on zero, and rethrows")
 
 TEST_CASE("loom: TryWaitFor — a zero limit never helps; a longer one does")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 0 }); // only a helping wait runs AnyWorker work
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 0 }); // only a helping wait runs AnyWorker work
 	std::atomic<int> ran{ 0 };
 	loom::ScopedCounter done(1);
 	loom::Submit([&ran]() { ran++; }, loom::TaskDesc{ .signals = done });
@@ -1021,7 +1031,7 @@ TEST_CASE("loom: TryWaitFor — a zero limit never helps; a longer one does")
 
 TEST_CASE("loom: dedicated — submits stay safe while other dedicated threads come and go")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	loom::DedicatedId steady = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "steady" });
 
 	// Ids are never reused: a stale id cannot reach a newer thread.
@@ -1071,7 +1081,7 @@ TEST_CASE("loom: shutdown — drains first: a task's wait completes and late wor
 	} st;
 	st.mainId = std::this_thread::get_id();
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 		// A task that waits for its child, blocking (no helping), while
 		// Shutdown runs: the wait must end at zero, not when stopping starts.
 		loom::Submit([&st]() {
@@ -1081,7 +1091,7 @@ TEST_CASE("loom: shutdown — drains first: a task's wait completes and late wor
 				st.childRan = true;
 			}, loom::TaskDesc{ .signals = child });
 			loom::WaitFor(child, loom::Help::BlockOnly);
-			st.countAfterWait = loom::Load(child);
+			st.countAfterWait = loom::Count(child);
 			loom::DestroyCounter(child);
 		});
 		// A task that submits main-thread work after Shutdown has begun.
@@ -1103,7 +1113,7 @@ TEST_CASE("loom: shutdown — drains first: a task's wait completes and late wor
 #if defined(__cpp_exceptions)
 TEST_CASE("loom: exceptions — WaitFor rethrows a task's exception, for every waiter")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	loom::CounterHandle c = loom::CreateCounter(3);
 	std::atomic<int> ran{ 0 };
 	loom::Submit([&ran]() { ran++; }, loom::TaskDesc{ .signals = c });
@@ -1124,7 +1134,7 @@ TEST_CASE("loom: exceptions — WaitFor rethrows a task's exception, for every w
 	CHECK(ran.load() >= 1); // the throw cancelled the counter: tasks not yet started were skipped
 	CHECK(ran.load() <= 3);
 	CHECK(loom::IsCancelled(c));
-	CHECK(loom::Load(c) == 0);
+	CHECK(loom::Count(c) == 0);
 	loom::DestroyCounter(c);
 
 	// A re-used counter starts clean.
@@ -1136,7 +1146,7 @@ TEST_CASE("loom: exceptions — WaitFor rethrows a task's exception, for every w
 
 TEST_CASE("loom: exceptions — a helper keeps other counters' exceptions out of its own wait")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 0 }); // the main thread runs everything
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 0 }); // the main thread runs everything
 	loom::ScopedCounter good(1), bad(1);
 	loom::Submit(loom::TaskDesc{ .fn = &Noop, .signals = good });
 	loom::Submit([]() { throw std::logic_error("bad"); }, loom::TaskDesc{ .signals = bad }); // runs first (newest)
@@ -1251,7 +1261,7 @@ TEST_CASE("loom: dependencies — a random DAG with several counters per task ru
 	// Two threads release every gate, interleaved.
 	auto release = [&](int parity) {
 		for (int i = parity; i < Counters; i += 2)
-			while (loom::Load(gates[(size_t)i]) > 0)
+			while (loom::Count(gates[(size_t)i]) > 0)
 				loom::Signal(gates[(size_t)i]);
 	};
 	std::thread other(release, 1);
@@ -1289,7 +1299,7 @@ namespace {
 
 TEST_CASE("loom: priorities — High before Normal before Low")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 	OrderLog log;
 	loom::ScopedCounter gate(1);
 	loom::Submit(loom::TaskDesc{ .fn = &HoldUntilOpen, .userData = &log, .signals = gate });
@@ -1316,7 +1326,7 @@ TEST_CASE("loom: priorities — High before Normal before Low")
 
 TEST_CASE("loom: priorities — a High task released later still runs before queued Normal work")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 	OrderLog log;
 	loom::ScopedCounter gate(1), release(1);
 	loom::Submit(loom::TaskDesc{ .fn = &HoldUntilOpen, .userData = &log, .signals = gate });
@@ -1336,7 +1346,7 @@ TEST_CASE("loom: priorities — a High task released later still runs before que
 
 TEST_CASE("loom: priorities — High goes to the front of the main thread's queue")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 	OrderLog log;
 	Tagged n1{ &log, '1' }, n2{ &log, '2' }, h{ &log, 'H' };
 	loom::ScopedCounter done(3);
@@ -1349,7 +1359,7 @@ TEST_CASE("loom: priorities — High goes to the front of the main thread's queu
 
 TEST_CASE("loom: cancellation — queued tasks are skipped, still signal, and a fresh counter is clean")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 	OrderLog hold;
 	loom::ScopedCounter gate(1);
 	loom::Submit(loom::TaskDesc{ .fn = &HoldUntilOpen, .userData = &hold, .signals = gate });
@@ -1363,7 +1373,7 @@ TEST_CASE("loom: cancellation — queued tasks are skipped, still signal, and a 
 	hold.open = true;
 	loom::WaitFor(c, loom::Help::BlockOnly); // returns: every skipped task still signalled
 	CHECK(ran.load() == 0);
-	CHECK(loom::Load(c) == 0);
+	CHECK(loom::Count(c) == 0);
 	loom::DestroyCounter(c);
 	loom::WaitFor(gate, loom::Help::BlockOnly);
 
@@ -1377,7 +1387,7 @@ TEST_CASE("loom: cancellation — queued tasks are skipped, still signal, and a 
 
 TEST_CASE("loom: cancellation — a running task can see it and stop early")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 	struct Long { loom::CounterHandle self; std::atomic<bool> started{ false }, sawCancel{ false }; } job;
 	job.self = loom::CreateCounter(1);
 	loom::Submit(loom::TaskDesc{ .fn = [](void* p) {
@@ -1407,7 +1417,7 @@ TEST_CASE("loom: cancellation — a running task can see it and stop early")
 #if defined(__cpp_exceptions)
 TEST_CASE("loom: cancellation — a task's exception skips the rest of its counter's queued work")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 	OrderLog hold;
 	loom::ScopedCounter gate(1);
 	loom::Submit(loom::TaskDesc{ .fn = &HoldUntilOpen, .userData = &hold, .signals = gate });
@@ -1441,7 +1451,7 @@ namespace {
 
 TEST_CASE("loom: Submit(F) — non-trivial, large and over-aligned callables run once and are destroyed")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	Tracked::live = 0;
 	auto shared = std::make_shared<int>(0);
 	std::atomic<int> sum{ 0 };
@@ -1476,7 +1486,7 @@ TEST_CASE("loom: Submit(F) — non-trivial, large and over-aligned callables run
 
 TEST_CASE("loom: Submit(F) — an owned callable is destroyed when cancelled or when it throws")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 	Tracked::live = 0;
 	OrderLog hold;
 	loom::ScopedCounter gate(1);
@@ -1514,7 +1524,7 @@ TEST_CASE("loom: Submit(F) — an owned callable is destroyed when cancelled or 
 
 TEST_CASE("loom: isolation — an isolated wait skips a foreign task on its own deque")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 	OrderLog hold; // keeps the one worker busy until the checks are done
 	loom::ScopedCounter gate(1);
 	loom::Submit(loom::TaskDesc{ .fn = &HoldUntilOpen, .userData = &hold, .signals = gate });
@@ -1522,7 +1532,7 @@ TEST_CASE("loom: isolation — an isolated wait skips a foreign task on its own 
 
 	struct Foreign { std::thread::id mainId; std::atomic<bool> ranOnMain{ false }, ran{ false }; } foreign;
 	foreign.mainId = std::this_thread::get_id();
-	// A long task from outside the region, parked until `release`: signalling
+	// A long task from outside the region, held until `release`: signalling
 	// it from inside the region puts it on top of the main thread's deque,
 	// above the region's own task.
 	loom::ScopedCounter release(1), foreignDone(1), mine(1);
@@ -1552,7 +1562,7 @@ TEST_CASE("loom: isolation — an isolated wait skips a foreign task on its own 
 
 TEST_CASE("loom: isolation — a region's tasks, and their own waits, stay in the region")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 	OrderLog hold; // the worker is held: only the main thread runs anything
 	loom::ScopedCounter gate(1);
 	loom::Submit(loom::TaskDesc{ .fn = &HoldUntilOpen, .userData = &hold, .signals = gate });
@@ -1603,18 +1613,18 @@ TEST_CASE("loom: isolation — a region's tasks, and their own waits, stay in th
 
 TEST_CASE("loom: isolation — without workers a region still waits on outside work")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 0 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 0 });
 	loom::ScopedCounter outside(1);
 	loom::Submit(loom::TaskDesc{ .fn = &Noop, .signals = outside }); // not in the region
 	loom::Isolated([&] { loom::WaitFor(outside); }); // nobody else could run it: no isolation
-	CHECK(loom::Load(outside) == 0);
+	CHECK(loom::Count(outside) == 0);
 }
 
 TEST_CASE("loom: ParallelFor — automatic chunking covers every index once, any size, any pool")
 {
 	for (int workers : { 0, 1, 3, -1 })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 		for (size_t n : { size_t(1), size_t(2), size_t(7), size_t(1000), size_t(100000), size_t(1000000) })
 		{
 			std::vector<std::atomic<uint8_t>> hits(n);
@@ -1643,7 +1653,7 @@ TEST_CASE("loom: ParallelFor — automatic chunking covers every index once, any
 
 TEST_CASE("loom: ParallelFor — automatic chunking spreads uneven work and nests")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 3 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 3 });
 	// The last few items are expensive: a fixed one-piece-per-thread split
 	// would leave them on one thread.
 	std::mutex m;
@@ -1711,7 +1721,7 @@ TEST_CASE("loom: ParallelReduce — the same bits on every run and with any numb
 
 	for (int workers : { 0, 1, 4, -1 })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 		for (int run = 0; run < 3; run++)
 		{
 			const double got = loom::ParallelReduce(0, N, 0, 0.0, map, add);
@@ -1757,7 +1767,7 @@ TEST_CASE("loom: graphs — every node runs once per run, after its predecessors
 {
 	for (int workers : { 0, 1, -1 })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 		const uint32_t N = 300;
 		const RandomDag dag(N, 3, 77);
 		std::atomic<uint32_t> ticket{ 0 };
@@ -1771,7 +1781,7 @@ TEST_CASE("loom: graphs — every node runs once per run, after its predecessors
 		for (int run = 0; run < 40; run++)
 		{
 			loom::Run(graph);
-			CHECK(!graph.Running());
+			CHECK(!graph.IsRunning());
 			bool ordered = true;
 			for (auto [a, b] : dag.edges)
 				ordered = ordered && stamp[a] < stamp[b];
@@ -1787,7 +1797,7 @@ TEST_CASE("loom: graphs — every node runs once per run, after its predecessors
 
 TEST_CASE("loom: graphs — dense layers share a wait; mixed affinities and repeated edges in one set")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 3 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 3 });
 	// Layer by layer, every node after every node of the layer before: each
 	// layer is one wait set. One member per layer runs on the main thread and
 	// one is High, so a set is queued partly in groups and partly one by one.
@@ -1842,7 +1852,7 @@ TEST_CASE("loom: graphs — dense layers share a wait; mixed affinities and repe
 
 TEST_CASE("loom: graphs — nodes keep their affinity, and one graph runs inside another's node")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	const loom::DedicatedId io = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "graph-io" });
 	std::atomic<int> mainIndex{ -1 }, dedicatedIndex{ -1 };
 	std::atomic<int> innerRuns{ 0 };
@@ -1869,7 +1879,7 @@ TEST_CASE("loom: graphs — nodes keep their affinity, and one graph runs inside
 
 TEST_CASE("loom: graphs — Submit waits for its counter and signals one it may share")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	std::atomic<int> ran{ 0 };
 	loom::TaskGraph graph;
 	const auto a = graph.Add([&] { ran++; });
@@ -1881,11 +1891,11 @@ TEST_CASE("loom: graphs — Submit waits for its counter and signals one it may 
 	loom::Submit([&] { ran += 10; }, loom::TaskDesc{ .signals = done });
 	std::this_thread::sleep_for(std::chrono::milliseconds(20));
 	CHECK_MESSAGE(ran.load() == 10, "no node runs before the gate opens");
-	CHECK(graph.Running());
+	CHECK(graph.IsRunning());
 	loom::Signal(gate);
 	loom::WaitFor(done);
 	CHECK(ran.load() == 12);
-	CHECK(!graph.Running());
+	CHECK(!graph.IsRunning());
 
 	// An empty graph completes at once, and still signals.
 	loom::TaskGraph empty;
@@ -1898,7 +1908,7 @@ TEST_CASE("loom: graphs — Submit waits for its counter and signals one it may 
 #if defined(__cpp_exceptions)
 TEST_CASE("loom: graphs — an exception or a Cancel skips the nodes not yet started; the graph runs again")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	std::atomic<int> c{ 0 }, d{ 0 };
 	bool throwNow = true;
 	loom::TaskGraph graph;
@@ -1912,7 +1922,7 @@ TEST_CASE("loom: graphs — an exception or a Cancel skips the nodes not yet sta
 	CHECK_THROWS_AS(loom::Run(graph), std::runtime_error);
 	CHECK(c.load() == 0);
 	CHECK(d.load() == 0);
-	CHECK(!graph.Running());
+	CHECK(!graph.IsRunning());
 	throwNow = false;
 	loom::Run(graph);
 	CHECK(c.load() == 1);
@@ -1937,7 +1947,7 @@ TEST_CASE("loom: graphs — an exception or a Cancel skips the nodes not yet sta
 	cancelled = true;
 	loom::WaitFor(done);
 	CHECK(after.load() == 0);
-	CHECK(!slow.Running());
+	CHECK(!slow.IsRunning());
 }
 #endif
 
@@ -1967,7 +1977,7 @@ TEST_CASE("loom: graphs — cycles are found, and callables live as long as the 
 		graph.Add([] {}); // a moved-from graph is empty and usable
 		CHECK(graph.NodeCount() == 1);
 
-		loom::Pool pool(loom::LoomConfig{ .workerCount = 1 });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 		loom::Run(moved);
 		loom::Run(moved);
 		CHECK(Tracked::live.load() == 2);
@@ -2002,7 +2012,7 @@ TEST_CASE("loom: limiters — never more than the limit at once, every task once
 	{
 		for (uint32_t limit : { 1u, 3u })
 		{
-			loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+			loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 			loom::ScopedLimiter limiter(limit);
 			Concurrency c;
 			constexpr int kTasks = 300;
@@ -2038,15 +2048,15 @@ TEST_CASE("loom: limiters — never more than the limit at once, every task once
 			CHECK(c.most.load() <= (int)limit);
 			if (workers < 0 && limit > 1)
 				CHECK_MESSAGE(c.most.load() >= 2, "a limit above one still runs tasks side by side");
-			CHECK(loom::LimiterHeld(limiter) == 0);
-			CHECK(loom::LimiterWaiting(limiter) == 0);
+			CHECK(loom::HeldUnits(limiter) == 0);
+			CHECK(loom::WaitingTasks(limiter) == 0);
 		}
 	}
 }
 
 TEST_CASE("loom: limiters — a limit of one is a serial queue, High first, then in order")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 4 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 4 });
 	loom::ScopedLimiter serial(1);
 	std::atomic<bool> release{ false }, blocking{ false };
 	loom::ScopedCounter done(1);
@@ -2065,8 +2075,8 @@ TEST_CASE("loom: limiters — a limit of one is a serial queue, High first, then
 	for (int i = 0; i < kTasks; i++)
 		loom::Submit([&order, i] { order.push_back(i); }, loom::TaskDesc{ .signals = queued, .limiter = serial });
 	loom::Submit([&order] { order.push_back(-1); }, loom::TaskDesc{ .signals = queued, .priority = loom::Priority::High, .limiter = serial });
-	CHECK(loom::LimiterHeld(serial) == 1);
-	CHECK(loom::LimiterWaiting(serial) == kTasks + 1);
+	CHECK(loom::HeldUnits(serial) == 1);
+	CHECK(loom::WaitingTasks(serial) == kTasks + 1);
 	release = true;
 	loom::WaitFor(queued);
 	loom::WaitFor(done);
@@ -2078,13 +2088,13 @@ TEST_CASE("loom: limiters — a limit of one is a serial queue, High first, then
 
 TEST_CASE("loom: limiters — a task takes its unit only once its counters reach zero")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	loom::ScopedLimiter limiter(1);
 	loom::ScopedCounter gate(1), other(1), gatedDone(1), freeDone(1);
 	std::atomic<int> gatedRan{ 0 };
 	const loom::CounterHandle all[] = { other };
 	loom::Submit([&] { gatedRan++; }, loom::TaskDesc{ .signals = gatedDone, .waitsFor = gate, .waitsForAll = all, .limiter = limiter });
-	CHECK(loom::LimiterHeld(limiter) == 0);
+	CHECK(loom::HeldUnits(limiter) == 0);
 	// The gated task holds no unit, so this one runs.
 	loom::Submit([] {}, loom::TaskDesc{ .signals = freeDone, .limiter = limiter });
 	CHECK(loom::TryWaitFor(freeDone, 5000));
@@ -2093,12 +2103,12 @@ TEST_CASE("loom: limiters — a task takes its unit only once its counters reach
 	loom::Signal(other);
 	loom::WaitFor(gatedDone);
 	CHECK(gatedRan.load() == 1);
-	CHECK(loom::LimiterHeld(limiter) == 0);
+	CHECK(loom::HeldUnits(limiter) == 0);
 }
 
 TEST_CASE("loom: limiters — many submitters at once; tasks of every affinity and graph nodes")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 4 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 4 });
 	const loom::DedicatedId io = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "limit-io" });
 	loom::ScopedLimiter limiter(2);
 	Concurrency c;
@@ -2123,7 +2133,7 @@ TEST_CASE("loom: limiters — many submitters at once; tasks of every affinity a
 	loom::WaitFor(done);
 	CHECK(c.ran.load() == kSpawners * kEach);
 	CHECK(c.most.load() <= 2);
-	CHECK(loom::LimiterHeld(limiter) == 0);
+	CHECK(loom::HeldUnits(limiter) == 0);
 
 	// Graph nodes: a wide layer under the limit, and nodes without one.
 	Concurrency g;
@@ -2141,13 +2151,13 @@ TEST_CASE("loom: limiters — many submitters at once; tasks of every affinity a
 	CHECK(g.ran.load() == 640);
 	CHECK(unlimited.load() == 640);
 	CHECK(g.most.load() <= 2);
-	CHECK(loom::LimiterHeld(limiter) == 0);
+	CHECK(loom::HeldUnits(limiter) == 0);
 	loom::UnregisterDedicatedThread(io);
 }
 
 TEST_CASE("loom: limiters — a cancelled or throwing task gives its unit back")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	loom::ScopedLimiter limiter(1);
 	std::atomic<bool> started{ false }, release{ false };
 	std::atomic<int> after{ 0 };
@@ -2165,8 +2175,8 @@ TEST_CASE("loom: limiters — a cancelled or throwing task gives its unit back")
 	release = true;
 	loom::WaitFor(done);
 	CHECK(after.load() == 0);
-	CHECK(loom::LimiterHeld(limiter) == 0);
-	CHECK(loom::LimiterWaiting(limiter) == 0);
+	CHECK(loom::HeldUnits(limiter) == 0);
+	CHECK(loom::WaitingTasks(limiter) == 0);
 
 #if defined(__cpp_exceptions)
 	loom::ScopedCounter failing(3);
@@ -2174,7 +2184,7 @@ TEST_CASE("loom: limiters — a cancelled or throwing task gives its unit back")
 	loom::Submit([] {}, loom::TaskDesc{ .signals = failing, .limiter = limiter });
 	loom::Submit([] {}, loom::TaskDesc{ .signals = failing, .limiter = limiter });
 	CHECK_THROWS_AS(loom::WaitFor(failing), std::runtime_error);
-	CHECK(loom::LimiterHeld(limiter) == 0);
+	CHECK(loom::HeldUnits(limiter) == 0);
 	// The unit is free for the next task.
 	loom::ScopedCounter next(1);
 	std::atomic<int> nextRan{ 0 };
@@ -2186,13 +2196,13 @@ TEST_CASE("loom: limiters — a cancelled or throwing task gives its unit back")
 
 TEST_CASE("loom: limiters — handles are reused safely and the table size is configurable")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 1, .maxLimiters = 3 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1, .maxLimiters = 3 });
 	for (int round = 0; round < 100; round++)
 	{
 		loom::ScopedLimiter a(1), b(2), c(5);
 		CHECK(a.Get() != b.Get());
 		CHECK(b.Get() != c.Get());
-		CHECK(loom::LimiterHeld(c) == 0);
+		CHECK(loom::HeldUnits(c) == 0);
 		loom::ScopedCounter done(3);
 		for (loom::LimiterHandle h : { a.Get(), b.Get(), c.Get() })
 			loom::Submit([] {}, loom::TaskDesc{ .signals = done, .limiter = h });
@@ -2201,7 +2211,7 @@ TEST_CASE("loom: limiters — handles are reused safely and the table size is co
 }
 
 namespace {
-	int LiveCounters() { return loom::SnapshotThreadStats().counterCount; }
+	int LiveCounters() { return loom::SnapshotPool().counterCount; }
 	// A future's task drops its hold on the future's state just after the
 	// future's value is ready, so a future dropped right after Get may leave
 	// its counter to that task to free, a moment later.
@@ -2216,18 +2226,18 @@ namespace {
 
 TEST_CASE("loom: counters — a task released by a counter already sees it at zero")
 {
-	// The final signal releases many parked tasks one by one; the first ones
+	// The final signal releases many waiting tasks one by one; the first ones
 	// can start on other workers while it is still releasing the rest.
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 4 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 4 });
 	std::atomic<int> notZero{ 0 };
 	for (int round = 0; round < 200; round++)
 	{
 		loom::ScopedCounter gate(1);
-		constexpr int kParked = 64;
-		loom::ScopedCounter done(kParked);
-		for (int i = 0; i < kParked; i++)
+		constexpr int kWaiting = 64;
+		loom::ScopedCounter done(kWaiting);
+		for (int i = 0; i < kWaiting; i++)
 			loom::Submit([&notZero, g = gate.Get()] {
-				if (loom::Load(g) != 0)
+				if (loom::Count(g) != 0)
 					notZero++;
 			}, loom::TaskDesc{ .signals = done, .waitsFor = gate });
 		loom::Signal(gate);
@@ -2261,7 +2271,7 @@ namespace {
 			}
 			if (i % 997 == 0)
 			{
-				const int live = loom::SnapshotThreadStats().counterCount;
+				const int live = loom::SnapshotPool().counterCount;
 				int seen = w->peakCounters.load();
 				while (live > seen && !w->peakCounters.compare_exchange_weak(seen, live)) {}
 			}
@@ -2273,7 +2283,7 @@ TEST_CASE("loom: counters — AddToCounter: a whole tree of tasks on one counter
 {
 	for (int workers : { 0, 1, -1 })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers, .maxTasks = 1 << 16 });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers, .maxTasks = 1 << 16 });
 		const int baseline = LiveCounters();
 		TreeWalk walk;
 		walk.nodes = 200000;
@@ -2285,22 +2295,22 @@ TEST_CASE("loom: counters — AddToCounter: a whole tree of tasks on one counter
 		CHECK(walk.refused.load() == 0);
 		CHECK(walk.peakCounters.load() <= baseline + 1); // the one counter, however deep the tree
 		CHECK(!loom::AddToCounter(done)); // reached zero: refused
-		CHECK(loom::Load(done) == 0);
+		CHECK(loom::Count(done) == 0);
 	}
 }
 
 TEST_CASE("loom: counters — AddToCounter keeps waiters asleep, refuses once zero, works with Cancel and exceptions")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 3 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 3 });
 	{
 		// A thread asleep on the counter stays asleep while adds keep it up.
 		loom::ScopedCounter c(1);
 		std::atomic<bool> returned{ false };
 		std::thread waiter([&] { loom::WaitFor(c.Get(), loom::Help::BlockOnly); returned = true; });
 		CHECK(loom::AddToCounter(c, 5));
-		CHECK(loom::Load(c) == 6);
+		CHECK(loom::Count(c) == 6);
 		loom::Signal(c, 5);
-		CHECK(loom::Load(c) == 1);
+		CHECK(loom::Count(c) == 1);
 		CHECK(loom::AddToCounter(c, 0)); // still open
 		std::this_thread::sleep_for(std::chrono::milliseconds(20));
 		CHECK(!returned.load());
@@ -2309,7 +2319,7 @@ TEST_CASE("loom: counters — AddToCounter keeps waiters asleep, refuses once ze
 		CHECK(returned.load());
 		CHECK(!loom::AddToCounter(c, 1));
 		CHECK(!loom::AddToCounter(c, 0));
-		CHECK(loom::Load(c) == 0);
+		CHECK(loom::Count(c) == 0);
 	}
 	{
 		// Added tasks of a cancelled counter are skipped and still signal it.
@@ -2357,7 +2367,7 @@ TEST_CASE("loom: counters — AddToCounter keeps waiters asleep, refuses once ze
 		for (auto& t : threads)
 			t.join();
 		CHECK(refused.load() == 0); // the initial 1 holds it open throughout
-		CHECK(loom::Load(c) == 1);
+		CHECK(loom::Count(c) == 1);
 		loom::Signal(c);
 		loom::WaitFor(c);
 	}
@@ -2367,17 +2377,17 @@ TEST_CASE("loom: limiters — each running task holds its own unit index")
 {
 	for (int workers : { 0, 1, -1 })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
-		CHECK(loom::LimiterUnit() == loom::kNoUnit); // not in a task
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
+		CHECK(loom::CurrentLimiterUnit() == loom::kNoUnit); // not in a task
 		loom::ScopedLimiter four(4), other(2);
-		CHECK(loom::LimiterLimit(four) == 4);
+		CHECK(loom::Limit(four) == 4);
 		std::atomic<bool> inUse[4] = {};
 		std::atomic<int> errors{ 0 }, ran{ 0 };
 		constexpr int kTasks = 400;
 		loom::ScopedCounter done(kTasks + 1);
 		for (int i = 0; i < kTasks; i++)
 			loom::Submit([&, i] {
-				const uint32_t u = loom::LimiterUnit();
+				const uint32_t u = loom::CurrentLimiterUnit();
 				if (u >= 4 || inUse[u].exchange(true))
 				{
 					errors++;
@@ -2388,20 +2398,20 @@ TEST_CASE("loom: limiters — each running task holds its own unit index")
 					// Another limiter's task run inside this one (helping) has its own
 					// index, and this task's comes back afterwards.
 					loom::ScopedCounter nested(1);
-					loom::Submit([&] { if (loom::LimiterUnit() >= 2) errors++; }, loom::TaskDesc{ .signals = nested, .limiter = other });
+					loom::Submit([&] { if (loom::CurrentLimiterUnit() >= 2) errors++; }, loom::TaskDesc{ .signals = nested, .limiter = other });
 					loom::WaitFor(nested);
 				}
 				SpinFor(std::chrono::microseconds(5));
-				if (loom::LimiterUnit() != u)
+				if (loom::CurrentLimiterUnit() != u)
 					errors++;
 				inUse[u] = false;
 				ran++;
 			}, loom::TaskDesc{ .signals = done, .limiter = four });
-		loom::Submit([&] { if (loom::LimiterUnit() != loom::kNoUnit) errors++; }, loom::TaskDesc{ .signals = done });
+		loom::Submit([&] { if (loom::CurrentLimiterUnit() != loom::kNoUnit) errors++; }, loom::TaskDesc{ .signals = done });
 		loom::WaitFor(done);
 		CHECK(errors.load() == 0);
 		CHECK(ran.load() == kTasks);
-		CHECK(loom::LimiterHeld(four) == 0);
+		CHECK(loom::HeldUnits(four) == 0);
 	}
 }
 
@@ -2422,7 +2432,7 @@ namespace {
 			if (point != 1 || !armed.exchange(false))
 				return;
 			loom::Submit([] {
-				secondUnit = loom::LimiterUnit();
+				secondUnit = loom::CurrentLimiterUnit();
 				secondAsked = true;
 			}, loom::TaskDesc{ .signals = secondDone, .limiter = limiter });
 			const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -2434,7 +2444,7 @@ namespace {
 
 TEST_CASE("loom: limiters — a unit's index is free before the unit is")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	// A plain task gives its unit back when it ends; a future's task when its
 	// value is ready, from inside its run.
 	for (bool future : { false, true })
@@ -2449,13 +2459,13 @@ TEST_CASE("loom: limiters — a unit's index is free before the unit is")
 		UnitHandover::armed = true;
 		if (future)
 		{
-			loom::Future<uint32_t> f = loom::Async([] { return loom::LimiterUnit(); }, loom::TaskDesc{ .limiter = one });
+			loom::Future<uint32_t> f = loom::Async([] { return loom::CurrentLimiterUnit(); }, loom::TaskDesc{ .limiter = one });
 			firstUnit = f.Get();
 		}
 		else
 		{
 			loom::ScopedCounter firstDone(1);
-			loom::Submit([&] { firstUnit = loom::LimiterUnit(); }, loom::TaskDesc{ .signals = firstDone, .limiter = one });
+			loom::Submit([&] { firstUnit = loom::CurrentLimiterUnit(); }, loom::TaskDesc{ .signals = firstDone, .limiter = one });
 			loom::WaitFor(firstDone);
 		}
 		loom::WaitFor(secondDone);
@@ -2471,7 +2481,7 @@ TEST_CASE("loom: limiters — a unit's index is free before the unit is")
 
 TEST_CASE("loom: limiters — raising a limit starts waiting tasks, lowering it waits for holders")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 6 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 6 });
 	loom::ScopedLimiter limiter(1);
 	std::atomic<int> active{ 0 }, started{ 0 };
 	std::atomic<int> release{ 0 }; // the long tasks numbered below this may finish
@@ -2491,16 +2501,16 @@ TEST_CASE("loom: limiters — raising a limit starts waiting tasks, lowering it 
 		return ready();
 	};
 	REQUIRE(waitUntil([&] { return started.load() == 1; }));
-	CHECK(loom::LimiterWaiting(limiter) == 3);
+	CHECK(loom::WaitingTasks(limiter) == 3);
 
-	loom::SetLimiterLimit(limiter, 4); // the three waiting start now, beside the first
+	loom::SetLimit(limiter, 4); // the three waiting start now, beside the first
 	REQUIRE(waitUntil([&] { return started.load() == 4; }));
-	CHECK(loom::LimiterHeld(limiter) == 4);
-	CHECK(loom::LimiterWaiting(limiter) == 0);
+	CHECK(loom::HeldUnits(limiter) == 4);
+	CHECK(loom::WaitingTasks(limiter) == 0);
 
-	loom::SetLimiterLimit(limiter, 2); // four hold units: two must finish, and one more, before a new task starts
-	CHECK(loom::LimiterLimit(limiter) == 2);
-	CHECK(loom::LimiterHeld(limiter) == 4);
+	loom::SetLimit(limiter, 2); // four hold units: two must finish, and one more, before a new task starts
+	CHECK(loom::Limit(limiter) == 2);
+	CHECK(loom::HeldUnits(limiter) == 4);
 	std::atomic<int> newStarted{ 0 }, maxActive{ 0 }, badUnit{ 0 };
 	constexpr int kNew = 20;
 	loom::ScopedCounter newDone(kNew);
@@ -2510,16 +2520,16 @@ TEST_CASE("loom: limiters — raising a limit starts waiting tasks, lowering it 
 			const int now = ++active;
 			int seen = maxActive.load();
 			while (now > seen && !maxActive.compare_exchange_weak(seen, now)) {}
-			if (loom::LimiterUnit() >= 2)
+			if (loom::CurrentLimiterUnit() >= 2)
 				badUnit++;
 			SpinFor(std::chrono::microseconds(20));
 			active--;
 		}, loom::TaskDesc{ .signals = newDone, .limiter = limiter });
-	CHECK(loom::LimiterWaiting(limiter) == kNew);
+	CHECK(loom::WaitingTasks(limiter) == kNew);
 	for (int finished = 1; finished <= 2; finished++)
 	{
 		release = finished;
-		REQUIRE(waitUntil([&] { return loom::LimiterHeld(limiter) == (uint32_t)(4 - finished); }));
+		REQUIRE(waitUntil([&] { return loom::HeldUnits(limiter) == (uint32_t)(4 - finished); }));
 		CHECK(newStarted.load() == 0); // still at or over the new limit
 	}
 	release = 4; // the rest finish; the new tasks then run two at a time
@@ -2528,13 +2538,13 @@ TEST_CASE("loom: limiters — raising a limit starts waiting tasks, lowering it 
 	CHECK(newStarted.load() == kNew);
 	CHECK(maxActive.load() <= 2);
 	CHECK(badUnit.load() == 0);
-	CHECK(loom::LimiterHeld(limiter) == 0);
-	CHECK(loom::LimiterWaiting(limiter) == 0);
+	CHECK(loom::HeldUnits(limiter) == 0);
+	CHECK(loom::WaitingTasks(limiter) == 0);
 }
 
 TEST_CASE("loom: limiters — a limit changed at random under load keeps every count straight")
 {
-	loom::Pool pool(loom::LoomConfig{});
+	loom::Pool pool(loom::PoolConfig{});
 	loom::ScopedLimiter limiter(3);
 	constexpr uint32_t kMaxLimit = 8;
 	std::atomic<bool> inUse[64] = {};
@@ -2545,7 +2555,7 @@ TEST_CASE("loom: limiters — a limit changed at random under load keeps every c
 		while (!stop)
 		{
 			x = x * 1664525u + 1013904223u;
-			loom::SetLimiterLimit(limiter, 1 + (x >> 16) % kMaxLimit);
+			loom::SetLimit(limiter, 1 + (x >> 16) % kMaxLimit);
 			std::this_thread::yield();
 		}
 	});
@@ -2553,7 +2563,7 @@ TEST_CASE("loom: limiters — a limit changed at random under load keeps every c
 	loom::ScopedCounter done(kTasks);
 	for (int i = 0; i < kTasks; i++)
 		loom::Submit([&] {
-			const uint32_t u = loom::LimiterUnit();
+			const uint32_t u = loom::CurrentLimiterUnit();
 			if (u >= 64 || inUse[u].exchange(true)) // distinct even across changes
 			{
 				errors++;
@@ -2566,16 +2576,16 @@ TEST_CASE("loom: limiters — a limit changed at random under load keeps every c
 	stop = true;
 	changer.join();
 	CHECK(errors.load() == 0);
-	CHECK(loom::LimiterHeld(limiter) == 0);
-	CHECK(loom::LimiterWaiting(limiter) == 0);
-	loom::SetLimiterLimit(limiter, 2);
-	CHECK(loom::LimiterLimit(limiter) == 2);
+	CHECK(loom::HeldUnits(limiter) == 0);
+	CHECK(loom::WaitingTasks(limiter) == 0);
+	loom::SetLimit(limiter, 2);
+	CHECK(loom::Limit(limiter) == 2);
 	// Destroying it asserts every unit came back and no debt is left.
 }
 
 TEST_CASE("loom: per-thread storage — one per thread, merged after the work")
 {
-	loom::Pool pool(loom::LoomConfig{});
+	loom::Pool pool(loom::PoolConfig{});
 	// A histogram per thread, merged once the loop is done.
 	constexpr size_t kN = 200000, kBins = 16;
 	loom::PerThread<std::vector<uint64_t>> bins(std::vector<uint64_t>(kBins, 0));
@@ -2622,7 +2632,7 @@ TEST_CASE("loom: per-thread storage — one per thread, merged after the work")
 
 TEST_CASE("loom: per-thread storage — move-only, over-aligned, threads outside the pool, Clear")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	{
 		loom::PerThread<std::unique_ptr<int>> owned;
 		owned.Local() = std::make_unique<int>(5);
@@ -2671,7 +2681,7 @@ TEST_CASE("loom: ParallelInclusiveScan / ParallelExclusiveScan — match std, in
 {
 	for (int workers : { 0, 1, -1 })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 		for (size_t n : { size_t(0), size_t(1), size_t(100), size_t(8191), size_t(8192), size_t(100000), size_t(1000003) })
 		{
 			std::vector<int64_t> in(n);
@@ -2709,7 +2719,7 @@ TEST_CASE("loom: ParallelInclusiveScan / ParallelExclusiveScan — match std, in
 	std::vector<std::vector<double>> results;
 	for (int workers : { 0, 1, 3, -1 })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 		std::vector<double> out(in.size());
 		loom::ParallelInclusiveScan(in.begin(), in.end(), out.begin(), 0.0);
 		results.push_back(std::move(out));
@@ -2718,7 +2728,7 @@ TEST_CASE("loom: ParallelInclusiveScan / ParallelExclusiveScan — match std, in
 		CHECK(std::memcmp(results[r].data(), results[0].data(), in.size() * sizeof(double)) == 0);
 #if defined(__cpp_exceptions)
 	{
-		loom::Pool pool(loom::LoomConfig{});
+		loom::Pool pool(loom::PoolConfig{});
 		std::vector<int> v(200000, 1);
 		v[150000] = -1;
 		std::vector<int> out(v.size());
@@ -2749,7 +2759,7 @@ TEST_CASE("loom: ParallelSort — matches std::sort on awkward inputs, any pool,
 	};
 	for (int workers : { 0, 1, -1 })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 		for (size_t n : { size_t(0), size_t(1), size_t(2), size_t(2047), size_t(2049), size_t(100000), size_t(1000000) })
 			for (std::vector<int>& v : shapes(n))
 			{
@@ -2786,7 +2796,7 @@ TEST_CASE("loom: ParallelSort — matches std::sort on awkward inputs, any pool,
 	std::vector<std::vector<std::pair<int, int>>> orders;
 	for (int workers : { 0, 1, 3, -1 })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 		std::vector<std::pair<int, int>> v(400000);
 		for (int i = 0; i < (int)v.size(); i++)
 			v[(size_t)i] = { (i * 31) % 97, i };
@@ -2797,7 +2807,7 @@ TEST_CASE("loom: ParallelSort — matches std::sort on awkward inputs, any pool,
 		CHECK(orders[r] == orders[0]);
 #if defined(__cpp_exceptions)
 	{
-		loom::Pool pool(loom::LoomConfig{});
+		loom::Pool pool(loom::PoolConfig{});
 		// Failing while counting into buckets, while sorting a bucket, and in a
 		// range too small for buckets. As after std::sort the order is then
 		// unspecified, but every element is still one live object: none leaked
@@ -2831,7 +2841,7 @@ TEST_CASE("loom: pipelines — serial stages keep the source's order, at most in
 {
 	for (int workers : { 0, 1, -1 })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 		struct Item { int index = -1; int64_t value = 0; };
 		for (uint32_t inFlight : { 1u, 4u, 16u })
 		{
@@ -2886,7 +2896,7 @@ TEST_CASE("loom: pipelines — serial stages keep the source's order, at most in
 
 TEST_CASE("loom: pipelines — stage TaskDescs, a run inside a task, running again, errors")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 4 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 4 });
 	struct Item { int index = 0; };
 	{
 		// A main-thread last stage and a limited middle one.
@@ -2973,20 +2983,12 @@ namespace {
 				std::this_thread::sleep_for(std::chrono::milliseconds(3));
 		}
 	};
-
-	uint32_t HeldUnits(loom::LimiterHandle h)
-	{
-		for (const loom::DebugLimiter& l : loom::CaptureDebugState().limiters)
-			if (l.handle == h)
-				return l.held;
-		return ~0u;
-	}
 }
 
 TEST_CASE("loom: pipelines — no limited stage holds a unit once Run returns")
 {
 	// The caller may destroy the limiter as soon as Run returns.
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 3 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 3 });
 	struct Item { int index = 0; };
 	for (int limitedStage = 0; limitedStage < 3; limitedStage++)
 	{
@@ -3005,7 +3007,7 @@ TEST_CASE("loom: pipelines — no limited stage holds a unit once Run returns")
 		{
 			produced = 0;
 			p.Run();
-			if (HeldUnits(two) != 0)
+			if (loom::HeldUnits(two) != 0)
 				stillHeld++;
 		}
 		SlowTaskEnds::armed = false;
@@ -3021,7 +3023,7 @@ TEST_CASE("loom: futures — values, void, move-only results and repeated Get, a
 {
 	for (int workers : { 0, 1, -1 })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 		const int baseline = LiveCounters();
 		{
 			std::vector<loom::Future<int>> squares;
@@ -3035,7 +3037,7 @@ TEST_CASE("loom: futures — values, void, move-only results and repeated Get, a
 
 			for (int i = 0; i < 200; i++)
 				CHECK(squares[(size_t)i].Get() == i * i);
-			CHECK(squares[5].Ready());
+			CHECK(squares[5].IsReady());
 			CHECK(squares[5].Get() == 25); // again: the same value
 			done.Get();
 			CHECK(sideEffect.load() == 7);
@@ -3047,7 +3049,7 @@ TEST_CASE("loom: futures — values, void, move-only results and repeated Get, a
 			CHECK(text.Get().size() == 101);
 
 			loom::Future<int> moved = std::move(squares[3]);
-			CHECK(!squares[3].Valid());
+			CHECK(!squares[3].IsValid());
 			CHECK(squares[3].Counter() == loom::kInvalidCounter);
 			CHECK(moved.Get() == 9);
 			moved = std::move(squares[4]); // drops the old one
@@ -3059,7 +3061,7 @@ TEST_CASE("loom: futures — values, void, move-only results and repeated Get, a
 
 TEST_CASE("loom: futures — a dropped future's task still runs, and frees its state")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	const int baseline = LiveCounters();
 	Tracked::live = 0;
 	std::atomic<int> ran{ 0 };
@@ -3097,7 +3099,7 @@ TEST_CASE("loom: futures — a dropped future's task still runs, and frees its s
 	loom::Future<int> g = loom::Async([] { return 4; });
 	CHECK(g.Get() == 4);
 	g.Reset();
-	CHECK(!g.Valid());
+	CHECK(!g.IsValid());
 	while (loom::LiveTaskCount() > 0)
 		std::this_thread::yield();
 	CHECK(LiveCounters() == baseline);
@@ -3105,7 +3107,7 @@ TEST_CASE("loom: futures — a dropped future's task still runs, and frees its s
 
 TEST_CASE("loom: futures — a task can wait for futures and read them without blocking")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 3 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 3 });
 	const loom::DedicatedId io = loom::RegisterDedicatedThread(loom::DedicatedConfig{ .name = "future-io" });
 	loom::ScopedCounter gate(1);
 	loom::Future<int> a = loom::Async([] { return 20; }, loom::TaskDesc{ .waitsFor = gate });
@@ -3114,7 +3116,7 @@ TEST_CASE("loom: futures — a task can wait for futures and read them without b
 	// A future of futures: runs once both are ready, reads them, never waits.
 	std::atomic<bool> bothReady{ false };
 	loom::Future<int> sum = loom::Async([&] {
-		bothReady = a.Ready() && b.Ready();
+		bothReady = a.IsReady() && b.IsReady();
 		return a.Get() + b.Get();
 	}, loom::TaskDesc{ .waitsForAll = both });
 	// A plain task can wait for one too.
@@ -3123,7 +3125,7 @@ TEST_CASE("loom: futures — a task can wait for futures and read them without b
 	loom::Submit([&] { seen = a.Get(); }, loom::TaskDesc{ .signals = plainDone, .waitsFor = a.Counter() });
 
 	CHECK(!sum.TryWait(20));
-	CHECK(!a.Ready());
+	CHECK(!a.IsReady());
 	loom::Signal(gate);
 	CHECK(sum.Get() == 42);
 	CHECK(bothReady.load());
@@ -3136,13 +3138,13 @@ TEST_CASE("loom: futures — a task can wait for futures and read them without b
 	loom::Future<int> limited = loom::Async([] { return 5; }, loom::TaskDesc{ .priority = loom::Priority::High, .limiter = one });
 	CHECK(onMain.Get() == 0);
 	CHECK(limited.Get() == 5);
-	CHECK(loom::LimiterHeld(one) == 0);
+	CHECK(loom::HeldUnits(one) == 0);
 	loom::UnregisterDedicatedThread(io);
 }
 
 TEST_CASE("loom: futures — once Get returns, the task holds no limiter unit")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 4 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 4 });
 	int held = 0;
 	for (int i = 0; i < 500; i++)
 	{
@@ -3151,7 +3153,7 @@ TEST_CASE("loom: futures — once Get returns, the task holds no limiter unit")
 		loom::Future<void> g = loom::Async([] {}, loom::TaskDesc{ .limiter = limiter });
 		CHECK(f.Get() == i);
 		g.Get();
-		held += (int)loom::LimiterHeld(limiter);
+		held += (int)loom::HeldUnits(limiter);
 	}
 	CHECK(held == 0);
 }
@@ -3159,7 +3161,7 @@ TEST_CASE("loom: futures — once Get returns, the task holds no limiter unit")
 #if defined(__cpp_exceptions)
 TEST_CASE("loom: futures — Get rethrows the callable's exception, every time")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	const int baseline = LiveCounters();
 	Tracked::live = 0;
 	{
@@ -3169,7 +3171,7 @@ TEST_CASE("loom: futures — Get rethrows the callable's exception, every time")
 		loom::Future<int> good = loom::Async([] { return 1; });
 		CHECK_THROWS_AS(bad.Get(), std::runtime_error);
 		CHECK_THROWS_AS(bad.Get(), std::runtime_error);
-		CHECK(bad.Ready());
+		CHECK(bad.IsReady());
 		bad.Wait(); // waiting does not throw
 		CHECK(bad.TryWait(0));
 		CHECK_THROWS_AS(badVoid.Get(), std::logic_error);
@@ -3183,7 +3185,7 @@ TEST_CASE("loom: futures — Get rethrows the callable's exception, every time")
 
 TEST_CASE("loom: promises — set from a thread outside loom, before or after GetFuture")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	const int baseline = LiveCounters();
 	{
 		// An IO callback on a thread loom did not start.
@@ -3201,11 +3203,11 @@ TEST_CASE("loom: promises — set from a thread outside loom, before or after Ge
 		early.SetValue(9);
 		CHECK(early.IsSet());
 		loom::Future<int> late = early.GetFuture();
-		CHECK(late.Ready());
+		CHECK(late.IsReady());
 		CHECK(late.Get() == 9);
 		loom::Promise<void> signal;
 		loom::Future<void> fired = signal.GetFuture();
-		CHECK(!fired.Ready());
+		CHECK(!fired.IsReady());
 		signal.SetValue();
 		fired.Get();
 		loom::Promise<std::vector<int>> built;
@@ -3239,7 +3241,7 @@ TEST_CASE("loom: promises — set from a thread outside loom, before or after Ge
 #if defined(__cpp_exceptions)
 TEST_CASE("loom: promises — an unset promise breaks its future; SetException")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	const int baseline = LiveCounters();
 	{
 		loom::Future<int> orphan;
@@ -3247,13 +3249,13 @@ TEST_CASE("loom: promises — an unset promise breaks its future; SetException")
 			loom::Promise<int> p;
 			orphan = p.GetFuture();
 		}
-		CHECK(orphan.Ready());
+		CHECK(orphan.IsReady());
 		CHECK_THROWS_AS(orphan.Get(), loom::BrokenPromise);
 
 		loom::Promise<int> moved;
 		loom::Future<int> f = moved.GetFuture();
 		loom::Promise<int> owner(std::move(moved)); // the moved-from one breaks nothing
-		CHECK(!f.Ready());
+		CHECK(!f.IsReady());
 		owner.SetValue(3);
 		CHECK(f.Get() == 3);
 
@@ -3268,7 +3270,7 @@ TEST_CASE("loom: promises — an unset promise breaks its future; SetException")
 
 TEST_CASE("loom: promises — set inside a limited task, the task keeps its unit")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	loom::ScopedLimiter one(1);
 	loom::Promise<int> p;
 	loom::Future<int> f = p.GetFuture();
@@ -3282,17 +3284,17 @@ TEST_CASE("loom: promises — set inside a limited task, the task keeps its unit
 	// Without helping: a helping Get could run the task here, and it spins
 	// until this thread sets `release`.
 	CHECK(f.Get(loom::Help::BlockOnly) == 5);
-	CHECK_MESSAGE(loom::LimiterHeld(one) == 1, "the setting task is still running and still holds its unit");
+	CHECK_MESSAGE(loom::HeldUnits(one) == 1, "the setting task is still running and still holds its unit");
 	release = true;
 	loom::WaitFor(done);
-	CHECK(loom::LimiterHeld(one) == 0);
+	CHECK(loom::HeldUnits(one) == 0);
 }
 
 TEST_CASE("loom: continuations — chains run in order and outlive the futures they read")
 {
 	for (int workers : { 0, 1, -1 })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 		const int baseline = LiveCounters();
 		Tracked::live = 0;
 		{
@@ -3308,7 +3310,7 @@ TEST_CASE("loom: continuations — chains run in order and outlive the futures t
 			loom::Future<void> toVoid = fromVoid.Then([&](int& v) { steps += v; });
 			toVoid.Get();
 			CHECK(steps.load() == 9);
-			CHECK(fromVoid.Ready());
+			CHECK(fromVoid.IsReady());
 			loom::Future<int> again = fromVoid.Then([](const int& v) { return v * 2; });
 			loom::Future<int> branch = fromVoid.Then([](int v) { return v * 3; });
 			CHECK(again.Get() == 14);
@@ -3345,13 +3347,13 @@ TEST_CASE("loom: continuations — chains run in order and outlive the futures t
 
 TEST_CASE("loom: continuations — a limited step, and a step waiting on more counters")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 3 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 3 });
 	loom::ScopedLimiter one(1);
 	for (int i = 0; i < 200; i++)
 	{
 		loom::Future<int> f = loom::Async([i] { return i; }).Then([](int& v) { return v * 2; }, loom::TaskDesc{ .limiter = one });
 		CHECK(f.Get() == 2 * i);
-		CHECK(loom::LimiterHeld(one) == 0);
+		CHECK(loom::HeldUnits(one) == 0);
 	}
 	loom::ScopedCounter extra(1);
 	const loom::CounterHandle more[] = { extra };
@@ -3364,7 +3366,7 @@ TEST_CASE("loom: continuations — a limited step, and a step waiting on more co
 #if defined(__cpp_exceptions)
 TEST_CASE("loom: continuations — an error skips the rest of the chain and reaches its end")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	const int baseline = LiveCounters();
 	{
 		std::atomic<int> ran{ 0 };
@@ -3432,15 +3434,15 @@ namespace {
 	const loom::DebugThread* FindRunning(const loom::DebugState& s, uint32_t nameId)
 	{
 		for (const loom::DebugThread& t : s.threads)
-			if (t.running > 0 && t.runningName == nameId)
+			if (t.runningDepth > 0 && t.runningNameId == nameId)
 				return &t;
 		return nullptr;
 	}
 }
 
-TEST_CASE("loom: debug dump — a stuck wait, the tasks parked on it and who sleeps on it")
+TEST_CASE("loom: debug dump — a stuck wait, the tasks waiting for it and who sleeps on it")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	CHECK(loom::CaptureDebugState().threads.front().isMain);
 
 	loom::ScopedCounter gate(1), done(3), inner(1);
@@ -3459,8 +3461,8 @@ TEST_CASE("loom: debug dump — a stuck wait, the tasks parked on it and who sle
 		const loom::DebugThread* t = FindRunning(st, 22);
 		const loom::DebugCounter* gc = FindCounter(st, gate.Get());
 		// The thread's record names the counter before it goes to sleep on it.
-		return d && !d->waiters.empty() && t && t->waitingOn == gate.Get() && gc
-			&& std::find(gc->waiters.begin(), gc->waiters.end(), t->index) != gc->waiters.end();
+		return d && !d->sleepers.empty() && t && t->waitingOn == gate.Get() && gc
+			&& std::find(gc->sleepers.begin(), gc->sleepers.end(), t->index) != gc->sleepers.end();
 	});
 	const loom::DebugCounter* g = FindCounter(s, gate.Get());
 	const loom::DebugCounter* d = FindCounter(s, done.Get());
@@ -3469,18 +3471,18 @@ TEST_CASE("loom: debug dump — a stuck wait, the tasks parked on it and who sle
 	REQUIRE(d);
 	REQUIRE(t);
 	CHECK(g->count == 1);
-	CHECK(g->parkedTotal == 3);
-	REQUIRE(g->parked.size() == 3);
-	CHECK(g->parked[0].nameId == 11);
-	CHECK(std::find(g->waiters.begin(), g->waiters.end(), t->index) != g->waiters.end()); // the task's own wait sleeps
+	CHECK(g->waitingTotal == 3);
+	REQUIRE(g->waiting.size() == 3);
+	CHECK(g->waiting[0].nameId == 11);
+	CHECK(std::find(g->sleepers.begin(), g->sleepers.end(), t->index) != g->sleepers.end()); // the task's own wait sleeps
 	CHECK(d->count == 3);
-	CHECK(d->waiters == std::vector<int>{ outside.load() });
+	CHECK(d->sleepers == std::vector<int>{ outside.load() });
 	CHECK(t->runningSignals == inner.Get());
 	CHECK(t->waitingSeconds >= 0.0);
 	CHECK(!t->isMain);
 
 	const std::string text = loom::FormatDebugState(s, &DumpTestName);
-	CHECK(text.find("3 parked: 'draw' x3") != std::string::npos);
+	CHECK(text.find("3 waiting: 'draw' x3") != std::string::npos);
 	CHECK(text.find("running 'physics'") != std::string::npos);
 	CHECK(text.find("asleep on it: [" + std::to_string(outside.load()) + "]") != std::string::npos);
 	CHECK(loom::FormatDebugState(s).find("task#11 x3") != std::string::npos); // no names: ids
@@ -3490,25 +3492,25 @@ TEST_CASE("loom: debug dump — a stuck wait, the tasks parked on it and who sle
 	loom::WaitFor(inner);
 	const loom::DebugState after = CaptureWhen([](const loom::DebugState& st) {
 		for (const loom::DebugThread& th : st.threads)
-			if (th.running > 0)
+			if (th.runningDepth > 0)
 				return false;
 		return true;
 	});
 	CHECK(FindRunning(after, 22) == nullptr);
 	CHECK(FindCounter(after, gate.Get())->count == 0);
-	CHECK(FindCounter(after, gate.Get())->parkedTotal == 0);
+	CHECK(FindCounter(after, gate.Get())->waitingTotal == 0);
 }
 
 TEST_CASE("loom: debug dump — hints for a missing signal, unpumped main work and a limiter waiting on itself")
 {
-	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
 	{
 		// Nobody will signal this: only a thread outside the pool waits.
 		loom::ScopedCounter never(1);
 		std::thread waiter([&] { loom::WaitFor(never.Get(), loom::Help::BlockOnly); });
 		CaptureWhen([&](const loom::DebugState& st) {
 			const loom::DebugCounter* c = FindCounter(st, never.Get());
-			return c && !c->waiters.empty();
+			return c && !c->sleepers.empty();
 		});
 		CHECK(loom::DebugDump().find("hint: nothing is running or queued") != std::string::npos);
 		loom::Signal(never);
@@ -3561,7 +3563,7 @@ TEST_CASE("loom: debug dump — main thread waits and nested tasks, no pool, cap
 	CHECK(loom::DebugDump().find("0 tasks live") != std::string::npos);
 	{
 		// No workers: the main thread runs everything, inside its own wait.
-		loom::Pool pool(loom::LoomConfig{ .workerCount = 0 });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 0 });
 		loom::DebugState seen, back;
 		loom::ScopedCounter outer(1);
 		loom::Submit([&] {
@@ -3574,23 +3576,23 @@ TEST_CASE("loom: debug dump — main thread waits and nested tasks, no pool, cap
 		REQUIRE(!seen.threads.empty());
 		const loom::DebugThread& m = seen.threads.front();
 		CHECK(m.isMain);
-		CHECK(m.running == 2);       // the outer task, and the one its wait ran
-		CHECK(m.runningName == 11);  // the innermost
+		CHECK(m.runningDepth == 2);       // the outer task, and the one its wait ran
+		CHECK(m.runningNameId == 11);  // the innermost
 		CHECK(m.waitingOn != loom::kInvalidCounter);
 		CHECK(loom::FormatDebugState(seen, &DumpTestName).find("running 'draw' (signals") != std::string::npos);
 		REQUIRE(!back.threads.empty());
-		CHECK(back.threads.front().running == 1);
-		CHECK(back.threads.front().runningName == 22);
+		CHECK(back.threads.front().runningDepth == 1);
+		CHECK(back.threads.front().runningNameId == 22);
 		CHECK(back.threads.front().waitingOn == outer.Get()); // the main thread's own wait, which ran the task
 		const loom::DebugState after = loom::CaptureDebugState();
-		CHECK(after.threads.front().running == 0);
+		CHECK(after.threads.front().runningDepth == 0);
 		CHECK(after.threads.front().waitingOn == loom::kInvalidCounter);
 		CHECK(after.threads.front().tasksRun >= 2);
 	}
 	{
 		// Captures racing a busy pool: counters, limiters, futures and waits
 		// come and go while another thread reads them.
-		loom::Pool pool(loom::LoomConfig{});
+		loom::Pool pool(loom::PoolConfig{});
 		std::atomic<bool> stop{ false };
 		std::atomic<int> captures{ 0 };
 		std::thread reader([&] {
@@ -3605,7 +3607,7 @@ TEST_CASE("loom: debug dump — main thread waits and nested tasks, no pool, cap
 		{
 			loom::ScopedCounter gate(1), done(64);
 			for (int i = 0; i < 64; i++)
-				loom::Submit([&] { (void)loom::Load(gate); }, loom::TaskDesc{ .signals = done, .waitsFor = gate, .nameId = 11, .limiter = i % 2 ? four.Get() : loom::kInvalidLimiter });
+				loom::Submit([&] { (void)loom::Count(gate); }, loom::TaskDesc{ .signals = done, .waitsFor = gate, .nameId = 11, .limiter = i % 2 ? four.Get() : loom::kInvalidLimiter });
 			loom::Future<int> f = loom::Async([] { return 1; }).Then([](int& v) { return v + 1; });
 			loom::Signal(gate);
 			loom::WaitFor(done);

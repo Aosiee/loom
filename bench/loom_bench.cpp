@@ -549,7 +549,7 @@ int main(int argc, char** argv)
 	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
 	{
 		// Room for every task queued at once (the parked run queues them all).
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers, .maxTasks = (uint32_t)std::max(tasks + 1024, 1 << 18) });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers, .maxTasks = (uint32_t)std::max(tasks + 1024, 1 << 18) });
 		double bestTotal = 1e9, bestCreate = 1e9, bestParked = 1e9, bestFor = 1e9;
 		for (int r = 0; r < repeats; r++)
 		{
@@ -567,7 +567,7 @@ int main(int argc, char** argv)
 	const FrameDag dag;
 	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 		double bestGraph = 1e9, bestCounters = 1e9;
 		for (int r = 0; r < repeats; r++)
 		{
@@ -580,7 +580,7 @@ int main(int argc, char** argv)
 	std::printf("%-30s  %7s  %10s  %11s  %6s\n", "shape", "workers", "TaskGraph", "counters", "ratio");
 	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers, .maxTasks = 1 << 16 });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers, .maxTasks = 1 << 16 });
 		GraphShapes(workers, repeats);
 	}
 
@@ -588,7 +588,7 @@ int main(int argc, char** argv)
 	std::printf("%8s  %12s  %16s  %20s\n", "workers", "no limiter", "limit never hit", "limit workers / 4");
 	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers, .maxTasks = 1 << 16 });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers, .maxTasks = 1 << 16 });
 		loom::ScopedLimiter wide(1u << 20), narrow((uint32_t)std::max(1, workers / 4));
 		const int n = 4096;
 		double none = 1e9, never = 1e9, held = 1e9;
@@ -603,7 +603,7 @@ int main(int argc, char** argv)
 
 	{
 		const int workers = std::max(1, cores - 1);
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 		std::printf("\na frame (256 x 5 us ParallelFor) beside 1 ms Low background tasks, %d workers, us\n", workers);
 		std::printf("%-34s  %8s  %8s  %15s  %12s\n", "background", "median", "p99", "isolated median", "isolated p99");
 		auto row = [&](const char* name, int tasks, loom::LimiterHandle limiter) {
@@ -620,7 +620,7 @@ int main(int argc, char** argv)
 	std::printf("%8s  %10s  %22s  %6s\n", "workers", "futures", "one counter + array", "ratio");
 	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers, .maxTasks = 1 << 16, .maxCounters = 8192 });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers, .maxTasks = 1 << 16, .maxCounters = 8192 });
 		const int n = 4096;
 		double futures = 1e9, array = 1e9;
 		for (int r = 0; r < repeats * 20; r++)
@@ -636,7 +636,7 @@ int main(int argc, char** argv)
 	std::printf("%8s  %10s  %22s  %6s\n", "workers", "Then", "counter per step", "ratio");
 	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers, .maxTasks = 1 << 16, .maxCounters = 8192 });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers, .maxTasks = 1 << 16, .maxCounters = 8192 });
 		double then = 1e9, counters = 1e9;
 		for (int r = 0; r < repeats * 20; r++)
 		{
@@ -662,7 +662,7 @@ int main(int argc, char** argv)
 	const double serialBig = Best(repeats, [&] { return ScanRun(bigIn, bigOut, false); });
 	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 		const double sort = Best(repeats, [&] { return SortRun(keys, true); });
 		const double small = Best(repeats * 4, [&] { return ScanRun(smallIn, smallOut, true); });
 		const double big = Best(repeats, [&] { return ScanRun(bigIn, bigOut, true); });
@@ -674,7 +674,7 @@ int main(int argc, char** argv)
 	std::printf("%8s  %10s  %16s  %18s\n", "workers", "in flight", "empty stages", "100-Work middle");
 	for (int workers : { 1, std::max(1, cores / 2), std::max(1, cores - 1) })
 	{
-		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
 		for (uint32_t inFlight : { 4u, 64u })
 		{
 			const double empty = Best(repeats, [&] { return PipelineRun(20000, inFlight, 0); });

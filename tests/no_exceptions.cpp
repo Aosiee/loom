@@ -22,7 +22,7 @@ static void Check(bool ok, const char* what)
 
 int main()
 {
-	loom::Pool pool(loom::LoomConfig{});
+	loom::Pool pool(loom::PoolConfig{});
 
 	std::vector<int> v(300000);
 	for (size_t i = 0; i < v.size(); i++)
@@ -63,8 +63,8 @@ int main()
 	Check(seen == 100 && inOrder, "Pipeline");
 
 	loom::ScopedLimiter limiter(2);
-	loom::SetLimiterLimit(limiter, 3);
-	Check(loom::LimiterLimit(limiter) == 3, "SetLimiterLimit");
+	loom::SetLimit(limiter, 3);
+	Check(loom::Limit(limiter) == 3, "SetLimit");
 
 	if (s_Failed == 0)
 		std::printf("no-exceptions build: all checks passed\n");

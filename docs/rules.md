@@ -41,7 +41,7 @@ a fixed order afterwards, which is what `ParallelReduce` does.
 `Shutdown()` first runs everything that was submitted, including work those
 tasks submit while it drains, and every wait completes. So every submitted
 task must be able to run: a task waiting on a counter nobody will signal
-stops the drain (after `LoomConfig::shutdownTimeoutMs`), and what is left,
+stops the drain (after `PoolConfig::shutdownTimeoutMs`), and what is left,
 along with lanes still held, asserts.
 
 ## An exception needs a counter to go to
@@ -94,7 +94,7 @@ future is dropped and its task has finished. A task that waits on
 keep the future where both can reach it (a member, or the frame's state),
 and drop it only after that task's own counter has reached zero. Each
 pending future holds one counter, so thousands in flight at once need a
-larger `LoomConfig::maxCounters`.
+larger `PoolConfig::maxCounters`.
 
 A continuation is the exception: `Then` holds its input itself, so a chain
 may be built from temporaries and only its last future kept.

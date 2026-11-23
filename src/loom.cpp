@@ -38,7 +38,7 @@ namespace loom {
 //   - Submit(span) chains its tasks into groups handed over as one entry;
 //     whoever takes a group spreads the rest from its own deque.
 //   - A counter is an atomic; only its final decrement takes its lock (to
-//     release the tasks parked on it and wake its waiters). A worker applies
+//     release the tasks waiting for it and wake its waiters). A worker applies
 //     its finished tasks' signals to one counter in one go.
 //   - Every sleep in loom goes through one Waiter per thread: a futex word
 //     the waker sets and notifies. Idle workers and sleeping helpers register
@@ -70,9 +70,9 @@ struct alignas(64) TaskSlot
 	TaskFn        fn       = nullptr;                 // 0
 	void*         userData = nullptr;                 // 8
 	Affinity      affinity = Affinity::AnyWorker;     // 16
-	uint8_t       window   = 0;                       // 17
+	uint8_t       profilerTag   = 0;                       // 17
 	uint16_t      limiter  = 0;                       // 18: its limiter's index + 1 (0 none)
-	DedicatedId   thread   = 0;                       // 20
+	DedicatedId   thread   = {};                      // 20
 	CounterHandle signals  = kInvalidCounter;         // 24
 	Priority      priority = Priority::Normal;        // 28
 	// It owns a callable (Submit(F) with a non-trivial or large one): the
@@ -126,7 +126,7 @@ static constexpr uint32_t kGroupBit = 1u << 31;
 // The most tasks Submit(span) chains into one entry.
 static constexpr uint32_t kMaxGroup = 32;
 // A thread applies its deferred task signals at least this often, so a
-// counter's Load never lags far behind.
+// counter's Count never lags far behind.
 static constexpr int kMaxDeferredSignals = 64;
 
 // ---- Waiting ------------------------------------------------------------------
@@ -366,7 +366,7 @@ private:
 // ---- Counters ------------------------------------------------------------------
 // `count` holds the user's count PLUS ONE while it is nonzero: the decrement
 // that takes the user's count to zero leaves 1 behind, then, under the lock,
-// stores 0, releases the parked tasks and wakes the waiters. A task released
+// stores 0, releases the waiting tasks and wakes the waiters. A task released
 // that way, or a waiter, may see zero before the final signaller has let go
 // of the lock, so DestroyCounter takes the lock first: the counter outlives
 // that signaller. 0 means "zero and settled".
@@ -375,7 +375,7 @@ struct alignas(64) CounterState
 {
 	std::atomic<int>      count{ 0 };
 	std::mutex            mutex;
-	std::vector<uint32_t> pending; // slots parked until zero
+	std::vector<uint32_t> pending; // slots waiting for zero
 	std::vector<Waiter*>  waiters; // threads asleep in WaitFor
 	// The first exception a task signalling this counter threw (under the
 	// lock); `failed` lets WaitFor check without it.
@@ -403,7 +403,7 @@ struct alignas(64) CounterState
 // Lowering the limit takes free units out at once and, for units that are
 // held, leaves "retiring" debts: a finishing task that finds one pays it with
 // its unit instead of handing it on. Raising it gives the new units back as
-// finishing tasks would. Unit indices (LimiterUnit) are handed out lazily from
+// finishing tasks would. Unit indices (CurrentLimiterUnit) are handed out lazily from
 // a stack of free ones below the limit; a task over a lowered limit may get
 // one above it, which is dropped again when it finishes.
 
@@ -433,7 +433,7 @@ struct DedicatedState
 	std::mutex             mutex;  // guards queue + waiter
 	Waiter*                waiter = nullptr; // set while the thread sleeps
 	std::atomic<bool>      stop{ false };
-	DedicatedId            id = 0;
+	DedicatedId            id = {};
 	// Its CurrentThreadIndex, once the thread has started: the key of its
 	// stats row (names need not be unique).
 	std::atomic<int>       threadIndex{ -1 };
@@ -518,7 +518,7 @@ struct PoolState
 	std::vector<uint32_t>   freeLimiters;
 
 	// false from the first instruction of Shutdown (TryHelp, PumpMainThreadTasks
-	// and IsInitialised then report the pool as down while it drains).
+	// and HasActivePool then report the pool as down while it drains).
 	std::atomic<bool>       running{ false };
 	std::atomic<bool>       stop{ false };
 	std::thread::id         mainThreadId;
@@ -559,7 +559,7 @@ struct PoolState
 	std::mutex              dedicatedMutex;
 	std::vector<std::unique_ptr<DedicatedState>> dedicated;
 	// Ids are handed out once: a stale id never reaches a newer thread.
-	DedicatedId             nextDedicatedId = 0;
+	uint32_t                nextDedicatedId = 0;
 	std::atomic<int>        lanesHeld{ 0 };
 
 	// Thread stats (the pool visualizer). Rows are only ever added until
@@ -629,7 +629,7 @@ static thread_local uint16_t        t_Isolation = 0;
 // its own counter from inside, as a future's does, can give its unit back
 // first. Null outside a task; saved and restored around nested runs.
 static thread_local uint16_t*       t_RunningLimiter = nullptr;
-// Its unit index once LimiterUnit asked for one (kNoUnitIndex before), beside it.
+// Its unit index once CurrentLimiterUnit asked for one (kNoUnitIndex before), beside it.
 static thread_local uint32_t*       t_RunningUnit = nullptr;
 
 static PoolState& ActivePool()
@@ -693,10 +693,10 @@ static void MarkProfilerState(PoolState& P, int threadIndex, uint8_t state)
 		fn(threadIndex, state);
 }
 
-static uint64_t MarkProfilerZone(PoolState& P, int threadIndex, uint32_t nameId, uint8_t window, const char* name, bool begin, uint64_t handle)
+static uint64_t MarkProfilerZone(PoolState& P, int threadIndex, uint32_t nameId, uint8_t profilerTag, const char* name, bool begin, uint64_t handle)
 {
 	if (ProfilerZoneFn fn = P.profilerZoneHook.load(std::memory_order_acquire))
-		return fn(threadIndex, nameId, window, name, begin, handle);
+		return fn(threadIndex, nameId, profilerTag, name, begin, handle);
 	return 0;
 }
 
@@ -708,10 +708,17 @@ static constexpr uint32_t kCounterIndexMask = (1u << kCounterGenBits) - 1;
 
 static CounterHandle PackCounter(uint32_t index, uint32_t generation)
 {
-	return (generation << kCounterGenBits) | index;
+	return CounterHandle{ (generation << kCounterGenBits) | index };
 }
-static uint32_t CounterIndex(CounterHandle h) { return h & kCounterIndexMask; }
-static uint32_t CounterGeneration(CounterHandle h) { return h >> kCounterGenBits; }
+// Limiter handles pack the same way.
+static LimiterHandle PackLimiter(uint32_t index, uint32_t generation)
+{
+	return LimiterHandle{ (generation << kCounterGenBits) | index };
+}
+template <typename H>
+static uint32_t HandleIndex(H h) { return (uint32_t)h & kCounterIndexMask; }
+template <typename H>
+static uint32_t HandleGeneration(H h) { return (uint32_t)h >> kCounterGenBits; }
 
 // Handle -> state, or null for a stale or invalid handle. The checks are
 // relaxed and lock-free: they catch misuse (asserted by the callers), they do
@@ -720,10 +727,10 @@ static uint32_t CounterGeneration(CounterHandle h) { return h >> kCounterGenBits
 static CounterState* ResolveCounter(PoolState& P, CounterHandle h)
 {
 	if (h == kInvalidCounter) return nullptr;
-	uint32_t idx = CounterIndex(h);
+	uint32_t idx = HandleIndex(h);
 	if (idx >= P.counterCount) return nullptr;
 	CounterState& c = P.counters[idx];
-	if (!c.alive.load(std::memory_order_relaxed) || CounterGeneration(h) != c.generation.load(std::memory_order_relaxed)) return nullptr;
+	if (!c.alive.load(std::memory_order_relaxed) || HandleGeneration(h) != c.generation.load(std::memory_order_relaxed)) return nullptr;
 	return &c;
 }
 
@@ -731,10 +738,10 @@ static CounterState* ResolveCounter(PoolState& P, CounterHandle h)
 static LimiterState* ResolveLimiter(PoolState& P, LimiterHandle h)
 {
 	if (h == kInvalidLimiter) return nullptr;
-	const uint32_t idx = CounterIndex(h);
+	const uint32_t idx = HandleIndex(h);
 	if (idx >= P.limiterCount) return nullptr;
 	LimiterState& l = P.limiters[idx];
-	if (!l.alive.load(std::memory_order_relaxed) || CounterGeneration(h) != l.generation.load(std::memory_order_relaxed)) return nullptr;
+	if (!l.alive.load(std::memory_order_relaxed) || HandleGeneration(h) != l.generation.load(std::memory_order_relaxed)) return nullptr;
 	return &l;
 }
 
@@ -1054,7 +1061,7 @@ static void ReleaseSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 
 // ---- Lifecycle -------------------------------------------------------------------
 
-Pool::Pool(const LoomConfig& config)
+Pool::Pool(const PoolConfig& config)
 	: m_State(std::make_unique<PoolState>())
 {
 	// One pool at a time: the free API resolves the single active pool.
@@ -1167,7 +1174,7 @@ void Pool::Shutdown()
 {
 	PoolState& P = *m_State;
 	if (!P.running) return;
-	P.running = false; // IsInitialised and PumpMainThreadTasks report the pool as down from here
+	P.running = false; // HasActivePool and PumpMainThreadTasks report the pool as down from here
 
 	// Drain first, with every thread still running: a task may still submit
 	// work (main-thread work too) and wait for it, and every wait completes.
@@ -1237,7 +1244,7 @@ void Pool::Shutdown()
 	s_ActivePool.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
 }
 
-bool IsInitialised()
+bool HasActivePool()
 {
 	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
 	return pool && pool->running;
@@ -1562,7 +1569,7 @@ static bool ReadySlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	return EnqueueSlot(P, slot, ctx);
 }
 
-// A parked task's count of unmet dependencies. It lives in groupNext, which
+// A waiting task's count of unmet dependencies. It lives in groupNext, which
 // only a runnable task uses (a task with dependencies is never grouped).
 static std::atomic_ref<uint32_t> PendingDeps(PoolState& P, uint32_t slot)
 {
@@ -1585,7 +1592,7 @@ static bool DispatchSlot(PoolState& P, uint32_t slot, const TaskDesc& desc, Work
 	// (by a counter reaching zero meanwhile) before every counter has it.
 	auto deps = PendingDeps(P, slot);
 	deps.store(1, std::memory_order_relaxed);
-	auto park = [&](CounterHandle h) {
+	auto waitOn = [&](CounterHandle h) {
 		if (h == kInvalidCounter)
 			return;
 		CounterState* c = ResolveCounter(P, h);
@@ -1601,9 +1608,9 @@ static bool DispatchSlot(PoolState& P, uint32_t slot, const TaskDesc& desc, Work
 			c->pending.push_back(slot);
 		}
 	};
-	park(desc.waitsFor);
+	waitOn(desc.waitsFor);
 	for (CounterHandle h : desc.waitsForAll)
-		park(h);
+		waitOn(h);
 	// Drop our hold. Whoever takes the count to zero (us, or the last
 	// counter's final signal) enqueues the task, exactly once.
 	if (deps.fetch_sub(1, std::memory_order_acq_rel) == 1)
@@ -1627,7 +1634,7 @@ static uint32_t PrepareSlot(PoolState& P, const TaskDesc& desc, WorkerCtx* ctx)
 	t.owned = false; // byte 29 was part of the free-batch list
 	t.isolation = t_Isolation; // a task belongs to the region it was submitted in
 	t.nameId = desc.nameId;
-	t.window = desc.window;
+	t.profilerTag = desc.profilerTag;
 	t.limiter = LimiterTag(P, desc.limiter);
 	LiveShard(P, ctx).fetch_add(1, std::memory_order_relaxed);
 	return slot;
@@ -1937,9 +1944,9 @@ struct GraphState
 		void*       userData = nullptr;
 		void      (*destroy)(void*) = nullptr; // an owned callable (Add(F))
 		Affinity    affinity = Affinity::AnyWorker;
-		DedicatedId thread = 0;
+		DedicatedId thread = {};
 		Priority    priority = Priority::Normal;
-		uint8_t     window = 0;
+		uint8_t     profilerTag = 0;
 		uint32_t    nameId = 0;
 		LimiterHandle limiter = kInvalidLimiter;
 	};
@@ -2109,7 +2116,7 @@ static size_t QueueGraphSet(PoolState& P, GraphState& g, uint32_t set, WorkerCtx
 		t.owned = false;
 		t.isolation = isolation;
 		t.nameId = n.nameId;
-		t.window = n.window;
+		t.profilerTag = n.profilerTag;
 		t.limiter = LimiterTag(P, n.limiter);
 		if (groupSize > 1 && n.affinity == Affinity::AnyWorker && n.priority == Priority::Normal && t.limiter == 0)
 		{
@@ -2194,7 +2201,7 @@ static void GraphNodeTask(void* p)
 	// The runner then signals nodesLeft for this node.
 }
 
-// Starts a run whose waitsFor was not yet zero, from a task parked on it.
+// Starts a run whose waitsFor was not yet zero, from a task waiting for it.
 static void GraphLaunchTask(void* p)
 {
 	StartGraphRun(ActivePool(), *static_cast<GraphState*>(p));
@@ -2232,7 +2239,7 @@ TaskGraph::Node TaskGraph::AddOwned(void* object, void (*run)(void*), void (*des
 		&& "a graph node's counters come from the graph");
 	assert((opts.affinity != Affinity::Dedicated) || opts.thread != kInvalidDedicated);
 	g.nodes.push_back(GraphState::NodeDesc{ .fn = run, .userData = object, .destroy = destroy, .affinity = opts.affinity,
-		.thread = opts.thread, .priority = opts.priority, .window = opts.window, .nameId = opts.nameId, .limiter = opts.limiter });
+		.thread = opts.thread, .priority = opts.priority, .profilerTag = opts.profilerTag, .nameId = opts.nameId, .limiter = opts.limiter });
 	g.compiled = false;
 	return Node(g.nodes.size() - 1);
 }
@@ -2263,7 +2270,7 @@ size_t TaskGraph::NodeCount() const
 	return m_State ? m_State->nodes.size() : 0;
 }
 
-bool TaskGraph::Running() const
+bool TaskGraph::IsRunning() const
 {
 	return m_State && m_State->running.load(std::memory_order_acquire);
 }
@@ -2389,14 +2396,14 @@ void DestroyCounter(CounterHandle h)
 		// The lock orders this after a final signaller still releasing the list.
 		std::lock_guard<std::mutex> lock(c->mutex);
 		assert(c->count.load(std::memory_order_relaxed) == 0 && "destroying a counter with nonzero count");
-		assert(c->pending.empty() && "destroying a counter with parked tasks");
+		assert(c->pending.empty() && "destroying a counter with waiting tasks");
 		assert(c->waiters.empty() && "destroying a counter with waiters");
 		c->error = nullptr;
 	}
 	// Under the lock CreateCounter holds: the handle is invalidated before the
 	// index can be handed out again.
 	std::lock_guard<std::mutex> lock(P.counterMutex);
-	if (!c->alive.load(std::memory_order_relaxed) || c->generation.load(std::memory_order_relaxed) != CounterGeneration(h))
+	if (!c->alive.load(std::memory_order_relaxed) || c->generation.load(std::memory_order_relaxed) != HandleGeneration(h))
 	{
 		assert(false && "counter destroyed twice");
 		return;
@@ -2408,7 +2415,7 @@ void DestroyCounter(CounterHandle h)
 	// its slot.
 	const uint32_t next = (c->generation.load(std::memory_order_relaxed) + 1) & 0xFFF;
 	c->generation.store(next == 0 ? 1 : next, std::memory_order_relaxed);
-	P.freeCounters.push_back(CounterIndex(h));
+	P.freeCounters.push_back(HandleIndex(h));
 }
 
 void Signal(CounterHandle h, int n)
@@ -2453,7 +2460,7 @@ static void SignalCounter(PoolState& P, CounterHandle h, int n)
 	if (before - n != 1)
 		return;
 
-	// The final signal: settle, then release the parked tasks and the waiters.
+	// The final signal: settle, then release the waiting tasks and the waiters.
 	// Settling first means a released task, which may run on another thread
 	// before this lock is dropped, already reads the count as zero. Anyone
 	// who sees zero and destroys the counter waits for this lock.
@@ -2462,7 +2469,7 @@ static void SignalCounter(PoolState& P, CounterHandle h, int n)
 	{
 		std::lock_guard<std::mutex> lock(c->mutex);
 		c->count.store(0, std::memory_order_release);
-		// A task parked on several counters runs when the last one releases it.
+		// A task waiting for several counters runs when the last one releases it.
 		for (uint32_t slot : c->pending)
 			if (PendingDeps(P, slot).fetch_sub(1, std::memory_order_acq_rel) == 1)
 				pooled += ReadySlot(P, slot, ctx) ? 1 : 0;
@@ -2581,7 +2588,7 @@ LimiterHandle CreateLimiter(uint32_t limit)
 	std::lock_guard<std::mutex> lock(P.limiterMutex);
 	if (P.freeLimiters.empty())
 	{
-		assert(false && "limiter pool exhausted (LoomConfig::maxLimiters)");
+		assert(false && "limiter pool exhausted (PoolConfig::maxLimiters)");
 		return kInvalidLimiter;
 	}
 	const uint32_t i = P.freeLimiters.back();
@@ -2598,7 +2605,7 @@ LimiterHandle CreateLimiter(uint32_t limit)
 	}
 	l.count.store((int)limit, std::memory_order_relaxed);
 	l.alive.store(true, std::memory_order_release);
-	return PackCounter(i, l.generation.load(std::memory_order_relaxed));
+	return PackLimiter(i, l.generation.load(std::memory_order_relaxed));
 }
 
 void DestroyLimiter(LimiterHandle h)
@@ -2614,7 +2621,7 @@ void DestroyLimiter(LimiterHandle h)
 			&& l->handoffs == 0 && l->retiring.load(std::memory_order_relaxed) == 0 && "destroying a limiter whose tasks are live");
 	}
 	std::lock_guard<std::mutex> lock(P.limiterMutex);
-	if (!l->alive.load(std::memory_order_relaxed) || l->generation.load(std::memory_order_relaxed) != CounterGeneration(h))
+	if (!l->alive.load(std::memory_order_relaxed) || l->generation.load(std::memory_order_relaxed) != HandleGeneration(h))
 	{
 		assert(false && "limiter destroyed twice");
 		return;
@@ -2622,12 +2629,12 @@ void DestroyLimiter(LimiterHandle h)
 	l->alive.store(false, std::memory_order_relaxed);
 	const uint32_t next = (l->generation.load(std::memory_order_relaxed) + 1) & 0xFFF;
 	l->generation.store(next == 0 ? 1 : next, std::memory_order_relaxed);
-	P.freeLimiters.push_back(CounterIndex(h));
+	P.freeLimiters.push_back(HandleIndex(h));
 }
 
 // count is free units less waiters less retiring debts. While it is negative
 // no unit is free, and the held ones are the limit plus those still to retire.
-static uint32_t HeldUnits(const LimiterState& l)
+static uint32_t UnitsHeld(const LimiterState& l)
 {
 	const int count = l.count.load(std::memory_order_acquire);
 	const uint32_t limit = l.limit.load(std::memory_order_relaxed);
@@ -2636,7 +2643,7 @@ static uint32_t HeldUnits(const LimiterState& l)
 	return limit + l.retiring.load(std::memory_order_relaxed);
 }
 
-void SetLimiterLimit(LimiterHandle h, uint32_t limit)
+void SetLimit(LimiterHandle h, uint32_t limit)
 {
 	PoolState& P = ActivePool();
 	assert(limit >= 1 && limit < (uint32_t)INT_MAX && "limiter limit out of range");
@@ -2683,7 +2690,7 @@ void SetLimiterLimit(LimiterHandle h, uint32_t limit)
 	WakeForWork(P, woken);
 }
 
-uint32_t LimiterUnit()
+uint32_t CurrentLimiterUnit()
 {
 	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
 	if (!pool || !t_RunningLimiter || *t_RunningLimiter == 0)
@@ -2693,23 +2700,23 @@ uint32_t LimiterUnit()
 	return *t_RunningUnit;
 }
 
-uint32_t LimiterLimit(LimiterHandle h)
+uint32_t Limit(LimiterHandle h)
 {
 	const LimiterState* l = ResolveLimiter(ActivePool(), h);
 	assert(l && "invalid/destroyed limiter");
 	return l ? l->limit.load(std::memory_order_relaxed) : 0;
 }
 
-uint32_t LimiterHeld(LimiterHandle h)
+uint32_t HeldUnits(LimiterHandle h)
 {
 	LimiterState* l = ResolveLimiter(ActivePool(), h);
 	assert(l && "invalid/destroyed limiter");
 	if (!l)
 		return 0;
-	return HeldUnits(*l);
+	return UnitsHeld(*l);
 }
 
-uint32_t LimiterWaiting(LimiterHandle h)
+uint32_t WaitingTasks(LimiterHandle h)
 {
 	LimiterState* l = ResolveLimiter(ActivePool(), h);
 	assert(l && "invalid/destroyed limiter");
@@ -2722,7 +2729,7 @@ uint32_t LimiterWaiting(LimiterHandle h)
 	return short_ > retiring ? short_ - retiring : 0; // retiring debts are no task's
 }
 
-int Load(CounterHandle h)
+int Count(CounterHandle h)
 {
 	PoolState& P = ActivePool();
 	FlushDeferredSignals(P, CurrentCtx(P)); // the caller's own finished tasks count
@@ -3010,7 +3017,7 @@ static bool TryHelpIn(PoolState& P)
 	if (stats)
 	{
 		stats->tasksRun.fetch_add(1, std::memory_order_relaxed);
-		stats->helpedRun.fetch_add(1, std::memory_order_relaxed);
+		stats->tasksHelped.fetch_add(1, std::memory_order_relaxed);
 		stats->state.store(before, std::memory_order_relaxed);
 	}
 	return true;
@@ -3121,7 +3128,7 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	void* const userData = t.userData;
 	const CounterHandle signals = t.signals;
 	const uint32_t nameId = t.nameId;
-	const uint8_t window = t.window;
+	const uint8_t profilerTag = t.profilerTag;
 	uint16_t limiter = t.limiter; // cleared if the task gives its unit back early
 	TaskFn destroy = nullptr;
 	if (t.owned)
@@ -3137,7 +3144,7 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	// A per-task profiler zone (null hook = free no-op). The begin hook
 	// returns the handle the end mark pairs with.
 	const int threadIndex = CurrentThreadIndex();
-	const uint64_t zone = MarkProfilerZone(P, threadIndex, nameId, window, "Task", true, 0);
+	const uint64_t zone = MarkProfilerZone(P, threadIndex, nameId, profilerTag, "Task", true, 0);
 	// A task of a cancelled counter is skipped, though it still signals it.
 	const CounterState* counter = signals != kInvalidCounter ? ResolveCounter(P, signals) : nullptr;
 	const bool cancelled = counter && counter->cancelled.load(std::memory_order_acquire);
@@ -3181,7 +3188,7 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	// the slot it may live in is released.
 	if (destroy)
 		destroy(userData);
-	MarkProfilerZone(P, threadIndex, nameId, window, "Task", false, zone);
+	MarkProfilerZone(P, threadIndex, nameId, profilerTag, "Task", false, zone);
 	LOOM_TEST_POINT(kTestPointTaskReturned);
 	// The unit goes back (or on to the next waiting task) before the signal:
 	// once a WaitFor on the task's counter returns, it holds none.
@@ -3222,7 +3229,7 @@ static void FlushDeferredSignals(PoolState& P, WorkerCtx* ctx)
 	const int n = ctx->deferredCount;
 	ctx->deferredSignal = kInvalidCounter;
 	ctx->deferredCount = 0;
-	SignalCounter(P, h, n); // may release parked tasks onto this deque
+	SignalCounter(P, h, n); // may release waiting tasks onto this deque
 }
 
 // ---- Main thread ---------------------------------------------------------------------
@@ -3413,7 +3420,7 @@ static PaddedStats* RegisterThreadStats(PoolState& P, int index, const char* nam
 	return raw;
 }
 
-PoolSnapshot SnapshotThreadStats()
+PoolSnapshot SnapshotPool()
 {
 	PoolSnapshot snap;
 	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
@@ -3430,12 +3437,12 @@ PoolSnapshot SnapshotThreadStats()
 			view.name = t.name;
 			view.state = t.state.load();
 			view.tasksRun = t.tasksRun.load();
-			view.helpedRun = t.helpedRun.load();
+			view.tasksHelped = t.tasksHelped.load();
 			view.queueDepth = 0;
 			snap.threads.push_back(std::move(view));
 		}
 	}
-	snap.anyQueueDepth = PoolQueueDepth(P);
+	snap.queueDepth = PoolQueueDepth(P);
 	{
 		std::lock_guard<std::mutex> lock(P.mainMutex);
 		snap.mainQueueDepth = (int)P.mainQueue.size();
@@ -3545,7 +3552,7 @@ DedicatedId RegisterDedicatedThread(const DedicatedConfig& config)
 {
 	PoolState& P = ActivePool();
 	std::lock_guard<std::mutex> lock(P.dedicatedMutex);
-	const DedicatedId id = P.nextDedicatedId++;
+	const DedicatedId id{ P.nextDedicatedId++ };
 	assert(id != kInvalidDedicated && "dedicated thread ids exhausted");
 	auto d = std::make_unique<DedicatedState>();
 	d->id = id;
@@ -3729,7 +3736,7 @@ void UnregisterParkParticipant(int id)
 	std::erase_if(pool->participants, [id](const PoolState::ParkParticipant& p) { return p.id == id; });
 }
 
-bool ParkRequested()
+bool IsParkRequested()
 {
 	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
 	return pool && pool->parkRequested.load();
@@ -4034,10 +4041,10 @@ static LimiterHandle LimiterOfTag(PoolState& P, uint16_t tag)
 {
 	if (tag == 0 || tag > P.limiterCount)
 		return kInvalidLimiter;
-	return PackCounter(tag - 1u, P.limiters[tag - 1u].generation.load(std::memory_order_relaxed));
+	return PackLimiter(tag - 1u, P.limiters[tag - 1u].generation.load(std::memory_order_relaxed));
 }
 
-// A slot that is parked on a counter or waiting for a limiter: nobody runs or
+// A slot that waits for a counter or for a limiter's unit: nobody runs or
 // frees it while the lock it is listed under is held.
 static DebugTask DebugTaskOf(PoolState& P, uint32_t slot)
 {
@@ -4053,10 +4060,10 @@ static DebugTask DebugTaskOf(PoolState& P, uint32_t slot)
 static void ReadThreadDebug(PoolState& P, const ThreadDebug& d, int64_t now, DebugThread& out)
 {
 	out.tasksRun = d.tasksRun.load(std::memory_order_relaxed);
-	out.running = d.running.load(std::memory_order_relaxed);
-	if (out.running > 0)
+	out.runningDepth = d.running.load(std::memory_order_relaxed);
+	if (out.runningDepth > 0)
 	{
-		out.runningName = d.runningName.load(std::memory_order_relaxed);
+		out.runningNameId = d.runningName.load(std::memory_order_relaxed);
 		out.runningSignals = d.runningSignals.load(std::memory_order_relaxed);
 		out.runningLimiter = LimiterOfTag(P, d.runningLimiter.load(std::memory_order_relaxed));
 	}
@@ -4131,11 +4138,11 @@ DebugState CaptureDebugState()
 			dc.failed = c.failed.load(std::memory_order_relaxed);
 			if (LockBriefly(c.mutex))
 			{
-				dc.parkedTotal = (int)c.pending.size();
+				dc.waitingTotal = (int)c.pending.size();
 				for (size_t k = 0; k < c.pending.size() && k < kDebugListMax; k++)
-					dc.parked.push_back(DebugTaskOf(P, c.pending[k]));
+					dc.waiting.push_back(DebugTaskOf(P, c.pending[k]));
 				for (const Waiter* w : c.waiters)
-					dc.waiters.push_back(w->threadIndex);
+					dc.sleepers.push_back(w->threadIndex);
 				c.mutex.unlock();
 			}
 			else
@@ -4155,9 +4162,9 @@ DebugState CaptureDebugState()
 			if (!l.alive.load(std::memory_order_relaxed))
 				continue;
 			DebugLimiter dl;
-			dl.handle = PackCounter(i, l.generation.load(std::memory_order_relaxed));
+			dl.handle = PackLimiter(i, l.generation.load(std::memory_order_relaxed));
 			dl.limit = l.limit.load(std::memory_order_relaxed);
-			dl.held = HeldUnits(l);
+			dl.held = UnitsHeld(l);
 			if (LockBriefly(l.mutex))
 			{
 				dl.waitingTotal = (int)l.waiting.size();
@@ -4175,12 +4182,12 @@ DebugState CaptureDebugState()
 		s.busy = true;
 
 	s.liveTasks = (int)LiveTasksIn(P);
-	s.queued = PoolQueueDepth(P);
-	s.queuedHigh = P.queuedHigh.load(std::memory_order_relaxed);
-	s.queuedLow = P.queuedLow.load(std::memory_order_relaxed);
+	s.queueDepth = PoolQueueDepth(P);
+	s.highQueueDepth = P.queuedHigh.load(std::memory_order_relaxed);
+	s.lowQueueDepth = P.queuedLow.load(std::memory_order_relaxed);
 	if (LockBriefly(P.mainMutex))
 	{
-		s.mainQueued = (int)P.mainQueue.size();
+		s.mainQueueDepth = (int)P.mainQueue.size();
 		P.mainMutex.unlock();
 	}
 	else
@@ -4209,10 +4216,11 @@ std::string Plural(long long n, const char* word)
 	return std::to_string(n) + " " + word + (n == 1 ? "" : "s");
 }
 
-std::string HandleText(char kind, uint32_t h)
+template <typename H>
+std::string HandleText(char kind, H h)
 {
 	char buf[32];
-	std::snprintf(buf, sizeof buf, "%c%u.%u", kind, CounterIndex(h), CounterGeneration(h));
+	std::snprintf(buf, sizeof buf, "%c%u.%u", kind, HandleIndex(h), HandleGeneration(h));
 	return buf;
 }
 
@@ -4258,7 +4266,7 @@ std::string FormatDebugState(const DebugState& s, TaskNameFn nameOf)
 {
 	TextOut out;
 	out.Line("loom: %s live; queued %d (high %d, low %d), for the main thread %d%s\n", Plural(s.liveTasks, "task").c_str(),
-		s.queued, s.queuedHigh, s.queuedLow, s.mainQueued, s.busy ? "; some tables were busy and are missing" : "");
+		s.queueDepth, s.highQueueDepth, s.lowQueueDepth, s.mainQueueDepth, s.busy ? "; some tables were busy and are missing" : "");
 
 	out.Line("threads:\n");
 	bool anyRunning = false, anyWaiting = false, dedicatedQueued = false;
@@ -4267,19 +4275,19 @@ std::string FormatDebugState(const DebugState& s, TaskNameFn nameOf)
 	{
 		if (t.isMain)
 			mainThread = &t;
-		anyRunning = anyRunning || t.running > 0;
+		anyRunning = anyRunning || t.runningDepth > 0;
 		anyWaiting = anyWaiting || t.waitingOn != kInvalidCounter;
 		dedicatedQueued = dedicatedQueued || t.queueDepth > 0;
 		std::string what;
-		if (t.running > 0)
+		if (t.runningDepth > 0)
 		{
-			what = "running " + TaskNameText(t.runningName, nameOf);
+			what = "running " + TaskNameText(t.runningNameId, nameOf);
 			if (t.runningSignals != kInvalidCounter)
 				what += " (signals " + HandleText('c', t.runningSignals) + ")";
 			if (t.runningLimiter != kInvalidLimiter)
 				what += " (holds a unit of " + HandleText('l', t.runningLimiter) + ")";
-			if (t.running > 1)
-				what += ", inside " + std::to_string(t.running - 1) + " more";
+			if (t.runningDepth > 1)
+				what += ", inside " + std::to_string(t.runningDepth - 1) + " more";
 		}
 		if (t.waitingOn != kInvalidCounter)
 		{
@@ -4305,12 +4313,12 @@ std::string FormatDebugState(const DebugState& s, TaskNameFn nameOf)
 			c.failed ? ", a task threw" : "");
 		if (c.busy)
 			out.Line("; busy");
-		if (c.parkedTotal > 0)
-			out.Line("; %d parked: %s", c.parkedTotal, TaskListText(c.parked, c.parkedTotal, nameOf).c_str());
-		if (!c.waiters.empty())
+		if (c.waitingTotal > 0)
+			out.Line("; %d waiting: %s", c.waitingTotal, TaskListText(c.waiting, c.waitingTotal, nameOf).c_str());
+		if (!c.sleepers.empty())
 		{
 			std::string who;
-			for (int w : c.waiters)
+			for (int w : c.sleepers)
 				who += (who.empty() ? "[" : ", [") + std::to_string(w) + "]";
 			out.Line("; asleep on it: %s", who.c_str());
 		}
@@ -4334,17 +4342,17 @@ std::string FormatDebugState(const DebugState& s, TaskNameFn nameOf)
 	// The common ways a wait never returns that the capture can see. A
 	// thread outside the pool shows up only asleep on a counter.
 	for (const DebugCounter& c : s.counters)
-		anyWaiting = anyWaiting || !c.waiters.empty();
-	if (anyWaiting && !anyRunning && s.queued == 0 && s.mainQueued == 0 && !dedicatedQueued)
+		anyWaiting = anyWaiting || !c.sleepers.empty();
+	if (anyWaiting && !anyRunning && s.queueDepth == 0 && s.mainQueueDepth == 0 && !dedicatedQueued)
 		out.Line("hint: nothing is running or queued, so the counters waited on are waiting for a Signal or a Submit that has not happened\n");
-	if (s.mainQueued > 0 && mainThread && mainThread->waitingOn == kInvalidCounter && mainThread->running == 0)
+	if (s.mainQueueDepth > 0 && mainThread && mainThread->waitingOn == kInvalidCounter && mainThread->runningDepth == 0)
 		out.Line("hint: main-thread tasks are queued; they run only while the main thread waits (helping) or calls PumpMainThreadTasks\n");
 	for (const DebugLimiter& l : s.limiters)
 	{
 		if (l.held < l.limit || l.waitingTotal == 0)
 			continue;
 		for (const DebugThread& t : s.threads)
-			if (t.running > 0 && t.runningLimiter == l.handle && t.waitingOn != kInvalidCounter)
+			if (t.runningDepth > 0 && t.runningLimiter == l.handle && t.waitingOn != kInvalidCounter)
 				out.Line("hint: [%d] holds a unit of %s and waits while %s for that limiter; a limited task must not wait for its own limiter's work\n",
 					t.index, HandleText('l', l.handle).c_str(), (Plural(l.waitingTotal, "task") + (l.waitingTotal == 1 ? " waits" : " wait")).c_str());
 	}

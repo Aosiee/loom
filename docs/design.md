@@ -5,7 +5,7 @@ is the contract.
 
 ## Task slots
 
-Tasks live in slots (`LoomConfig::maxTasks`, rounded up to chunks of 4096
+Tasks live in slots (`PoolConfig::maxTasks`, rounded up to chunks of 4096
 and grown a chunk at a time, with a warning, when exhausted). A slot holds the
 function, its user data or up to 48 bytes of an inline callable (an owned,
 non-trivial callable keeps its destroy function in the last 8), the
@@ -44,16 +44,18 @@ size; the runner reads the slot in place and owns it until it releases it.
 A counter is an index into a table plus a generation. `CreateCounter` takes
 an entry off a free list; `DestroyCounter` asserts the count is zero and
 nobody waits on it, then bumps the generation, so a stale handle never reaches
-a re-used entry.
+a re-used entry. Limiters pack their handles the same way. Each kind of
+handle is an enum class over its 32 bits, so the compiler keeps them apart;
+inside loom they are unpacked with a cast.
 
 `Signal` is one atomic decrement. Only the decrement that reaches zero takes
-the counter's lock: it publishes zero, then releases the tasks parked on the
+the counter's lock: it publishes zero, then releases the tasks waiting for the
 counter (`waitsFor`) and wakes its waiters. Zero comes first so that a
 released task, which may start on another thread at once, sees the counter
-it waited for as zero (a future it waited for is `Ready`, and `Get` returns
-without waiting). The stored value is the count plus one while it is
+it waited for as zero (a future it waited for reports `IsReady`, and `Get`
+returns without waiting). The stored value is the count plus one while it is
 nonzero, so between the decrement and the lock the final signaller leaves 1
-behind (`Load` reports it as 1). Someone who sees zero can destroy the
+behind (`Count` reports it as 1). Someone who sees zero can destroy the
 counter while that signaller still holds the lock: `DestroyCounter` takes
 the lock first, so it waits for the signaller to finish.
 
@@ -77,7 +79,7 @@ them as one `Signal(counter, n)`:
 - when it runs out of work at hand (after its first failed steal pass),
   before it parks, sleeps or exits;
 - before `WaitFor` waits and before `WaitFor`, `TryHelp` and
-  `PumpMainThreadTasks` return; `Load` applies the caller's own first;
+  `PumpMainThreadTasks` return; `Count` applies the caller's own first;
 - after 64 at most.
 
 The first rule is what makes this invisible. While a task runs, the only
@@ -105,7 +107,7 @@ then holds a count of unmet counters (in the group link, which only a
 runnable task uses). The submitter takes one count of its own, parks the
 slot on each counter that is not yet zero (adding one per counter), then
 drops its own count: the task becomes runnable at once if all were zero.
-Each counter that reaches zero decrements the count for the tasks parked on
+Each counter that reaches zero decrements the count for the tasks waiting on
 it, and the decrement that takes it to zero queues the task.
 
 ### Task graphs
@@ -215,7 +217,7 @@ and its top and bottom bounced between up to 31 cores: with 23 ns tasks the
 workers spent about 92% of their time searching. Groups make that one steal
 per 32 tasks and spread the rest across the workers' own deques.
 `ParallelFor` does not group: its chunks are already coarse. Queue depths
-(`PendingTaskCount`, `PoolSnapshot::anyQueueDepth`) count entries, so a
+(`PendingTaskCount`, `PoolSnapshot::queueDepth`) count entries, so a
 queued group counts once.
 
 ### Priorities
@@ -233,7 +235,7 @@ put a High task at the front. Groups are always Normal.
 A limiter is a count of free units, a lock and a queue of waiting tasks. A
 task with a limiter takes a unit at the point it becomes runnable: in
 `Submit` when it has no counters to wait for, or when the last of them
-reaches zero; a task parked on a counter holds none. Taking is one
+reaches zero; a task waiting for a counter holds none. Taking is one
 decrement of the count while it is positive. At zero or below the task waits:
 under the lock it puts itself in the queue (a High task at the front), and
 the slot stays out of every run queue, so no worker pops it only to put it
@@ -253,16 +255,16 @@ Limited tasks are never grouped (each takes its own unit); a task's limiter
 is a 16-bit index in a free byte pair of the slot's first line, so a task
 without one pays a load it already makes and an untaken branch.
 
-`SetLimiterLimit` raising the limit gives out the new units the way
+`SetLimit` raising the limit gives out the new units the way
 finishing tasks give theirs back, so waiting tasks start at once. Lowering
 it takes free units out of the count at once. For each held unit it would
 need, it leaves a *retiring* debt instead: the count goes down as if a task
 waited, and the next finisher that takes the lock to hand its unit on finds
 the debt and drops the unit. So no task waits behind a debt, and the count
-stays the one number the fast paths read. `LimiterHeld` is the limit plus
+stays the one number the fast paths read. `HeldUnits` is the limit plus
 the debts still open while the count is negative.
 
-A unit's index (`LimiterUnit`) is handed out only when a task asks for one,
+A unit's index (`CurrentLimiterUnit`) is handed out only when a task asks for one,
 from a stack of the free indices below the limit, under the limiter's lock.
 The index goes back before the unit does, so whoever takes the unit next
 finds one free. After the limit is lowered, more tasks can hold units than
@@ -440,7 +442,7 @@ it still shows up asleep on the counter it waits for.
 
 `CaptureDebugState` reads those records, then walks the counter and limiter
 tables under their table locks, and each live entry under its own lock: the
-tasks parked on a counter or waiting for a limiter are listed in a lock
+tasks waiting for a counter or for a limiter are listed in a lock
 they cannot leave without, so their slots are stable while it reads them.
 Every lock is taken with a try-lock that gives up after about two
 milliseconds and marks that part busy, so a capture never hangs on a thread

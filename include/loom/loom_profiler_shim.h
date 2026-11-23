@@ -26,10 +26,10 @@ namespace loom {
 	// Per-task zones: loom marks a "Task" zone around each task's execution.
 	// The hook maps these onto the profiler's ZoneBegin/ZoneEnd: the begin
 	// call returns a handle, and loom passes it back with the matching end.
-	// The task's name id (0 = unnamed; the hook falls back to `name`) and
-	// window tag come along, so named tasks from different windows stay
-	// distinguishable in the timeline.
-	using ProfilerZoneFn = uint64_t (*)(int threadIndex, uint32_t nameId, uint8_t window, const char* name, bool begin, uint64_t handle);
+	// The task's name id (0 = unnamed; the hook falls back to `name`) and its
+	// TaskDesc::profilerTag come along, so the host can tell apart named tasks
+	// with different tags (the engine's windows) in the timeline.
+	using ProfilerZoneFn = uint64_t (*)(int threadIndex, uint32_t nameId, uint8_t profilerTag, const char* name, bool begin, uint64_t handle);
 
 	void SetProfilerZoneHook(ProfilerZoneFn fn);
 
