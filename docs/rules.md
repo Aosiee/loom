@@ -108,6 +108,22 @@ counter of a pool that is gone, so finish or drop it first. An IO
 callback that may never fire should still destroy its promise, so whoever
 waits on the future sees the broken promise instead of waiting forever.
 
+## Hold nothing thread-bound across a co_await
+
+The part of a coroutine after a `co_await` that suspends may run on
+another thread. A lock held across it is unlocked on a thread that does
+not own it (undefined for `std::mutex`), and a thread-local read after it
+is another thread's. Release locks before the `co_await`, and read
+`CurrentThreadIndex`, `PerThread::Local` and `CurrentLimiterUnit` again
+after it.
+
+A coroutine's parameters are copied into its frame, but a reference
+parameter (a `const std::string&`, a lambda's captures by reference) stays
+a reference: what it names must outlive the coroutine, not just the call
+that started it. Pass what the coroutine reads after a suspension by
+value. A counter awaited with `After` must live until the coroutine has
+resumed.
+
 ## Merge per-thread storage only after the work is done
 
 `PerThread<T>::Local()` may run on many threads at once, but `ForEach`,

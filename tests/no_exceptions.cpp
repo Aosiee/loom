@@ -1,7 +1,7 @@
 // Built with -fno-exceptions, as an engine may build loom: checks that the
 // header and library compile that way and that the parts with exception
-// handling inside them (futures, promises, continuations, sort, pipelines)
-// still run. Returns non-zero, naming the check, if one fails. CI builds it
+// handling inside them (futures, promises, continuations, coroutines, sort,
+// pipelines) still run. Returns non-zero, naming the check, if one fails. CI builds it
 // in its embedded job (.github/workflows/linux.yml), which shows the commands.
 #include "loom/loom.h"
 
@@ -10,6 +10,15 @@
 #include <vector>
 
 static int s_Failed = 0;
+
+#if defined(LOOM_COROUTINES)
+static loom::Future<int> Doubled(int v)
+{
+	co_await loom::ResumeOn();
+	const int x = co_await loom::Async([v] { return v; });
+	co_return x * 2;
+}
+#endif
 
 static void Check(bool ok, const char* what)
 {
@@ -43,6 +52,10 @@ int main()
 
 	loom::Future<int> doubled = loom::Async([] { return 21; }).Then([](int x) { return x * 2; });
 	Check(doubled.Get() == 42, "Async and Then");
+
+#if defined(LOOM_COROUTINES)
+	Check(Doubled(21).Get() == 42, "coroutines");
+#endif
 
 	loom::Promise<int> promise;
 	loom::Future<int>  promised = promise.GetFuture();

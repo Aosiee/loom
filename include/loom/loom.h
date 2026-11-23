@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <initializer_list>
 #include <iterator>
 #include <memory>
 #include <new>
@@ -41,6 +42,14 @@
 #include <vector>
 #include <type_traits>
 #include <utility>
+
+// Coroutines (co_await on futures and counters; a coroutine returning a
+// Future) need the compiler's support, which every C++20 compiler loom
+// builds with has. LOOM_COROUTINES says whether it is there.
+#if defined(__cpp_impl_coroutine) && __has_include(<coroutine>)
+#include <coroutine>
+#define LOOM_COROUTINES 1
+#endif
 
 #include "loom/loom_version.h"
 
@@ -378,6 +387,13 @@ struct BrokenPromise : std::exception
 
 template <typename T> class Future;
 template <typename T> class Promise;
+#if defined(LOOM_COROUTINES)
+namespace detail {
+	template <typename T> struct CoroutinePromise;
+	template <typename T> struct CoroutinePromiseBase;
+	template <typename T, bool Move> struct FutureAwaiter;
+}
+#endif
 
 namespace detail {
 	struct FutureStateBase
@@ -573,6 +589,15 @@ public:
 	}
 	// Zero once ready: for a task's waitsFor. Valid while the future lives.
 	CounterHandle Counter() const { return m_State ? m_State->counter : kInvalidCounter; }
+#if defined(LOOM_COROUTINES)
+	// co_await future, in a coroutine: the value (a reference into the
+	// future, or moved out of a temporary one), or the error rethrown. See
+	// Coroutines below.
+	detail::FutureAwaiter<T, false> operator co_await() &;
+	detail::FutureAwaiter<T, true> operator co_await() &&;
+	// A coroutine may return a Future: see Coroutines below.
+	using promise_type = detail::CoroutinePromise<T>;
+#endif
 	// Drops the future (IsValid() is then false); its task, if still to come,
 	// runs anyway.
 	void Reset() noexcept
@@ -587,6 +612,10 @@ private:
 	template <typename> friend class Promise;
 	template <typename F> requires std::is_invocable_v<std::decay_t<F>&>
 	friend Future<std::invoke_result_t<std::decay_t<F>&>> Async(F&& fn, const TaskDesc& opts);
+#if defined(LOOM_COROUTINES)
+	template <typename> friend struct detail::CoroutinePromiseBase;
+	template <typename, bool> friend struct detail::FutureAwaiter;
+#endif
 
 	detail::FutureState<T>* m_State = nullptr;
 };
@@ -697,6 +726,275 @@ private:
 	bool m_Set = false;
 	bool m_Taken = false;
 };
+
+// ---- Coroutines -------------------------------------------------------------
+// A coroutine can wait without blocking a thread: where it co_awaits a
+// future or a counter that is not ready, it is suspended, and once the value
+// is there a task resumes it (on a worker, by default), so it holds no
+// thread and no stack while it waits. A coroutine that returns a Future is
+// itself awaitable, and its future's value is what it co_returns:
+//
+//   loom::Future<GpuMesh> LoadMesh(std::string path)
+//   {
+//       Bytes bytes = co_await loom::Async([&] { return ReadFile(path); });
+//       Mesh mesh = co_await loom::Async([&] { return ParseMesh(bytes); });
+//       co_await loom::ResumeOn({ .affinity = loom::Affinity::MainThread });
+//       co_return Upload(mesh);  // on the main thread
+//   }
+//
+//   loom::Future<GpuMesh> gpu = LoadMesh("rock.mesh"); // Get(), Then, co_await
+//
+// Such a coroutine starts at once, on the calling thread, and runs there up
+// to its first wait that suspends; `co_await loom::ResumeOn()` first starts
+// it as a task instead. What it throws goes to its future, as a task's goes
+// to an Async future. Its frame, which holds its future's state, is one heap
+// allocation; the future holds a counter until the coroutine has finished.
+// Its locals are destroyed as it ends, before its future is ready; its
+// parameters, copied into the frame, go with the frame, once the future
+// (and any continuation reading it) has let go too. A reference parameter
+// stays a reference: pass what the coroutine reads after a suspension by
+// value.
+//
+//   co_await future         the value, as Get returns it (moved out of a
+//                           temporary future), or its error rethrown
+//   co_await After(future, opts)   the same, and the rest runs as a task
+//                           with opts: on the main thread, under a limiter
+//   co_await After(counter[, opts])   resumes once the counter is zero, and
+//                           rethrows a failed counter's error as WaitFor
+//   co_await After({ a, b, c }[, opts])   once every counter is zero
+//   co_await ResumeOn(opts) moves the rest of the coroutine onto a task
+//                           with opts (a hop to the main thread, a dedicated
+//                           thread, a limiter, a priority)
+//
+// Without opts, a wait that is already satisfied does not suspend, and the
+// coroutine carries on where it is. With opts it always suspends, so what
+// follows always runs as such a task. The opts are a TaskDesc for its
+// affinity, thread, priority, limiter and profiler fields; fn, userData,
+// signals and the waits stay unset. The part of the coroutine a task resumes
+// holds that task's limiter unit until its next suspension or its end
+// (CurrentLimiterUnit answers there): the unit goes back as it suspends, or
+// before its future is ready, as an Async task's does.
+//
+// A counter awaited with After must live until the coroutine has resumed
+// (DestroyCounter asserts while a coroutine waits for it), and a future
+// until co_await returns, which a temporary does. A suspended coroutine is
+// a waiting task, so the pool's drain and debug dump see it; one that can
+// never resume is reported at Shutdown like any task that cannot run.
+// Coroutines work with any coroutine type, not only one returning a Future:
+// the awaitables need nothing from the coroutine's promise.
+#if defined(LOOM_COROUTINES)
+namespace detail {
+	// Submits a task that resumes `coroutine` once `waitsFor` and every
+	// counter in `waitsForAll` are zero. Reads the counters only while it runs.
+	void SubmitResume(std::coroutine_handle<> coroutine, const TaskDesc& opts, CounterHandle waitsFor,
+		std::span<const CounterHandle> waitsForAll);
+	// The end of a coroutine that returns a Future: gives back the limiter
+	// unit of the task that resumed it, if one did, signals the future, then
+	// drops the coroutine's reference.
+	void FinishCoroutine(FutureStateBase* state, void* coroutine) noexcept;
+
+	inline void RethrowFailure(const FutureStateBase& state)
+	{
+#if defined(__cpp_exceptions)
+		if (state.error)
+			std::rethrow_exception(state.error);
+#else
+		if (state.broken)
+			std::terminate();
+#endif
+	}
+
+	template <typename T, bool Move>
+	struct FutureAwaiter
+	{
+		FutureState<T>* state = nullptr;
+		bool always = false; // After(future, opts): suspend even when ready
+		TaskDesc opts = {};
+
+		static FutureAwaiter Of(Future<T>& future, bool always, const TaskDesc& opts) { return { future.m_State, always, opts }; }
+
+		bool await_ready() const { return !always && Count(state->counter) == 0; }
+		void await_suspend(std::coroutine_handle<> h) const { SubmitResume(h, opts, state->counter, {}); }
+		decltype(auto) await_resume() const
+		{
+			RethrowFailure(*state);
+			if constexpr (std::is_void_v<T>)
+				return;
+			else if constexpr (Move)
+				return T(std::move(*state->value));
+			else
+				return static_cast<T&>(*state->value);
+		}
+	};
+
+	struct CounterAwaiter
+	{
+		CounterHandle counter = kInvalidCounter;
+		std::span<const CounterHandle> all = {};
+		bool always = false;
+		TaskDesc opts = {};
+
+		bool await_ready() const
+		{
+			if (always)
+				return false;
+			if (counter != kInvalidCounter && Count(counter) != 0)
+				return false;
+			for (CounterHandle c : all)
+				if (Count(c) != 0)
+					return false;
+			return true;
+		}
+		void await_suspend(std::coroutine_handle<> h) const { SubmitResume(h, opts, counter, all); }
+		void await_resume() const
+		{
+			// Zero by now: a check that rethrows a failed counter's error.
+			if (counter != kInvalidCounter)
+				(void)TryWaitFor(counter, 0);
+			for (CounterHandle c : all)
+				(void)TryWaitFor(c, 0);
+		}
+	};
+
+	struct ResumeOnAwaiter
+	{
+		TaskDesc opts = {};
+		bool await_ready() const noexcept { return false; }
+		void await_suspend(std::coroutine_handle<> h) const { SubmitResume(h, opts, kInvalidCounter, {}); }
+		void await_resume() const noexcept {}
+	};
+
+	// The future's state lives in the coroutine's frame, so the frame is
+	// freed when the future and the coroutine have both let go of it.
+	template <typename T>
+	struct CoroutineState final : FutureState<T>
+	{
+		void* frame = nullptr;
+		static void Destroy(FutureStateBase* b) noexcept
+		{
+			std::coroutine_handle<>::from_address(static_cast<CoroutineState*>(b)->frame).destroy();
+		}
+	};
+
+	template <typename T>
+	struct CoroutinePromiseBase
+	{
+		CoroutineState<T> state; // two references: the future, the coroutine
+
+		CoroutinePromiseBase()
+		{
+			state.destroy = &CoroutineState<T>::Destroy;
+			CreateFutureCounter(&state);
+		}
+		CoroutinePromiseBase(const CoroutinePromiseBase&) = delete;
+		CoroutinePromiseBase& operator=(const CoroutinePromiseBase&) = delete;
+
+		Future<T> get_return_object()
+		{
+			state.frame = std::coroutine_handle<CoroutinePromise<T>>::from_promise(static_cast<CoroutinePromise<T>&>(*this)).address();
+			return Future<T>(&state);
+		}
+		std::suspend_never initial_suspend() const noexcept { return {}; }
+
+		// The coroutine stays suspended here, its locals gone, until the
+		// future lets go too. Destroying the frame as it ends would race
+		// with the code that started it, which some compilers have touch
+		// the frame after its first suspension: a coroutine resumed on
+		// another thread can reach its end before that code is done.
+		struct FinalAwaiter
+		{
+			bool await_ready() const noexcept { return false; }
+			template <typename P>
+			void await_suspend(std::coroutine_handle<P> h) const noexcept { FinishCoroutine(&h.promise().state, h.address()); }
+			void await_resume() const noexcept {}
+		};
+		FinalAwaiter final_suspend() const noexcept { return {}; }
+
+		void unhandled_exception() noexcept
+		{
+#if defined(__cpp_exceptions)
+			state.error = std::current_exception();
+#else
+			std::terminate();
+#endif
+		}
+	};
+
+	template <typename T>
+	struct CoroutinePromise final : CoroutinePromiseBase<T>
+	{
+		template <typename U = T> requires std::is_constructible_v<T, U&&>
+		void return_value(U&& value) { this->state.value.emplace(std::forward<U>(value)); }
+	};
+
+	template <>
+	struct CoroutinePromise<void> final : CoroutinePromiseBase<void>
+	{
+		void return_void() const noexcept {}
+	};
+} // namespace detail
+
+template <typename T>
+detail::FutureAwaiter<T, false> Future<T>::operator co_await() &
+{
+	return { m_State };
+}
+
+template <typename T>
+detail::FutureAwaiter<T, true> Future<T>::operator co_await() &&
+{
+	return { m_State };
+}
+
+template <typename T>
+[[nodiscard]] detail::FutureAwaiter<T, false> After(Future<T>& future, const TaskDesc& opts)
+{
+	return detail::FutureAwaiter<T, false>::Of(future, true, opts);
+}
+
+template <typename T>
+[[nodiscard]] detail::FutureAwaiter<T, true> After(Future<T>&& future, const TaskDesc& opts)
+{
+	return detail::FutureAwaiter<T, true>::Of(future, true, opts);
+}
+
+[[nodiscard]] inline detail::CounterAwaiter After(CounterHandle counter)
+{
+	return { counter, {}, false, {} };
+}
+
+[[nodiscard]] inline detail::CounterAwaiter After(CounterHandle counter, const TaskDesc& opts)
+{
+	return { counter, {}, true, opts };
+}
+
+// The counters are read when the coroutine suspends; a braced list lives
+// until then.
+[[nodiscard]] inline detail::CounterAwaiter After(std::span<const CounterHandle> counters)
+{
+	return { kInvalidCounter, counters, false, {} };
+}
+
+[[nodiscard]] inline detail::CounterAwaiter After(std::span<const CounterHandle> counters, const TaskDesc& opts)
+{
+	return { kInvalidCounter, counters, true, opts };
+}
+
+[[nodiscard]] inline detail::CounterAwaiter After(std::initializer_list<CounterHandle> counters)
+{
+	return After(std::span<const CounterHandle>(counters.begin(), counters.size()));
+}
+
+[[nodiscard]] inline detail::CounterAwaiter After(std::initializer_list<CounterHandle> counters, const TaskDesc& opts)
+{
+	return After(std::span<const CounterHandle>(counters.begin(), counters.size()), opts);
+}
+
+[[nodiscard]] inline detail::ResumeOnAwaiter ResumeOn(const TaskDesc& opts = {})
+{
+	return { opts };
+}
+#endif // LOOM_COROUTINES
 
 // ---- Isolation ---------------------------------------------------------------
 // Runs fn() as an isolated region. The tasks submitted inside it, and the

@@ -182,6 +182,46 @@ then it drops the input and completes as `Async` does. Because the
 continuation holds its input, a chain's earlier futures may be dropped as
 soon as `Then` returns.
 
+### Coroutines
+
+A coroutine's wait is a plain task. Where it awaits a future or counters
+that are not yet zero, `await_suspend` submits a task whose function
+resumes the coroutine, with the counters as its `waitsFor` and
+`waitsForAll` and the awaited `TaskDesc` for the rest, and returns. So a
+suspended coroutine costs one task slot and its frame, holds no thread,
+and is released by the counters' final signal like any waiting task; the
+drain at `Shutdown` and the debug dump see it as one. The resume task may
+start on another thread before `await_suspend` has returned: `Submit` reads
+the description, the counter list included, before the task can run, and
+nothing in the awaiter is touched after it.
+
+A coroutine that returns a `Future` keeps its future's state in its
+frame: the promise type holds the block a promise would allocate, with a
+reference for the future and one for the coroutine, and creates its
+counter before the body starts, so the frame is the coroutine's only
+allocation. `co_return` stores the value and an uncaught exception stores
+the error. At the final suspension, its locals already gone, the coroutine
+signals the counter and drops its reference, and stays suspended there;
+whichever reference goes last destroys the frame, its parameters and the
+state with it. The frame is not destroyed as the coroutine ends because
+the code that starts a coroutine may still touch the frame after its first
+suspension (GCC keeps a count in the frame that it updates there), and a
+coroutine resumed on another thread can reach its end before that code is
+done; the future, which that code has just returned to its caller, keeps
+the frame alive past it.
+
+The thread that runs a resume task notes which coroutine it resumed; a
+coroutine that suspends again there gives back that task's limiter unit
+before it submits its next resume, and one that ends there gives it back
+before the signal, as a future's task does, so the rest of the coroutine,
+which may run on another thread at once, never finds the unit still taken.
+A coroutine that suspends or ends inside some other task (one that never
+suspended) leaves that task's unit alone.
+
+An awaited future or counter that is already zero does not suspend, unless
+the await gives a `TaskDesc`: then it always suspends, so the rest of the
+coroutine always runs where that description says.
+
 ## Queues
 
 AnyWorker work lives in work-stealing deques, one per worker and one for the

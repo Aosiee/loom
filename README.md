@@ -60,6 +60,19 @@ loom::Future<Texture> ready = texture.GetFuture();
 io.ReadAsync(file, [p = std::move(texture)](Texture t) mutable { p.SetValue(std::move(t)); });
 ```
 
+A coroutine that waits without holding a thread, and moves to the main
+thread for its last step:
+
+```cpp
+loom::Future<GpuMesh> LoadMesh(std::string path)
+{
+    Bytes bytes = co_await loom::Async([&] { return ReadFile(path); });
+    Mesh mesh = co_await loom::Async([&] { return ParseMesh(bytes); });
+    co_await loom::ResumeOn({ .affinity = loom::Affinity::MainThread });
+    co_return Upload(mesh);
+}
+```
+
 Background work on at most four workers, each with a staging buffer of its own:
 
 ```cpp
@@ -149,6 +162,10 @@ counter and limiter is doing.
   or rethrows, and `Counter()` lets another task wait for it first.
   `Then` runs a task on the value once it is ready, and a `Promise` makes a
   future for a value that comes from outside loom, such as an IO callback.
+- **Coroutines**: a coroutine can return a `Future` and `co_await` futures
+  and counters (`After`) without holding a thread while it waits, and
+  `ResumeOn` moves its rest to the main thread, a dedicated thread or a
+  limiter.
 - **Limiters** (`CreateLimiter`): at most N tasks of a kind run at once, so
   background work (asset decompression, uploads) cannot take every worker;
   a limit of 1 is a serial queue. `CurrentLimiterUnit()` tells a task which

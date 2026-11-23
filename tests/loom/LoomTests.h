@@ -3397,6 +3397,372 @@ TEST_CASE("loom: continuations — an error skips the rest of the chain and reac
 }
 #endif
 
+#if defined(LOOM_COROUTINES)
+namespace {
+	loom::Future<int> AddLater(int a, int b)
+	{
+		const int x = co_await loom::Async([a] { return a; });
+		const int y = co_await loom::Async([b] { return b; });
+		co_return x + y;
+	}
+
+	loom::Future<void> Bump(std::atomic<int>& n, int times)
+	{
+		for (int i = 0; i < times; i++)
+			co_await loom::Async([&n] { n++; });
+	}
+
+	loom::Future<std::unique_ptr<int>> MakeOwned(int v)
+	{
+		std::unique_ptr<int> p = co_await loom::Async([v] { return std::make_unique<int>(v); });
+		co_return p;
+	}
+
+	// The halves start as tasks (above a size), so the tree spreads over the pool.
+	loom::Future<long> Fib(int n)
+	{
+		if (n >= 14)
+			co_await loom::ResumeOn();
+		if (n < 2)
+			co_return n;
+		loom::Future<long> a = Fib(n - 1);
+		loom::Future<long> b = Fib(n - 2);
+		co_return co_await a + co_await b;
+	}
+}
+
+TEST_CASE("loom: coroutines — co_await futures, co_return values, void and move-only, any pool")
+{
+	for (int workers : { 0, 1, -1 })
+	{
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
+		const int baseline = LiveCounters();
+		{
+			std::vector<loom::Future<int>> sums;
+			for (int i = 0; i < 300; i++)
+				sums.push_back(AddLater(i, 2 * i));
+			for (int i = 0; i < 300; i++)
+				CHECK(sums[(size_t)i].Get() == 3 * i);
+
+			std::atomic<int> n{ 0 };
+			Bump(n, 50).Get();
+			CHECK(n.load() == 50);
+
+			loom::Future<std::unique_ptr<int>> owned = MakeOwned(9);
+			REQUIRE(owned.Get() != nullptr);
+			CHECK(*owned.Get() == 9);
+
+			CHECK(Fib(22).Get() == 17711);
+
+			// Awaiting a future that is kept: a reference into it, which stays valid.
+			loom::Future<std::vector<int>> kept = loom::Async([] { return std::vector<int>(10, 4); });
+			auto reader = [](loom::Future<std::vector<int>>& f) -> loom::Future<int> {
+				std::vector<int>& v = co_await f;
+				v.push_back(1); // the future's own value
+				co_return (int)v.size();
+			};
+			CHECK(reader(kept).Get() == 11);
+			CHECK(kept.Get().size() == 11);
+
+			// A ready future does not suspend: the coroutine carries on where it is.
+			loom::Future<int> ready = loom::Async([] { return 5; });
+			ready.Wait();
+			auto same = [](loom::Future<int>& f) -> loom::Future<bool> {
+				const int before = loom::CurrentThreadIndex();
+				(void)co_await f;
+				co_return loom::CurrentThreadIndex() == before;
+			};
+			loom::Future<bool> stayed = same(ready);
+			CHECK(stayed.IsReady()); // it never suspended, so it is done already
+			CHECK(stayed.Get());
+
+			// A coroutine awaiting a promise set from outside loom.
+			loom::Promise<int> promise;
+			auto waiter = [](loom::Future<int> f) -> loom::Future<int> { co_return co_await f + 1; };
+			loom::Future<int> fromPromise = waiter(promise.GetFuture());
+			CHECK(!fromPromise.IsReady());
+			std::thread setter([&promise] { promise.SetValue(41); });
+			CHECK(fromPromise.Get() == 42);
+			setter.join();
+		}
+		CHECK_MESSAGE(CountersReturnTo(baseline), "every coroutine's counter is freed");
+		while (loom::LiveTaskCount() > 0)
+			std::this_thread::yield();
+	}
+}
+
+TEST_CASE("loom: coroutines — ResumeOn and After(future, opts) move the rest to the main thread, a dedicated thread, a priority")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 3 });
+	const loom::DedicatedId io = loom::RegisterDedicatedThread({ .name = "coroutine-io" });
+	int ioIndex = -1;
+	{
+		loom::ScopedCounter found(1);
+		loom::Submit([&] { ioIndex = loom::CurrentThreadIndex(); }, { .affinity = loom::Affinity::Dedicated, .thread = io, .signals = found });
+		loom::WaitFor(found);
+	}
+	REQUIRE(ioIndex > 0);
+
+	auto hop = [](loom::DedicatedId io) -> loom::Future<std::vector<int>> {
+		std::vector<int> where;
+		co_await loom::ResumeOn();
+		where.push_back(loom::CurrentThreadIndex());
+		co_await loom::ResumeOn({ .affinity = loom::Affinity::MainThread });
+		where.push_back(loom::CurrentThreadIndex());
+		co_await loom::ResumeOn({ .affinity = loom::Affinity::Dedicated, .thread = io });
+		where.push_back(loom::CurrentThreadIndex());
+		// Ready already, but with opts it still moves: to the main thread.
+		loom::Future<int> done = loom::Async([] { return 1; });
+		done.Wait();
+		const int v = co_await loom::After(done, { .affinity = loom::Affinity::MainThread });
+		where.push_back(v == 1 ? loom::CurrentThreadIndex() : -1);
+		co_await loom::ResumeOn({ .priority = loom::Priority::High });
+		co_return where;
+	};
+	for (int round = 0; round < 50; round++)
+	{
+		std::vector<int> where = hop(io).Get(); // Get on the main thread runs its main-thread parts
+		REQUIRE(where.size() == 4);
+		CHECK(where[1] == 0);
+		CHECK(where[2] == ioIndex);
+		CHECK(where[3] == 0);
+	}
+	loom::UnregisterDedicatedThread(io);
+}
+
+TEST_CASE("loom: coroutines — a limited stretch holds a unit until its next suspension, and none once Get returns")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 6 });
+	loom::ScopedLimiter limiter(3);
+	std::atomic<int> inside{ 0 }, most{ 0 }, badUnit{ 0 };
+	std::array<std::atomic<int>, 3> unitUsers{};
+	auto limited = [&](int i) -> loom::Future<int> {
+		co_await loom::ResumeOn({ .limiter = limiter });
+		const int now = ++inside;
+		int seen = most.load();
+		while (now > seen && !most.compare_exchange_weak(seen, now)) {}
+		const uint32_t unit = loom::CurrentLimiterUnit();
+		if (unit >= 3 || unitUsers[unit]++ != 0)
+			badUnit++;
+		std::this_thread::sleep_for(std::chrono::microseconds(200));
+		if (unit < 3)
+			unitUsers[unit]--;
+		inside--;
+		// Leaving the limiter: the rest runs as a task without one.
+		co_await loom::ResumeOn();
+		if (loom::CurrentLimiterUnit() != loom::kNoUnit)
+			badUnit++;
+		co_return co_await loom::Async([i] { return i; });
+	};
+	std::vector<loom::Future<int>> all;
+	for (int i = 0; i < 200; i++)
+		all.push_back(limited(i));
+	for (int i = 0; i < 200; i++)
+		CHECK(all[(size_t)i].Get() == i);
+	CHECK(most.load() <= 3);
+	CHECK(most.load() >= 1);
+	CHECK(badUnit.load() == 0);
+
+	// A coroutine that ends inside a limited stretch gives its unit back
+	// before its future is ready, so the limiter is idle once Get returns.
+	int held = 0;
+	for (int i = 0; i < 500; i++)
+	{
+		loom::ScopedLimiter once(1 + i % 2); // destroyed right after Get: it must be idle
+		auto ends = [](loom::LimiterHandle l, int v) -> loom::Future<int> {
+			co_await loom::ResumeOn({ .limiter = l });
+			co_return v;
+		};
+		CHECK(ends(once, i).Get() == i);
+		held += (int)loom::HeldUnits(once);
+	}
+	CHECK(held == 0);
+}
+
+TEST_CASE("loom: coroutines — After(counter) and After({ ... }) resume once every counter is zero")
+{
+	for (int workers : { 0, 2 })
+	{
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
+		loom::ScopedCounter a(1), b(2), c(1);
+		std::atomic<int> stage{ 0 };
+		auto waits = [&]() -> loom::Future<void> {
+			co_await loom::After(a);
+			stage = 1;
+			co_await loom::After({ a.Get(), b.Get(), c.Get() });
+			stage = 2;
+			co_await loom::After(c, { .affinity = loom::Affinity::MainThread }); // zero already, but opts: it moves
+			stage = loom::CurrentThreadIndex() == 0 ? 3 : -1;
+		};
+		loom::Future<void> f = waits();
+		CHECK(stage.load() == 0);
+		CHECK(!f.IsReady());
+		loom::Signal(a);
+		for (int i = 0; i < 1000 && stage.load() != 1; i++)
+			(void)loom::TryHelp(), std::this_thread::yield();
+		CHECK(stage.load() == 1);
+		loom::Signal(b);
+		loom::Signal(c);
+		for (int i = 0; i < 100; i++)
+			(void)loom::TryHelp(), std::this_thread::yield();
+		CHECK(stage.load() == 1); // b is still 1
+		loom::Signal(b);
+		f.Get();
+		CHECK(stage.load() == 3);
+
+		// A satisfied wait without opts does not suspend.
+		const loom::CounterHandle zeros[] = { a.Get(), c.Get() };
+		auto nowait = [&]() -> loom::Future<int> {
+			co_await loom::After(a);
+			co_await loom::After(std::span<const loom::CounterHandle>(zeros));
+			co_return loom::CurrentThreadIndex();
+		};
+		loom::Future<int> g = nowait();
+		CHECK(g.IsReady());
+		CHECK(g.Get() == 0);
+	}
+}
+
+TEST_CASE("loom: coroutines — locals are gone before the future is ready, parameters once it is dropped")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 4 });
+	Tracked::live = 0;
+	auto keeps = [](Tracked param, int v) -> loom::Future<int> {
+		(void)param;
+		Tracked local;
+		(void)local;
+		co_await loom::ResumeOn();
+		const int r = co_await loom::Async([v] { return v; });
+		co_return r;
+	};
+	for (int i = 0; i < 300; i++)
+	{
+		loom::Future<int> f = keeps(Tracked{}, i);
+		CHECK(f.Get() == i);
+		CHECK(Tracked::live.load() == 1); // the parameter, in the frame the future holds
+		f.Reset();
+		// The coroutine drops its own hold just after the value is ready.
+		const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		while (Tracked::live.load() != 0 && std::chrono::steady_clock::now() < until)
+			std::this_thread::yield();
+		CHECK(Tracked::live.load() == 0);
+	}
+	// Dropped before it finishes: the coroutine frees its frame as it ends.
+	for (int i = 0; i < 300; i++)
+	{
+		loom::ScopedCounter gate(1);
+		{
+			auto waits = [](Tracked param, loom::CounterHandle g) -> loom::Future<void> {
+				(void)param;
+				co_await loom::After(g);
+			};
+			(void)waits(Tracked{}, gate);
+		}
+		CHECK(Tracked::live.load() == 1);
+		loom::Signal(gate);
+		while (loom::LiveTaskCount() > 0)
+			std::this_thread::yield();
+		CHECK(Tracked::live.load() == 0);
+	}
+}
+
+#if defined(__cpp_exceptions)
+TEST_CASE("loom: coroutines — errors reach the coroutine at its co_await, and its future if uncaught")
+{
+	for (int workers : { 0, 3 })
+	{
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
+		auto throws = []() -> loom::Future<int> {
+			co_await loom::ResumeOn();
+			throw std::runtime_error("inside");
+		};
+		loom::Future<int> f = throws();
+		CHECK_THROWS_WITH_AS(f.Get(), "inside", std::runtime_error);
+		CHECK_THROWS_WITH_AS(f.Get(), "inside", std::runtime_error); // every time
+
+		auto catches = []() -> loom::Future<std::string> {
+			try
+			{
+				(void)co_await loom::Async([]() -> int { throw std::runtime_error("task"); });
+			}
+			catch (const std::runtime_error& e)
+			{
+				co_return std::string("caught ") + e.what();
+			}
+			co_return "not thrown";
+		};
+		CHECK(catches().Get() == "caught task");
+
+		// A counter whose task threw: After rethrows, as WaitFor would.
+		loom::ScopedCounter failed(1);
+		loom::Submit([] { throw std::runtime_error("counted"); }, { .signals = failed });
+		auto afterFailed = [&]() -> loom::Future<void> { co_await loom::After(failed); };
+		CHECK_THROWS_WITH_AS(afterFailed().Get(), "counted", std::runtime_error);
+
+		// A broken promise.
+		loom::Future<int> broken;
+		{
+			loom::Promise<int> p;
+			broken = p.GetFuture();
+		}
+		auto readsBroken = [](loom::Future<int>& b) -> loom::Future<int> { co_return co_await b; };
+		CHECK_THROWS_AS(readsBroken(broken).Get(), loom::BrokenPromise);
+
+		// An error before the first suspension still goes to the future.
+		auto early = []() -> loom::Future<void> {
+			throw std::logic_error("early");
+			co_return;
+		};
+		loom::Future<void> e = early();
+		CHECK(e.IsReady());
+		CHECK_THROWS_AS(e.Get(), std::logic_error);
+	}
+}
+#endif
+
+TEST_CASE("loom: coroutines — thousands at once, chained on each other and on tasks")
+{
+	for (int workers : { 0, 1, -1 })
+	{
+		loom::Pool pool(loom::PoolConfig{ .workerCount = workers });
+		const int baseline = LiveCounters();
+		{
+			loom::Promise<int> start;
+			loom::Future<int> go = start.GetFuture();
+			std::atomic<long> total{ 0 };
+			auto leaf = [&](int i) -> loom::Future<int> {
+				const int s = co_await go; // every leaf waits for the same promise
+				int sum = s;
+				for (int k = 0; k < 3; k++)
+					sum += co_await loom::Async([i, k] { return i + k; });
+				total += sum;
+				co_return sum;
+			};
+			auto branch = [&](int i) -> loom::Future<long> {
+				loom::Future<int> x = leaf(2 * i);
+				loom::Future<int> y = leaf(2 * i + 1);
+				co_return (long)co_await x + co_await y;
+			};
+			const int n = 600;
+			std::vector<loom::Future<long>> branches;
+			for (int i = 0; i < n; i++)
+				branches.push_back(branch(i));
+			std::thread setter([&start] { start.SetValue(1); });
+			long expected = 0;
+			for (int i = 0; i < n; i++)
+			{
+				const long want = 2 + (2L * i * 3 + 3) + ((2L * i + 1) * 3 + 3);
+				expected += want;
+				CHECK(branches[(size_t)i].Get() == want);
+			}
+			setter.join();
+			CHECK(total.load() == expected);
+		}
+		CHECK_MESSAGE(CountersReturnTo(baseline), "every coroutine's counter is freed");
+	}
+}
+#endif // LOOM_COROUTINES
+
 namespace {
 	const char* DumpTestName(uint32_t id)
 	{

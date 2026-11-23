@@ -2577,6 +2577,59 @@ void ReleaseFuture(FutureStateBase* state) noexcept
 	state->destroy(state);
 }
 
+#if defined(LOOM_COROUTINES)
+// ---- Coroutines ------------------------------------------------------------------
+// A suspended coroutine is a plain task waiting on its counters, whose
+// function resumes it. The thread running such a task notes which coroutine
+// it resumed, so that the coroutine can give back the task's limiter unit
+// where its stretch ends, as it suspends again or before its future is
+// ready (as FinishFuture does), while a coroutine that suspends or ends
+// inside some other task (one that never suspended, say) leaves that task's
+// unit alone.
+static thread_local void* t_ResumedCoroutine = nullptr;
+
+static void ResumeCoroutine(void* address)
+{
+	void* const outer = t_ResumedCoroutine; // a wait inside can resume others
+	t_ResumedCoroutine = address;
+	// The coroutine may finish, and its frame be freed, inside resume().
+	std::coroutine_handle<>::from_address(address).resume();
+	t_ResumedCoroutine = outer;
+}
+
+void SubmitResume(std::coroutine_handle<> coroutine, const TaskDesc& opts, CounterHandle waitsFor,
+	std::span<const CounterHandle> waitsForAll)
+{
+	assert(opts.fn == nullptr && opts.userData == nullptr && "a coroutine's resume takes no fn or userData");
+	assert(opts.signals == kInvalidCounter && opts.waitsFor == kInvalidCounter && opts.waitsForAll.empty()
+		&& "a coroutine's resume signals nothing, and waits only for what it awaits");
+	// Submit reads the description, waitsForAll included, before the task
+	// can run: once it can, it may resume the coroutine and free the frame
+	// that holds them.
+	TaskDesc desc = opts;
+	desc.fn = &ResumeCoroutine;
+	desc.userData = coroutine.address();
+	desc.waitsFor = waitsFor;
+	desc.waitsForAll = waitsForAll;
+	// A stretch that a limited task resumed ends here: its unit goes back
+	// now, not when the task returns, since the rest may finish on another
+	// thread first.
+	PoolState& P = ActivePool();
+	if (coroutine.address() == t_ResumedCoroutine)
+		ReleaseRunningUnit(P, CurrentCtx(P));
+	Submit(desc);
+}
+
+void FinishCoroutine(FutureStateBase* state, void* coroutine) noexcept
+{
+	PoolState& P = ActivePool();
+	if (coroutine == t_ResumedCoroutine)
+		ReleaseRunningUnit(P, CurrentCtx(P));
+	SignalCounter(P, state->counter, 1);
+	ReleaseFuture(state); // the last reference destroys the frame, state and all
+}
+#endif
+
 } // namespace detail
 
 // ---- Limiters ------------------------------------------------------------------
