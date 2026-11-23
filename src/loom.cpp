@@ -783,6 +783,8 @@ void SetTestHook(TestHookFn fn) { s_TestHook.store(fn, std::memory_order_release
 #endif
 // A limiter unit has just become free for anyone to take.
 static constexpr int kTestPointUnitFreed = 1;
+// A task's function has returned; its runner has given nothing back yet.
+static constexpr int kTestPointTaskReturned = 2;
 
 // Gives a unit back. Returns the waiting task it went to (which must now be
 // queued), or kNoSlot.
@@ -3180,6 +3182,7 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	if (destroy)
 		destroy(userData);
 	MarkProfilerZone(P, threadIndex, nameId, window, "Task", false, zone);
+	LOOM_TEST_POINT(kTestPointTaskReturned);
 	// The unit goes back (or on to the next waiting task) before the signal:
 	// once a WaitFor on the task's counter returns, it holds none.
 	if (limiter != 0)
@@ -3840,6 +3843,16 @@ bool CallStage(PipelineRun& run, size_t stage, uint32_t item)
 
 void SubmitStage(PipelineRun& run, uint32_t item, size_t stage);
 
+// A stage task gives its limiter unit back before it lets go of its last
+// item, as a future's task does before its signal: once that item moves on,
+// the run can end and Run return (and the caller destroy the limiter)
+// before the task's runner would give the unit back.
+void ReleaseStageUnit()
+{
+	PoolState& P = ActivePool();
+	ReleaseRunningUnit(P, CurrentCtx(P));
+}
+
 void RunSource(PipelineRun& run, uint32_t item)
 {
 	for (;;)
@@ -3848,6 +3861,8 @@ void RunSource(PipelineRun& run, uint32_t item)
 		uint32_t next = kNoSlot;
 		bool finished = false;
 		const CounterHandle done = run.done;
+		if (!more)
+			ReleaseStageUnit();
 		{
 			std::lock_guard<std::mutex> lock(run.mutex);
 			if (more)
@@ -3871,6 +3886,8 @@ void RunSource(PipelineRun& run, uint32_t item)
 				Signal(done); // the run may be gone after this
 			return;
 		}
+		if (next == kNoSlot)
+			ReleaseStageUnit();
 		PipelineAdvance(run, item, 1); // with no `next` held, the run may be gone after this
 		if (next == kNoSlot)
 			return;
@@ -3901,6 +3918,8 @@ void RunStage(PipelineRun& run, uint32_t item, size_t stage)
 			else
 				st.busy = false;
 		}
+		if (next == kNoSlot)
+			ReleaseStageUnit();
 		PipelineAdvance(run, item, stage + 1); // with no `next` held, the run may be gone after this
 		if (next == kNoSlot)
 			return;

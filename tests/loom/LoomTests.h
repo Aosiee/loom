@@ -2959,6 +2959,64 @@ TEST_CASE("loom: pipelines — stage TaskDescs, a run inside a task, running aga
 #endif
 }
 
+#if defined(LOOM_TEST_HOOKS)
+namespace {
+	// Holds every task at the end of its run, before its runner gives back
+	// its unit: a unit a task still holds after the work's wait shows.
+	struct SlowTaskEnds
+	{
+		static inline std::atomic<bool> armed{ false };
+
+		static void Hook(int point)
+		{
+			if (point == 2 && armed.load())
+				std::this_thread::sleep_for(std::chrono::milliseconds(3));
+		}
+	};
+
+	uint32_t HeldUnits(loom::LimiterHandle h)
+	{
+		for (const loom::DebugLimiter& l : loom::CaptureDebugState().limiters)
+			if (l.handle == h)
+				return l.held;
+		return ~0u;
+	}
+}
+
+TEST_CASE("loom: pipelines — no limited stage holds a unit once Run returns")
+{
+	// The caller may destroy the limiter as soon as Run returns.
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 3 });
+	struct Item { int index = 0; };
+	for (int limitedStage = 0; limitedStage < 3; limitedStage++)
+	{
+		CAPTURE(limitedStage);
+		loom::ScopedLimiter two(2);
+		auto desc = [&](int stage) { return stage == limitedStage ? loom::TaskDesc{ .limiter = two } : loom::TaskDesc{}; };
+		int produced = 0;
+		loom::Pipeline<Item> p(4);
+		p.Source([&](Item& it) { it.index = produced; return produced++ < 8; }, desc(0))
+		 .Parallel([](Item&) {}, desc(1))
+		 .Serial([](Item&) {}, desc(2));
+		loom::detail::SetTestHook(&SlowTaskEnds::Hook);
+		SlowTaskEnds::armed = true;
+		int stillHeld = 0;
+		for (int run = 0; run < 5; run++)
+		{
+			produced = 0;
+			p.Run();
+			if (HeldUnits(two) != 0)
+				stillHeld++;
+		}
+		SlowTaskEnds::armed = false;
+		loom::detail::SetTestHook(nullptr);
+		while (loom::LiveTaskCount() > 0)
+			std::this_thread::yield();
+		CHECK(stillHeld == 0);
+	}
+}
+#endif
+
 TEST_CASE("loom: futures — values, void, move-only results and repeated Get, any pool")
 {
 	for (int workers : { 0, 1, -1 })

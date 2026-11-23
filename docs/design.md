@@ -388,7 +388,11 @@ next and the items that came early, in a ring indexed by place (at most
 the item count of places can be waiting, so it never collides). Every task
 of a run holds an item that is still in the pipeline and touches the run
 only while it does. The task that brings the last item home after the
-source has ended signals the run's counter as its last step.
+source has ended signals the run's counter as its last step. A stage task
+with a limiter gives its unit back before it lets go of its last item, as
+a future's task does before its signal: once that item moves on, the run
+can end and `Run` return before the task's runner would otherwise give the
+unit back, and the caller may destroy the limiter straight away.
 
 The source fills items in one task for as long as free ones are left; an
 item coming home restarts it if it stopped. A serial stage likewise takes
