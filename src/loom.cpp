@@ -2393,6 +2393,31 @@ void Signal(CounterHandle h, int n)
 	SignalCounter(ActivePool(), h, n);
 }
 
+// The stored value is the count + 1 while it is nonzero, and the final
+// signaller takes it from 2 to 1 before releasing anything. So an add that
+// sees more than 1 and wins its exchange comes before that final signal:
+// nobody has been released, and the count stays above zero. Deferred task
+// signals only hold decrements back, so they never make this unsafe.
+bool AddToCounter(CounterHandle h, int n)
+{
+	CounterState* c = ResolveCounter(ActivePool(), h);
+	assert(c && "adding to an invalid/destroyed counter");
+	assert(n >= 0 && "AddToCounter adds; Signal takes away");
+	if (!c || n < 0)
+		return false;
+	int v = c->count.load(std::memory_order_acquire);
+	for (;;)
+	{
+		if (v <= 1)
+			return false; // reached zero (1: still settling, 0: settled)
+		if (n == 0)
+			return true;
+		assert(v <= INT_MAX - n && "counter overflow");
+		if (c->count.compare_exchange_weak(v, v + n, std::memory_order_acq_rel, std::memory_order_relaxed))
+			return true;
+	}
+}
+
 static void SignalCounter(PoolState& P, CounterHandle h, int n)
 {
 	CounterState* c = ResolveCounter(P, h);

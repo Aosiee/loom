@@ -57,6 +57,14 @@ behind (`Load` reports it as 1). Someone who sees zero can destroy the
 counter while that signaller still holds the lock: `DestroyCounter` takes
 the lock first, so it waits for the signaller to finish.
 
+`AddToCounter` is a compare-and-swap that adds only while the stored value
+is above 1. The final decrement takes it from 2 to 1 before releasing
+anyone, so an add that wins comes before that signal: no task or waiter has
+been released, and the count stays above zero. Once the value is 1 or 0 the
+add fails and changes nothing. Deferred task signals only hold decrements
+back, so they can keep a count up a little longer but never let an add
+reopen one that has been released.
+
 ### Deferred task signals
 
 When tasks signal one counter, that counter's line is the hottest in the

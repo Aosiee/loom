@@ -2231,6 +2231,133 @@ TEST_CASE("loom: counters — a task released by a counter already sees it at ze
 	CHECK(notZero.load() == 0);
 }
 
+namespace {
+	// A tree walked by tasks that each add their children to one counter: node
+	// i has children 4i+1 .. 4i+4 below `nodes`.
+	struct TreeWalk
+	{
+		loom::CounterHandle done = loom::kInvalidCounter;
+		size_t nodes = 0;
+		std::atomic<size_t> visited{ 0 };
+		std::atomic<int> refused{ 0 };
+		std::atomic<int> peakCounters{ 0 };
+		size_t throwAt = SIZE_MAX;
+
+		static void Visit(TreeWalk* w, size_t i)
+		{
+			w->visited++;
+			if (i == w->throwAt)
+				throw std::runtime_error("bad node");
+			for (size_t c = 4 * i + 1; c <= 4 * i + 4 && c < w->nodes; c++)
+			{
+				if (!loom::AddToCounter(w->done))
+					w->refused++;
+				loom::Submit([w, c] { Visit(w, c); }, loom::TaskDesc{ .signals = w->done });
+			}
+			if (i % 997 == 0)
+			{
+				const int live = loom::SnapshotThreadStats().counterCount;
+				int seen = w->peakCounters.load();
+				while (live > seen && !w->peakCounters.compare_exchange_weak(seen, live)) {}
+			}
+		}
+	};
+}
+
+TEST_CASE("loom: counters — AddToCounter: a whole tree of tasks on one counter, no task waiting")
+{
+	for (int workers : { 0, 1, -1 })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers, .maxTasks = 1 << 16 });
+		const int baseline = LiveCounters();
+		TreeWalk walk;
+		walk.nodes = 200000;
+		loom::ScopedCounter done(1);
+		walk.done = done.Get();
+		loom::Submit([w = &walk] { TreeWalk::Visit(w, 0); }, loom::TaskDesc{ .signals = done });
+		loom::WaitFor(done);
+		CHECK(walk.visited.load() == walk.nodes);
+		CHECK(walk.refused.load() == 0);
+		CHECK(walk.peakCounters.load() <= baseline + 1); // the one counter, however deep the tree
+		CHECK(!loom::AddToCounter(done)); // reached zero: refused
+		CHECK(loom::Load(done) == 0);
+	}
+}
+
+TEST_CASE("loom: counters — AddToCounter keeps waiters asleep, refuses once zero, works with Cancel and exceptions")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 3 });
+	{
+		// A thread asleep on the counter stays asleep while adds keep it up.
+		loom::ScopedCounter c(1);
+		std::atomic<bool> returned{ false };
+		std::thread waiter([&] { loom::WaitFor(c.Get(), loom::Help::BlockOnly); returned = true; });
+		CHECK(loom::AddToCounter(c, 5));
+		CHECK(loom::Load(c) == 6);
+		loom::Signal(c, 5);
+		CHECK(loom::Load(c) == 1);
+		CHECK(loom::AddToCounter(c, 0)); // still open
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		CHECK(!returned.load());
+		loom::Signal(c);
+		waiter.join();
+		CHECK(returned.load());
+		CHECK(!loom::AddToCounter(c, 1));
+		CHECK(!loom::AddToCounter(c, 0));
+		CHECK(loom::Load(c) == 0);
+	}
+	{
+		// Added tasks of a cancelled counter are skipped and still signal it.
+		loom::ScopedCounter c(1);
+		std::atomic<int> ran{ 0 };
+		loom::Cancel(c);
+		REQUIRE(loom::AddToCounter(c, 50));
+		for (int i = 0; i < 50; i++)
+			loom::Submit([&] { ran++; }, loom::TaskDesc{ .signals = c });
+		loom::Signal(c);
+		loom::WaitFor(c);
+		CHECK(ran.load() == 0);
+	}
+#if defined(__cpp_exceptions)
+	{
+		// A node that throws cancels the counter: the nodes not yet started are
+		// skipped (adding no children), so the count still comes down to zero.
+		TreeWalk walk;
+		walk.nodes = 100000;
+		walk.throwAt = 40;
+		loom::ScopedCounter done(1);
+		walk.done = done.Get();
+		loom::Submit([w = &walk] { TreeWalk::Visit(w, 0); }, loom::TaskDesc{ .signals = done });
+		CHECK_THROWS_AS(loom::WaitFor(done), std::runtime_error);
+		CHECK(walk.visited.load() < walk.nodes);
+		CHECK(walk.refused.load() == 0);
+	}
+#endif
+	{
+		// Adds and signals racing from many threads: every add is matched.
+		loom::ScopedCounter c(1);
+		constexpr int kThreads = 8, kRounds = 20000;
+		std::vector<std::thread> threads;
+		std::atomic<int> refused{ 0 };
+		for (int t = 0; t < kThreads; t++)
+			threads.emplace_back([&] {
+				for (int r = 0; r < kRounds; r++)
+				{
+					if (!loom::AddToCounter(c, 2))
+						refused++;
+					loom::Signal(c);
+					loom::Signal(c);
+				}
+			});
+		for (auto& t : threads)
+			t.join();
+		CHECK(refused.load() == 0); // the initial 1 holds it open throughout
+		CHECK(loom::Load(c) == 1);
+		loom::Signal(c);
+		loom::WaitFor(c);
+	}
+}
+
 TEST_CASE("loom: limiters — each running task holds its own unit index")
 {
 	for (int workers : { 0, 1, -1 })

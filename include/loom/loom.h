@@ -206,6 +206,15 @@ void Submit(F&& fn, const TaskDesc& opts = {})
 CounterHandle CreateCounter(int initial);
 void           DestroyCounter(CounterHandle);  // asserts count == 0, no waiters
 void           Signal(CounterHandle, int n = 1);
+// Raises a count that has not reached zero yet by n, for work that finds
+// more work as it runs (a tree walk, culling a bounding-volume hierarchy):
+// a task that signals the counter adds 1 for each task it submits that will
+// signal it too, so one counter and one wait cover the whole tree, with no
+// task waiting for its children. True when added. False, changing nothing,
+// once the count has reached zero, since its waits may already have
+// returned. A running task that signals the counter always succeeds: its
+// own signal is still to come.
+bool           AddToCounter(CounterHandle, int n = 1);
 // The current count. It can lag briefly behind tasks that have finished on
 // other threads (a worker applies its finished tasks' signals to a counter in
 // one go, at the latest when it runs out of work at hand or runs a task of

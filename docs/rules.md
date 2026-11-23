@@ -115,3 +115,14 @@ waits on the future sees the broken promise instead of waiting forever.
 the wait for the work that writes the cells, never while a task may still
 call `Local()`. That wait is also what makes each thread's writes visible
 to the merge.
+
+## Add to a counter before submitting what will signal it
+
+`AddToCounter` succeeds only while the count is above zero, and only a
+signal still to come can keep it there. Add for a child before submitting
+the child: once the child is submitted it may finish, and if it was the
+last thing holding the count up the counter reaches zero and the next add
+fails. A running task that signals the counter holds it open for its own
+children, so the tree-walk pattern (add, then submit, from inside a task of
+that counter) always works. Check the result where nothing else holds the
+count up.
