@@ -298,37 +298,89 @@ private:
 //   ...
 //   Draw(mesh.Get());
 //
+// Then(fn) runs fn(value) as a task once the value is ready and returns a
+// future for fn's result, so steps chain without writing the waits:
+//
+//   loom::Future<GpuMesh> gpu = loom::Async([path] { return ReadFile(path); })
+//       .Then([](Bytes& bytes) { return ParseMesh(bytes); })
+//       .Then([](Mesh& mesh) { return Upload(mesh); }, { .affinity = loom::Affinity::MainThread });
+//
+// A step whose input failed is skipped and its future fails the same way, so
+// one Get at the end of a chain sees the first error. A continuation keeps
+// what it reads alive: the futures before it may be dropped.
+//
+// A Promise is a future whose value comes from outside loom: an IO
+// callback, a GPU fence, another library's thread. SetValue (or
+// SetException) completes the future, from any thread. A promise destroyed
+// without either completes it with BrokenPromise, so a Get never hangs.
+//
 // A future is also a counter: Counter() is zero once the value is ready, so
-// a task can wait for it (TaskDesc::waitsFor, or waitsForAll for several)
-// and read Get() without blocking. Keep the future alive until that task has
-// read it.
+// a plain task can wait for it (TaskDesc::waitsFor, or waitsForAll for
+// several) and read Get() without blocking. Keep the future alive until that
+// task has read it.
 //
-// The callable is stored with the result in one heap allocation, and
-// destroyed as soon as it has run. Dropping a future before its task has run
-// is fine: the task still runs, and frees the result and the counter. A
-// future's task always runs: it ignores Cancel. Each pending future holds
-// one counter (LoomConfig::maxCounters) until it is both finished and
-// dropped, and like a counter it must not outlive the pool.
+// A future's state (the callable, the result, a counter) is one heap
+// allocation, freed once the future, its task or promise, and any
+// continuation reading it have all let go. Dropping a future before its
+// value is there is fine: the task still runs. A future's task always runs:
+// it ignores Cancel. Each pending future holds one counter
+// (LoomConfig::maxCounters), and like a counter it must not outlive the pool.
 //
-// The TaskDesc gives the task's affinity, thread, priority, limiter, waits
-// and profiler fields; its fn, userData and signals must be unset (the
-// future signals its own counter).
+// The TaskDesc of Async and Then gives the task's affinity, thread,
+// priority, limiter, waitsForAll and profiler fields; fn, userData and
+// signals must be unset (the future signals its own counter), and so must
+// waitsFor for Then (it waits for the future).
+
+// What Get throws when the promise behind a future was destroyed unset.
+struct BrokenPromise : std::exception
+{
+	const char* what() const noexcept override { return "loom: a promise was destroyed without a value"; }
+};
+
+template <typename T> class Future;
+template <typename T> class Promise;
+
 namespace detail {
 	struct FutureStateBase
 	{
 		CounterHandle    counter = kInvalidCounter;
-		std::atomic<int> refs{ 2 }; // the future and its task
+		std::atomic<int> refs{ 2 }; // one per owner: the future, its task or promise, continuations
 		void (*destroy)(FutureStateBase*) noexcept = nullptr;
+		bool             broken = false; // completed without a value (also `error`, with exceptions)
 #if defined(__cpp_exceptions)
 		std::exception_ptr error;
 #endif
+		bool Failed() const
+		{
+#if defined(__cpp_exceptions)
+			return broken || error != nullptr;
+#else
+			return broken;
+#endif
+		}
 	};
-	// Creates the counter and submits `run` with the state as its userData.
-	void StartFuture(FutureStateBase* state, TaskFn run, const TaskDesc& opts);
-	// The task's end: signals the counter, then drops the task's reference.
+	// Creates the state's counter (count 1: its value).
+	void CreateFutureCounter(FutureStateBase* state);
+	// CreateFutureCounter, then submits `run` with the state as its userData,
+	// waiting also for `after` when given.
+	void StartFuture(FutureStateBase* state, TaskFn run, const TaskDesc& opts, CounterHandle after = kInvalidCounter);
+	// The end of a future's own task: gives back its limiter unit, signals
+	// the counter, then drops the task's reference.
 	void FinishFuture(FutureStateBase* state) noexcept;
+	// Marks the value there (a promise): signals the counter. Drops nothing.
+	void SignalFuture(FutureStateBase* state) noexcept;
 	// Drops one reference; the last frees the counter and the state.
 	void ReleaseFuture(FutureStateBase* state) noexcept;
+	inline void RetainFuture(FutureStateBase* state) noexcept { state->refs.fetch_add(1, std::memory_order_relaxed); }
+
+	// A continuation's input failed: its own future fails the same way.
+	inline void CopyFailure(FutureStateBase& to, const FutureStateBase& from)
+	{
+		to.broken = from.broken;
+#if defined(__cpp_exceptions)
+		to.error = from.error;
+#endif
+	}
 
 	struct NoValue {};
 	template <typename T>
@@ -336,6 +388,27 @@ namespace detail {
 	{
 		std::conditional_t<std::is_void_v<T>, NoValue, std::optional<T>> value;
 	};
+
+	// Calls fn, with the input's value unless it is void, into `out`.
+	template <typename U, typename G, typename... In>
+	void RunInto(FutureState<U>& out, G& fn, In&... in)
+	{
+#if defined(__cpp_exceptions)
+		try
+		{
+#endif
+			if constexpr (std::is_void_v<U>)
+				fn(in...);
+			else
+				out.value.emplace(fn(in...));
+#if defined(__cpp_exceptions)
+		}
+		catch (...)
+		{
+			out.error = std::current_exception();
+		}
+#endif
+	}
 
 	template <typename T, typename F>
 	struct FutureTask final : FutureState<T>
@@ -348,25 +421,49 @@ namespace detail {
 		static void Run(void* p)
 		{
 			FutureTask& t = *static_cast<FutureTask*>(p);
-#if defined(__cpp_exceptions)
-			try
-			{
-#endif
-				if constexpr (std::is_void_v<T>)
-					t.fn();
-				else
-					t.value.emplace(t.fn());
-#if defined(__cpp_exceptions)
-			}
-			catch (...)
-			{
-				t.error = std::current_exception();
-			}
-#endif
+			RunInto(t, t.fn);
 			t.fn.~F();
 			FinishFuture(&t);
 		}
 		static void Destroy(FutureStateBase* b) noexcept { delete static_cast<FutureTask*>(b); }
+	};
+
+	// Then: fn(input value) once the input is ready.
+	template <typename T, typename G> struct ThenInvocable : std::is_invocable<G&, T&> {};
+	template <typename G> struct ThenInvocable<void, G> : std::is_invocable<G&> {};
+	template <typename T, typename G> struct ThenResult { using type = std::invoke_result_t<G&, T&>; };
+	template <typename G> struct ThenResult<void, G> { using type = std::invoke_result_t<G&>; };
+
+	template <typename T, typename U, typename F>
+	struct ContinuationTask final : FutureState<U>
+	{
+		union { F fn; };
+		FutureState<T>* input = nullptr; // one reference, dropped once read
+		template <typename A>
+		explicit ContinuationTask(A&& a) : fn(std::forward<A>(a)) {}
+		~ContinuationTask() {}
+
+		static void Run(void* p)
+		{
+			ContinuationTask& t = *static_cast<ContinuationTask*>(p);
+			FutureState<T>& in = *t.input;
+			if (in.Failed())
+				CopyFailure(t, in);
+			else if constexpr (std::is_void_v<T>)
+				RunInto(t, t.fn);
+			else
+				RunInto(t, t.fn, *in.value);
+			t.fn.~F();
+			ReleaseFuture(&in);
+			FinishFuture(&t);
+		}
+		static void Destroy(FutureStateBase* b) noexcept { delete static_cast<ContinuationTask*>(b); }
+	};
+
+	template <typename T>
+	struct PromiseState final : FutureState<T>
+	{
+		static void Destroy(FutureStateBase* b) noexcept { delete static_cast<PromiseState*>(b); }
 	};
 } // namespace detail
 
@@ -393,7 +490,7 @@ public:
 	Future& operator=(const Future&) = delete;
 
 	bool Valid() const { return m_State != nullptr; }
-	// True once the value (or the exception) is there; never waits.
+	// True once the value (or the error) is there; never waits.
 	bool Ready() const { return Load(m_State->counter) == 0; }
 	// Waits for the value; Get calls it. Rethrows nothing: Get does.
 	void Wait(Help help = Help::WhileWaiting) const { WaitFor(m_State->counter, help); }
@@ -403,18 +500,37 @@ public:
 		return TryWaitFor(m_State->counter, timeoutMs, help);
 	}
 	// Waits, then returns the value (a reference into the future, valid while
-	// it lives; move from it to take it), or rethrows the callable's
-	// exception. Can be called again: it returns the same value, or throws
-	// the same exception.
+	// it lives; move from it to take it), or rethrows the error. Can be called
+	// again: it returns the same value, or throws the same exception. (Built
+	// without exceptions, a failed future's Get ends the program.)
 	std::add_lvalue_reference_t<T> Get(Help help = Help::WhileWaiting)
 	{
 		Wait(help);
 #if defined(__cpp_exceptions)
 		if (m_State->error)
 			std::rethrow_exception(m_State->error);
+#else
+		if (m_State->broken)
+			std::terminate();
 #endif
 		if constexpr (!std::is_void_v<T>)
 			return *m_State->value;
+	}
+	// fn(value) (fn() for a void future) as a task once the value is ready;
+	// returns the future of its result. Skipped, with the same error, if this
+	// future fails. This future may be dropped afterwards.
+	template <typename F> requires detail::ThenInvocable<T, std::decay_t<F>>::value
+	[[nodiscard]] Future<typename detail::ThenResult<T, std::decay_t<F>>::type> Then(F&& fn, const TaskDesc& opts = {}) const
+	{
+		using G = std::decay_t<F>;
+		using U = typename detail::ThenResult<T, G>::type;
+		using Task = detail::ContinuationTask<T, U, G>;
+		Task* task = new Task(std::forward<F>(fn)); // nothing started yet if this throws
+		task->destroy = &Task::Destroy;
+		task->input = m_State;
+		detail::RetainFuture(m_State);
+		detail::StartFuture(task, &Task::Run, opts, m_State->counter);
+		return Future<U>(task);
 	}
 	// Zero once ready: for a task's waitsFor. Valid while the future lives.
 	CounterHandle Counter() const { return m_State ? m_State->counter : kInvalidCounter; }
@@ -428,6 +544,8 @@ public:
 
 private:
 	explicit Future(detail::FutureState<T>* state) : m_State(state) {}
+	template <typename> friend class Future;
+	template <typename> friend class Promise;
 	template <typename F> requires std::is_invocable_v<std::decay_t<F>&>
 	friend Future<std::invoke_result_t<std::decay_t<F>&>> Async(F&& fn, const TaskDesc& opts);
 
@@ -445,6 +563,101 @@ template <typename F> requires std::is_invocable_v<std::decay_t<F>&>
 	detail::StartFuture(task, &Task::Run, opts);
 	return Future<T>(task);
 }
+
+// The producing side of a future, for a value that comes from outside loom.
+// Set it once, from any thread, while the pool lives; the Promise object
+// itself is not shared between threads.
+template <typename T>
+class Promise
+{
+	static_assert(std::is_void_v<T> || (std::is_object_v<T> && !std::is_array_v<T>),
+		"a Promise holds a value or nothing");
+
+public:
+	Promise() : m_State(new detail::PromiseState<T>())
+	{
+		m_State->destroy = &detail::PromiseState<T>::Destroy;
+		m_State->refs.store(1, std::memory_order_relaxed); // the promise; GetFuture adds the future's
+		detail::CreateFutureCounter(m_State);
+	}
+	// Completes the future with BrokenPromise if it was never set.
+	~Promise() { Abandon(); }
+	Promise(Promise&& other) noexcept : m_State(std::exchange(other.m_State, nullptr)), m_Set(other.m_Set), m_Taken(other.m_Taken) {}
+	Promise& operator=(Promise&& other) noexcept
+	{
+		if (this != &other)
+		{
+			Abandon();
+			m_State = std::exchange(other.m_State, nullptr);
+			m_Set = other.m_Set;
+			m_Taken = other.m_Taken;
+		}
+		return *this;
+	}
+	Promise(const Promise&) = delete;
+	Promise& operator=(const Promise&) = delete;
+
+	// The future it completes. Once per promise, before or after it is set.
+	[[nodiscard]] Future<T> GetFuture()
+	{
+		CheckUsable(!m_Taken);
+		m_Taken = true;
+		detail::RetainFuture(m_State);
+		return Future<T>(m_State);
+	}
+	// Stores the value (constructed from `args`) and completes the future.
+	template <typename... A>
+		requires (std::is_void_v<T> ? sizeof...(A) == 0 : std::is_constructible_v<T, A&&...>)
+	void SetValue(A&&... args)
+	{
+		CheckUsable(!m_Set);
+		if constexpr (!std::is_void_v<T>)
+			m_State->value.emplace(std::forward<A>(args)...);
+		Complete();
+	}
+#if defined(__cpp_exceptions)
+	// Completes the future with an error for Get to rethrow.
+	void SetException(std::exception_ptr error)
+	{
+		CheckUsable(!m_Set && error != nullptr);
+		m_State->error = std::move(error);
+		Complete();
+	}
+#endif
+	bool IsSet() const { return m_Set; }
+
+private:
+	static void CheckUsable(bool ok)
+	{
+		if (!ok)
+			std::terminate(); // a moved-from promise, a second set, or a second GetFuture
+	}
+	void Complete()
+	{
+		CheckUsable(m_State != nullptr);
+		m_Set = true;
+		detail::SignalFuture(m_State);
+	}
+	void Abandon() noexcept
+	{
+		if (!m_State)
+			return;
+		if (!m_Set)
+		{
+			m_State->broken = true;
+#if defined(__cpp_exceptions)
+			m_State->error = std::make_exception_ptr(BrokenPromise{});
+#endif
+			m_Set = true;
+			detail::SignalFuture(m_State);
+		}
+		detail::ReleaseFuture(std::exchange(m_State, nullptr));
+	}
+
+	detail::PromiseState<T>* m_State = nullptr;
+	bool m_Set = false;
+	bool m_Taken = false;
+};
 
 // ---- Isolation ---------------------------------------------------------------
 // Runs fn() as an isolated region. The tasks submitted inside it, and the

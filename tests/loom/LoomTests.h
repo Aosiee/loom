@@ -2392,6 +2392,220 @@ TEST_CASE("loom: futures — Get rethrows the callable's exception, every time")
 }
 #endif
 
+TEST_CASE("loom: promises — set from a thread outside loom, before or after GetFuture")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	const int baseline = LiveCounters();
+	{
+		// An IO callback on a thread loom did not start.
+		loom::Promise<std::string> read;
+		loom::Future<std::string> text = read.GetFuture();
+		std::thread io([p = std::move(read)]() mutable {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			p.SetValue(std::string(64, 'r'));
+		});
+		CHECK(text.Get().size() == 64);
+		io.join();
+
+		// Set first, the future taken afterwards; void; a value built in place.
+		loom::Promise<int> early;
+		early.SetValue(9);
+		CHECK(early.IsSet());
+		loom::Future<int> late = early.GetFuture();
+		CHECK(late.Ready());
+		CHECK(late.Get() == 9);
+		loom::Promise<void> signal;
+		loom::Future<void> fired = signal.GetFuture();
+		CHECK(!fired.Ready());
+		signal.SetValue();
+		fired.Get();
+		loom::Promise<std::vector<int>> built;
+		built.SetValue(5, 7);
+		CHECK(built.GetFuture().Get() == std::vector<int>(5, 7));
+
+		// A task can wait for a promise's future like any other.
+		loom::Promise<int> gate;
+		loom::Future<int> gated = gate.GetFuture();
+		std::atomic<int> seen{ 0 };
+		loom::ScopedCounter done(1);
+		loom::Submit([&] { seen = gated.Get(); }, loom::TaskDesc{ .signals = done, .waitsFor = gated.Counter() });
+		CHECK(!loom::TryWaitFor(done, 10));
+		gate.SetValue(11);
+		loom::WaitFor(done);
+		CHECK(seen.load() == 11);
+
+		// Neither side need outlive the other.
+		{
+			loom::Promise<int> unread;
+			(void)unread.GetFuture(); // the future dropped at once
+			unread.SetValue(1);
+		}
+		{
+			loom::Promise<int> neverTaken; // no future, never set
+		}
+	}
+	CHECK(LiveCounters() == baseline);
+}
+
+#if defined(__cpp_exceptions)
+TEST_CASE("loom: promises — an unset promise breaks its future; SetException")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	const int baseline = LiveCounters();
+	{
+		loom::Future<int> orphan;
+		{
+			loom::Promise<int> p;
+			orphan = p.GetFuture();
+		}
+		CHECK(orphan.Ready());
+		CHECK_THROWS_AS(orphan.Get(), loom::BrokenPromise);
+
+		loom::Promise<int> moved;
+		loom::Future<int> f = moved.GetFuture();
+		loom::Promise<int> owner(std::move(moved)); // the moved-from one breaks nothing
+		CHECK(!f.Ready());
+		owner.SetValue(3);
+		CHECK(f.Get() == 3);
+
+		loom::Promise<void> failing;
+		loom::Future<void> failed = failing.GetFuture();
+		failing.SetException(std::make_exception_ptr(std::runtime_error("io failed")));
+		CHECK_THROWS_AS(failed.Get(), std::runtime_error);
+	}
+	CHECK(LiveCounters() == baseline);
+}
+#endif
+
+TEST_CASE("loom: promises — set inside a limited task, the task keeps its unit")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	loom::ScopedLimiter one(1);
+	loom::Promise<int> p;
+	loom::Future<int> f = p.GetFuture();
+	std::atomic<bool> release{ false };
+	loom::ScopedCounter done(1);
+	loom::Submit([&] {
+		p.SetValue(5);
+		while (!release)
+			std::this_thread::yield();
+	}, loom::TaskDesc{ .signals = done, .limiter = one });
+	// Without helping: a helping Get could run the task here, and it spins
+	// until this thread sets `release`.
+	CHECK(f.Get(loom::Help::BlockOnly) == 5);
+	CHECK_MESSAGE(loom::LimiterHeld(one) == 1, "the setting task is still running and still holds its unit");
+	release = true;
+	loom::WaitFor(done);
+	CHECK(loom::LimiterHeld(one) == 0);
+}
+
+TEST_CASE("loom: continuations — chains run in order and outlive the futures they read")
+{
+	for (int workers : { 0, 1, -1 })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		const int baseline = LiveCounters();
+		Tracked::live = 0;
+		{
+			loom::Future<std::string> chain = loom::Async([] { return 20; })
+				.Then([](int& v) { return v + 1; })
+				.Then([](int& v) { return std::vector<int>((size_t)v, 2); })
+				.Then([](std::vector<int>& v) { return std::to_string(v.size() * (size_t)v[0]); });
+			CHECK(chain.Get() == "42");
+
+			// Void at either end; Then on an already ready future; several on one.
+			std::atomic<int> steps{ 0 };
+			loom::Future<int> fromVoid = loom::Async([&] { steps++; }).Then([&] { steps++; return 7; });
+			loom::Future<void> toVoid = fromVoid.Then([&](int& v) { steps += v; });
+			toVoid.Get();
+			CHECK(steps.load() == 9);
+			CHECK(fromVoid.Ready());
+			loom::Future<int> again = fromVoid.Then([](const int& v) { return v * 2; });
+			loom::Future<int> branch = fromVoid.Then([](int v) { return v * 3; });
+			CHECK(again.Get() == 14);
+			CHECK(branch.Get() == 21);
+
+			// Only the last future kept: the chain still completes, and the
+			// callables are destroyed as each step runs.
+			loom::ScopedCounter gate(1);
+			loom::Future<int> last;
+			{
+				Tracked tracked;
+				loom::Future<int> first = loom::Async([tracked] { (void)tracked; return 1; }, loom::TaskDesc{ .waitsFor = gate });
+				loom::Future<int> second = first.Then([tracked](int& v) { (void)tracked; return v + 1; });
+				last = second.Then([tracked](int& v) { (void)tracked; return v + 1; });
+			}
+			CHECK(Tracked::live.load() == 3);
+			loom::Signal(gate);
+			CHECK(last.Get() == 3);
+			CHECK(Tracked::live.load() == 0);
+
+			// A chain from a promise, every step on the main thread.
+			loom::Promise<int> p;
+			loom::Future<int> onMain = p.GetFuture()
+				.Then([](int& v) { return v + loom::CurrentThreadIndex(); }, loom::TaskDesc{ .affinity = loom::Affinity::MainThread });
+			std::thread setter([&p] { p.SetValue(100); });
+			CHECK(onMain.Get() == 100);
+			setter.join();
+		}
+		while (loom::LiveTaskCount() > 0)
+			std::this_thread::yield();
+		CHECK(LiveCounters() == baseline);
+	}
+}
+
+TEST_CASE("loom: continuations — a limited step, and a step waiting on more counters")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 3 });
+	loom::ScopedLimiter one(1);
+	for (int i = 0; i < 200; i++)
+	{
+		loom::Future<int> f = loom::Async([i] { return i; }).Then([](int& v) { return v * 2; }, loom::TaskDesc{ .limiter = one });
+		CHECK(f.Get() == 2 * i);
+		CHECK(loom::LimiterHeld(one) == 0);
+	}
+	loom::ScopedCounter extra(1);
+	const loom::CounterHandle more[] = { extra };
+	loom::Future<int> both = loom::Async([] { return 1; }).Then([](int& v) { return v + 1; }, loom::TaskDesc{ .waitsForAll = more });
+	CHECK(!both.TryWait(20));
+	loom::Signal(extra);
+	CHECK(both.Get() == 2);
+}
+
+#if defined(__cpp_exceptions)
+TEST_CASE("loom: continuations — an error skips the rest of the chain and reaches its end")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	const int baseline = LiveCounters();
+	{
+		std::atomic<int> ran{ 0 };
+		loom::Future<int> end = loom::Async([]() -> int { throw std::runtime_error("read failed"); })
+			.Then([&](int& v) { ran++; return v; })
+			.Then([&](int& v) { ran++; return v; });
+		CHECK_THROWS_AS(end.Get(), std::runtime_error);
+		CHECK(ran.load() == 0);
+
+		// A step that throws; the steps before it ran.
+		loom::Future<void> mid = loom::Async([&] { ran++; return 1; })
+			.Then([](int&) -> int { throw std::logic_error("parse failed"); })
+			.Then([&](int&) { ran += 100; });
+		CHECK_THROWS_AS(mid.Get(), std::logic_error);
+		CHECK(ran.load() == 1);
+
+		// A broken promise reaches a chain's end too.
+		loom::Future<int> fromBroken;
+		{
+			loom::Promise<int> p;
+			fromBroken = p.GetFuture().Then([](int& v) { return v; });
+		}
+		CHECK_THROWS_AS(fromBroken.Get(), loom::BrokenPromise);
+	}
+	while (loom::LiveTaskCount() > 0)
+		std::this_thread::yield();
+	CHECK(LiveCounters() == baseline);
+}
+#endif
+
 TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thread index")
 {
 	loom::Pool pool; // the suite owns its pool explicitly

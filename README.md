@@ -52,6 +52,8 @@ loom::ParallelFor(0, meshes.size(), 64, [&](size_t begin, size_t end) {
   when nothing else is queued.
 - **Futures** (`Async`): a task that returns a value; `Get()` waits for it
   or rethrows, and `Counter()` lets another task wait for it first.
+  `Then` runs a task on the value once it is ready, and a `Promise` makes a
+  future for a value that comes from outside loom, such as an IO callback.
 - **Limiters** (`CreateLimiter`): at most N tasks of a kind run at once, so
   background work (asset decompression, uploads) cannot take every worker;
   a limit of 1 is a serial queue.

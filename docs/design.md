@@ -155,6 +155,23 @@ own error and cancellation. Because the task signals no counter through
 the runner, nothing can skip it: a future's task ignores `Cancel`, and
 always completes its future.
 
+A `Promise` uses the same block with no task behind it: the promise holds
+the reference the task would, `SetValue` or `SetException` stores into the
+block and signals the counter, and the promise's destructor drops its
+reference. A promise destroyed unset first stores `BrokenPromise` and
+signals, so nothing waiting on it hangs. Setting a promise never touches a
+limiter: a task that sets one keeps its own unit until it returns, unlike
+a future's own task, which gives its unit back with its signal.
+
+`Then` is a future whose task holds a reference to its input and waits on
+the input's counter through `waitsFor`, so it is queued only once the
+input is ready and never blocks a worker. When it runs it either copies the
+input's failure (error or broken promise) into its own block, so a failure
+skips the rest of a chain, or calls the callable with the input's value;
+then it drops the input and completes as `Async` does. Because the
+continuation holds its input, a chain's earlier futures may be dropped as
+soon as `Then` returns.
+
 ## Queues
 
 AnyWorker work lives in work-stealing deques, one per worker and one for the

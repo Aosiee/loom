@@ -95,3 +95,15 @@ keep the future where both can reach it (a member, or the frame's state),
 and drop it only after that task's own counter has reached zero. Each
 pending future holds one counter, so thousands in flight at once need a
 larger `LoomConfig::maxCounters`.
+
+A continuation is the exception: `Then` holds its input itself, so a chain
+may be built from temporaries and only its last future kept.
+
+## Set every promise once, while the pool lives
+
+A promise's future is completed only by `SetValue`, `SetException` or the
+promise's destructor (which completes it with `BrokenPromise`). Setting it
+twice terminates; setting or destroying it after `Shutdown` touches a
+counter of a pool that is gone, so finish or drop it first. An IO
+callback that may never fire should still destroy its promise, so whoever
+waits on the future sees the broken promise instead of waiting forever.

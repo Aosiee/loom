@@ -2381,30 +2381,47 @@ bool IsCancelled(CounterHandle h)
 }
 
 // ---- Futures ---------------------------------------------------------------------
-// A future's task signals its counter itself, at the end of its own run, so
-// that it can then drop its reference: whichever of the future and the task
-// lets go last frees the state, and the counter with it. By then the counter
-// is settled (the task's own final Signal returned, or the future's wait
-// did), so it can be destroyed at once.
+// A future's state is shared by reference count: the future, its task or
+// promise, and each continuation reading it hold one. A future's own task
+// signals the counter itself, at the end of its run, so that it can then
+// drop its reference; whoever lets go last destroys the counter and frees
+// the state. DestroyCounter takes the counter's lock, which a final
+// signaller still releasing waiters holds, so the count is settled by then
+// even when the last owner is a continuation released by that signal.
 
 namespace detail {
 
-void StartFuture(FutureStateBase* state, TaskFn run, const TaskDesc& opts)
+void CreateFutureCounter(FutureStateBase* state)
 {
-	assert(opts.fn == nullptr && opts.userData == nullptr && "Async takes the callable; leave fn and userData unset");
-	assert(opts.signals == kInvalidCounter && "a future signals its own counter; leave signals unset");
 	state->counter = CreateCounter(1);
+}
+
+void StartFuture(FutureStateBase* state, TaskFn run, const TaskDesc& opts, CounterHandle after)
+{
+	assert(opts.fn == nullptr && opts.userData == nullptr && "Async and Then take the callable; leave fn and userData unset");
+	assert(opts.signals == kInvalidCounter && "a future signals its own counter; leave signals unset");
+	assert((after == kInvalidCounter || opts.waitsFor == kInvalidCounter) && "Then waits for its future; leave waitsFor unset");
+	CreateFutureCounter(state);
 	TaskDesc desc = opts;
 	desc.fn = run;
 	desc.userData = state;
 	desc.signals = kInvalidCounter;
+	if (after != kInvalidCounter)
+		desc.waitsFor = after;
 	Submit(desc);
+}
+
+void SignalFuture(FutureStateBase* state) noexcept
+{
+	SignalCounter(ActivePool(), state->counter, 1);
 }
 
 void FinishFuture(FutureStateBase* state) noexcept
 {
 	// As a plain task's runner does, the unit goes back before the signal:
-	// once Get returns, the future's task holds none.
+	// once Get returns, the future's task holds none. (A promise set inside a
+	// limited task signals through SignalFuture alone: that unit is the
+	// task's own.)
 	PoolState& P = ActivePool();
 	ReleaseRunningUnit(P, CurrentCtx(P));
 	SignalCounter(P, state->counter, 1);
@@ -2413,7 +2430,7 @@ void FinishFuture(FutureStateBase* state) noexcept
 
 void ReleaseFuture(FutureStateBase* state) noexcept
 {
-	// acq_rel: the last one sees everything the other wrote (the value).
+	// acq_rel: the last one sees everything the others wrote (the value).
 	if (state->refs.fetch_sub(1, std::memory_order_acq_rel) != 1)
 		return;
 	DestroyCounter(state->counter);
