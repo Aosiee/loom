@@ -2194,6 +2194,16 @@ TEST_CASE("loom: limiters — handles are reused safely and the table size is co
 
 namespace {
 	int LiveCounters() { return loom::SnapshotThreadStats().counterCount; }
+	// A future's task drops its hold on the future's state just after the
+	// future's value is ready, so a future dropped right after Get may leave
+	// its counter to that task to free, a moment later.
+	bool CountersReturnTo(int baseline)
+	{
+		const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		while (LiveCounters() != baseline && std::chrono::steady_clock::now() < until)
+			std::this_thread::yield();
+		return LiveCounters() == baseline;
+	}
 }
 
 TEST_CASE("loom: counters — a task released by a counter already sees it at zero")
@@ -2254,7 +2264,7 @@ TEST_CASE("loom: futures — values, void, move-only results and repeated Get, a
 			moved = std::move(squares[4]); // drops the old one
 			CHECK(moved.Get() == 16);
 		}
-		CHECK_MESSAGE(LiveCounters() == baseline, "every future's counter is freed");
+		CHECK_MESSAGE(CountersReturnTo(baseline), "every future's counter is freed");
 	}
 }
 
@@ -2378,7 +2388,7 @@ TEST_CASE("loom: futures — Get rethrows the callable's exception, every time")
 		CHECK(Tracked::live.load() == 1); // the callable's copy is gone once it has run
 	}
 	CHECK(Tracked::live.load() == 0);
-	CHECK(LiveCounters() == baseline);
+	CHECK(CountersReturnTo(baseline));
 }
 #endif
 
