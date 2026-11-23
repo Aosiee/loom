@@ -29,7 +29,7 @@ endif()
 # Sleep on a mutex and condition variable instead of a futex, as non-Linux
 # builds do: lets that path be tested on Linux.
 option(LOOM_NO_FUTEX "Use the portable sleep instead of the Linux futex" OFF)
-option(LOOM_BUILD_TESTS "Build the suite and the benchmark" ${PROJECT_IS_TOP_LEVEL})
+option(LOOM_BUILD_TESTS "Build the suite, the stress test and the benchmark" ${PROJECT_IS_TOP_LEVEL})
 option(LOOM_INSTALL "Install the library, headers and CMake package" ${PROJECT_IS_TOP_LEVEL})
 
 # The library, as `name`. The suite links a second copy built with test
@@ -72,7 +72,11 @@ if(LOOM_BUILD_TESTS)
     target_link_libraries(loom_tests PRIVATE loom_test_hooks)
     add_test(NAME loom_tests COMMAND loom_tests)
 
-    set_tests_properties(loom_tests PROPERTIES ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp")
+    add_executable(loom_stress tests/stress.cpp)
+    target_link_libraries(loom_stress PRIVATE loom)
+    add_test(NAME loom_stress COMMAND loom_stress --seconds 10 --quiet)
+
+    set_tests_properties(loom_tests loom_stress PROPERTIES ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp")
 
     add_executable(loom_bench bench/loom_bench.cpp)
     target_link_libraries(loom_bench PRIVATE loom)

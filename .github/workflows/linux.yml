@@ -1,5 +1,5 @@
-# Builds loom and runs its suite in each configuration it is checked in
-# before a release: GCC and Clang, Debug and Release, the portable sleep
+# Builds loom and runs its suite and a minute of the stress test in each
+# configuration it is checked in before a release: GCC and Clang, Debug and Release, the portable sleep
 # instead of the futex, and the address, undefined-behaviour and thread
 # sanitizers. Two more jobs build loom as an engine embeds it, without
 # exceptions and without the suite, and as a package: installed and found
@@ -55,6 +55,12 @@ jobs:
           TSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/tsan.supp
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: timeout 20m build/loom_tests
+
+      - name: Stress
+        env:
+          TSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/tsan.supp
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: timeout 10m build/loom_stress --seconds 60 --quiet
 
   embedded:
     name: embedded, no exceptions
