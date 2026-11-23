@@ -766,12 +766,33 @@ static bool AcquireUnit(LimiterState& l, uint32_t slot, Priority priority)
 	return false;
 }
 
+// ---- Test hooks --------------------------------------------------------------------
+// With LOOM_TEST_HOOKS (loom's own test build), a test can install a callback
+// that runs at the points below, to hold a thread there and widen a race.
+// Elsewhere the points compile to nothing.
+#if defined(LOOM_TEST_HOOKS)
+namespace detail {
+using TestHookFn = void (*)(int point);
+static std::atomic<TestHookFn> s_TestHook{ nullptr };
+void SetTestHook(TestHookFn fn) { s_TestHook.store(fn, std::memory_order_release); }
+} // namespace detail
+#define LOOM_TEST_POINT(point) \
+	do { if (detail::TestHookFn hook = detail::s_TestHook.load(std::memory_order_relaxed)) hook(point); } while (0)
+#else
+#define LOOM_TEST_POINT(point) do {} while (0)
+#endif
+// A limiter unit has just become free for anyone to take.
+static constexpr int kTestPointUnitFreed = 1;
+
 // Gives a unit back. Returns the waiting task it went to (which must now be
 // queued), or kNoSlot.
 static uint32_t ReleaseUnit(LimiterState& l)
 {
 	if (l.count.fetch_add(1, std::memory_order_acq_rel) >= 0)
+	{
+		LOOM_TEST_POINT(kTestPointUnitFreed);
 		return kNoSlot;
+	}
 	std::lock_guard<std::mutex> lock(l.mutex);
 	const uint32_t retiring = l.retiring.load(std::memory_order_relaxed);
 	if (retiring > 0)

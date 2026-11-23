@@ -43,6 +43,9 @@ if(LOOM_BUILD_TESTS)
     add_executable(loom_tests tests/main.cpp)
     target_include_directories(loom_tests PRIVATE tests tests/third_party)
     target_link_libraries(loom_tests PRIVATE loom)
+    # Test hooks: callbacks at a few points inside loom where a test needs to
+    # widen a race to see it. Only a build of loom's own tests has them.
+    target_compile_definitions(loom PUBLIC LOOM_TEST_HOOKS)
     add_test(NAME loom_tests COMMAND loom_tests)
     set_tests_properties(loom_tests PROPERTIES ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp")
 

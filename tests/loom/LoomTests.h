@@ -29,6 +29,11 @@
 #include <pthread.h>
 #endif
 
+#if defined(LOOM_TEST_HOOKS)
+// Only loom's own test build has these (see LOOM_TEST_POINT in loom.cpp).
+namespace loom::detail { using TestHookFn = void (*)(int point); void SetTestHook(TestHookFn fn); }
+#endif
+
 namespace loom { namespace tests {
 
 namespace {
@@ -2399,6 +2404,70 @@ TEST_CASE("loom: limiters — each running task holds its own unit index")
 		CHECK(loom::LimiterHeld(four) == 0);
 	}
 }
+
+#if defined(LOOM_TEST_HOOKS)
+namespace {
+	// Held at the moment a task's unit becomes free: a second task takes that
+	// unit and asks for its index before the first task's run has ended.
+	struct UnitHandover
+	{
+		static inline std::atomic<bool> armed{ false };
+		static inline std::atomic<uint32_t> secondUnit{ 0 };
+		static inline std::atomic<bool> secondAsked{ false };
+		static inline loom::LimiterHandle limiter = loom::kInvalidLimiter;
+		static inline loom::CounterHandle secondDone = loom::kInvalidCounter;
+
+		static void Hook(int point)
+		{
+			if (point != 1 || !armed.exchange(false))
+				return;
+			loom::Submit([] {
+				secondUnit = loom::LimiterUnit();
+				secondAsked = true;
+			}, loom::TaskDesc{ .signals = secondDone, .limiter = limiter });
+			const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (!secondAsked && std::chrono::steady_clock::now() < until)
+				std::this_thread::yield();
+		}
+	};
+}
+
+TEST_CASE("loom: limiters — a unit's index is free before the unit is")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	// A plain task gives its unit back when it ends; a future's task when its
+	// value is ready, from inside its run.
+	for (bool future : { false, true })
+	{
+		loom::ScopedLimiter one(1);
+		loom::ScopedCounter secondDone(1);
+		UnitHandover::limiter = one.Get();
+		UnitHandover::secondDone = secondDone.Get();
+		UnitHandover::secondAsked = false;
+		std::atomic<uint32_t> firstUnit{ 99 };
+		loom::detail::SetTestHook(&UnitHandover::Hook);
+		UnitHandover::armed = true;
+		if (future)
+		{
+			loom::Future<uint32_t> f = loom::Async([] { return loom::LimiterUnit(); }, loom::TaskDesc{ .limiter = one });
+			firstUnit = f.Get();
+		}
+		else
+		{
+			loom::ScopedCounter firstDone(1);
+			loom::Submit([&] { firstUnit = loom::LimiterUnit(); }, loom::TaskDesc{ .signals = firstDone, .limiter = one });
+			loom::WaitFor(firstDone);
+		}
+		loom::WaitFor(secondDone);
+		loom::detail::SetTestHook(nullptr);
+		while (loom::LiveTaskCount() > 0)
+			std::this_thread::yield();
+		CHECK(UnitHandover::secondAsked.load());
+		CHECK(firstUnit.load() == 0);
+		CHECK(UnitHandover::secondUnit.load() == 0); // the only index below the limit, already back
+	}
+}
+#endif
 
 TEST_CASE("loom: limiters — raising a limit starts waiting tasks, lowering it waits for holders")
 {
