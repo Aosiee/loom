@@ -3457,7 +3457,10 @@ TEST_CASE("loom: debug dump — a stuck wait, the tasks parked on it and who sle
 	const loom::DebugState s = CaptureWhen([&](const loom::DebugState& st) {
 		const loom::DebugCounter* d = FindCounter(st, done.Get());
 		const loom::DebugThread* t = FindRunning(st, 22);
-		return d && !d->waiters.empty() && t && t->waitingOn == gate.Get();
+		const loom::DebugCounter* gc = FindCounter(st, gate.Get());
+		// The thread's record names the counter before it goes to sleep on it.
+		return d && !d->waiters.empty() && t && t->waitingOn == gate.Get() && gc
+			&& std::find(gc->waiters.begin(), gc->waiters.end(), t->index) != gc->waiters.end();
 	});
 	const loom::DebugCounter* g = FindCounter(s, gate.Get());
 	const loom::DebugCounter* d = FindCounter(s, done.Get());
