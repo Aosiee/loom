@@ -1,6 +1,7 @@
 # Changelog
 
-Each release is an annotated tag (`v0.x.0`) whose message is the entry below.
+Each release is an annotated tag (`v0.x.0`, or `v0.x.y` for a release of
+fixes only) whose message is the entry below.
 Versions before 1.0 may change the API; every entry says whether existing
 callers need to change anything.
 
@@ -17,6 +18,24 @@ Only two releases changed behaviour for existing callers. Updating from
 - 0.11.0: `ParallelFor` with `chunkSize` 0 now chunks automatically (it did
   nothing). A task's exception now cancels its counter: that counter's tasks
   that have not started are skipped.
+
+## 0.18.1 (2026-11-23): a pipeline fix, and CI
+
+- A pipeline stage with a limiter could still hold its unit for a moment
+  after `Run` returned, so a caller that destroyed the limiter straight away
+  could have a task give a unit back to a limiter that was gone (a Debug
+  build asserted in `DestroyLimiter`). A stage task now gives its unit back
+  before it hands on its last item, as a future's task does before its
+  signal.
+- GitHub Actions builds and tests every push on Linux with GCC and Clang,
+  in Debug and Release, with the portable sleep instead of the futex, and
+  under the address, undefined-behaviour and thread sanitizers, and builds
+  loom as an engine embeds it, without exceptions. The README shows a badge
+  per platform: Linux tested, Windows and macOS not supported yet.
+- A debug-dump test no longer fails when it captures a wait between naming
+  its counter and going to sleep on it.
+
+No changes for existing callers.
 
 ## 0.18.0 (2026-11-23): counter increments
 
