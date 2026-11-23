@@ -2631,6 +2631,138 @@ TEST_CASE("loom: ParallelSort — matches std::sort on awkward inputs, any pool,
 #endif
 }
 
+TEST_CASE("loom: pipelines — serial stages keep the source's order, at most inFlight items at once")
+{
+	for (int workers : { 0, 1, -1 })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		struct Item { int index = -1; int64_t value = 0; };
+		for (uint32_t inFlight : { 1u, 4u, 16u })
+		{
+			constexpr int kItems = 600;
+			int produced = 0;
+			std::vector<int64_t> collected;
+			std::atomic<int> inParallel{ 0 }, maxParallel{ 0 }, serialBusy{ 0 }, errors{ 0 }, live{ 0 }, maxLive{ 0 };
+			std::set<const Item*> seenItems;
+			std::mutex seenMutex;
+			auto noteMax = [](std::atomic<int>& m, int v) { int s = m.load(); while (v > s && !m.compare_exchange_weak(s, v)) {} };
+			loom::Pipeline<Item> p(inFlight);
+			p.Source([&](Item& it) {
+				if (produced == kItems)
+					return false;
+				noteMax(maxLive, ++live);
+				it.index = produced++;
+				{
+					std::lock_guard<std::mutex> lock(seenMutex);
+					seenItems.insert(&it);
+				}
+				return true;
+			})
+			.Parallel([&](Item& it) {
+				noteMax(maxParallel, ++inParallel);
+				if (it.index % 7 == 0)
+					SpinFor(std::chrono::microseconds(30)); // overtake each other
+				it.value = (int64_t)it.index * it.index;
+				inParallel--;
+			})
+			.Serial([&](Item& it) {
+				if (serialBusy.exchange(1) != 0)
+					errors++;
+				if (it.value != (int64_t)it.index * it.index)
+					errors++;
+				collected.push_back(it.value); // serial: no lock needed
+				serialBusy = 0;
+				live--;
+			});
+			p.Run();
+			REQUIRE(collected.size() == (size_t)kItems);
+			bool inOrder = true;
+			for (int i = 0; i < kItems; i++)
+				inOrder = inOrder && collected[(size_t)i] == (int64_t)i * i;
+			CHECK(inOrder);
+			CHECK(errors.load() == 0);
+			CHECK(maxLive.load() <= (int)inFlight);
+			CHECK(maxParallel.load() <= (int)inFlight);
+			CHECK(seenItems.size() <= inFlight); // the items are reused
+		}
+	}
+}
+
+TEST_CASE("loom: pipelines — stage TaskDescs, a run inside a task, running again, errors")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 4 });
+	struct Item { int index = 0; };
+	{
+		// A main-thread last stage and a limited middle one.
+		loom::ScopedLimiter two(2);
+		std::atomic<int> limited{ 0 }, maxLimited{ 0 }, offMain{ 0 };
+		int produced = 0, uploaded = 0;
+		loom::Pipeline<Item> p(8);
+		p.Source([&](Item& it) { it.index = produced; return produced++ < 200; })
+		 .Parallel([&](Item&) {
+			 const int now = ++limited;
+			 int seen = maxLimited.load();
+			 while (now > seen && !maxLimited.compare_exchange_weak(seen, now)) {}
+			 SpinFor(std::chrono::microseconds(20));
+			 limited--;
+		 }, loom::TaskDesc{ .limiter = two })
+		 .Serial([&](Item&) {
+			 if (loom::CurrentThreadIndex() != 0)
+				 offMain++;
+			 uploaded++;
+		 }, loom::TaskDesc{ .affinity = loom::Affinity::MainThread });
+		p.Run();
+		CHECK(uploaded == 200);
+		CHECK(offMain.load() == 0);
+		CHECK(maxLimited.load() <= 2);
+
+		// The same pipeline again: the stages and items stay.
+		produced = 0;
+		uploaded = 0;
+		p.Run();
+		CHECK(uploaded == 200);
+	}
+	{
+		// Run from inside a task: its wait helps.
+		std::atomic<int> sum{ 0 };
+		loom::ScopedCounter done(1);
+		loom::Submit([&] {
+			int n = 0;
+			loom::Pipeline<Item> p(3);
+			p.Source([&](Item& it) { it.index = n; return n++ < 100; })
+			 .Parallel([&](Item& it) { sum += it.index; });
+			p.Run();
+		}, loom::TaskDesc{ .signals = done });
+		loom::WaitFor(done);
+		CHECK(sum.load() == 99 * 100 / 2);
+	}
+	{
+		// A source alone, and an empty stream.
+		int n = 0;
+		loom::Pipeline<Item> sourceOnly(2);
+		sourceOnly.Source([&](Item&) { return ++n < 10; });
+		sourceOnly.Run();
+		CHECK(n == 10);
+		int stages = 0;
+		loom::Pipeline<Item> empty(2);
+		empty.Source([](Item&) { return false; }).Serial([&](Item&) { stages++; });
+		empty.Run();
+		CHECK(stages == 0);
+	}
+#if defined(__cpp_exceptions)
+	{
+		std::atomic<int> produced{ 0 }, reachedEnd{ 0 };
+		loom::Pipeline<Item> p(4);
+		p.Source([&](Item& it) { it.index = produced++; return it.index < 100000; })
+		 .Parallel([](Item& it) { if (it.index == 50) throw std::runtime_error("decode failed"); })
+		 .Serial([&](Item& it) { if (it.index > 50) reachedEnd++; });
+		CHECK_THROWS_AS(p.Run(), std::runtime_error);
+		CHECK(produced.load() < 1000); // the source stopped
+		CHECK(reachedEnd.load() <= 4); // at most the items already past the failing stage
+	}
+#endif
+}
+
 TEST_CASE("loom: futures — values, void, move-only results and repeated Get, any pool")
 {
 	for (int workers : { 0, 1, -1 })

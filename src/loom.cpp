@@ -3700,6 +3700,253 @@ std::vector<ParkedThread> ParkedThreads()
 	return P.parked;
 }
 
+// ---- Pipelines --------------------------------------------------------------------
+// One run's state lives on Run's stack. Every task of the run holds an item
+// that has not left the pipeline yet, and touches the run only while it
+// does; the task that brings the last item home signals `done` as its very
+// last step, so Run can return and free the state. The source keeps filling
+// items in one task while free ones are left, and a serial stage keeps
+// taking the next item in order when it is already waiting, so a busy
+// pipeline does not pay a task per item for them.
+
+namespace detail {
+
+namespace {
+
+struct PipelineSerial
+{
+	std::mutex mutex;
+	uint64_t   next = 0;  // the place of the item it takes next
+	bool       busy = false;
+	// Items that came early, at their place modulo the item count: the places
+	// waiting are always within one item count of `next`.
+	std::vector<uint32_t> waiting;
+};
+
+struct PipelineRun
+{
+	const PipelineStage* stages = nullptr;
+	size_t               stageCount = 0;
+	void* const*         items = nullptr;
+	CounterHandle        done = kInvalidCounter;
+	std::unique_ptr<PipelineSerial[]> serial; // by stage
+	std::vector<uint64_t> order;              // each item's place in the stream (written by the source before it passes the item on)
+
+	std::mutex            mutex;             // the source and the free items
+	std::vector<uint32_t> freeItems;
+	size_t                inFlight = 0;      // items out of freeItems (the source's included)
+	uint64_t              nextOrder = 0;
+	bool                  sourceBusy = false;
+	bool                  ended = false;     // the source returned false, or a stage threw
+	bool                  signalled = false;
+	std::atomic<bool>     failed{ false };
+#if defined(__cpp_exceptions)
+	std::exception_ptr    error;             // under mutex
+#endif
+};
+
+void PipelineAdvance(PipelineRun& run, uint32_t item, size_t stage);
+
+// Under the lock: the item the source may fill next, or kNoSlot.
+uint32_t TakeSourceItem(PipelineRun& run)
+{
+	if (run.ended || run.freeItems.empty())
+		return kNoSlot;
+	const uint32_t item = run.freeItems.back();
+	run.freeItems.pop_back();
+	run.inFlight++;
+	return item;
+}
+
+// Under the lock: whether this was the run's end (the caller then signals,
+// last of all).
+bool FinishedLocked(PipelineRun& run)
+{
+	if (!run.ended || run.inFlight != 0 || run.signalled)
+		return false;
+	run.signalled = true;
+	return true;
+}
+
+// Calls a stage's function, catching what it throws into the run. The
+// source's false (or a throw) ends the stream.
+bool CallStage(PipelineRun& run, size_t stage, uint32_t item)
+{
+	const PipelineStage& s = run.stages[stage];
+#if defined(__cpp_exceptions)
+	try
+	{
+		return s.run(s.stage, run.items[item]);
+	}
+	catch (...)
+	{
+		std::lock_guard<std::mutex> lock(run.mutex);
+		if (!run.failed.load(std::memory_order_relaxed))
+			run.error = std::current_exception();
+		run.failed.store(true, std::memory_order_relaxed);
+		run.ended = true;
+		return false;
+	}
+#else
+	return s.run(s.stage, run.items[item]);
+#endif
+}
+
+void SubmitStage(PipelineRun& run, uint32_t item, size_t stage);
+
+void RunSource(PipelineRun& run, uint32_t item)
+{
+	for (;;)
+	{
+		const bool more = !run.failed.load(std::memory_order_relaxed) && CallStage(run, 0, item);
+		uint32_t next = kNoSlot;
+		bool finished = false;
+		const CounterHandle done = run.done;
+		{
+			std::lock_guard<std::mutex> lock(run.mutex);
+			if (more)
+			{
+				run.order[item] = run.nextOrder++;
+				next = TakeSourceItem(run); // keep going while items are free
+			}
+			else
+			{
+				run.ended = true;
+				run.freeItems.push_back(item);
+				run.inFlight--;
+				finished = FinishedLocked(run);
+			}
+			if (next == kNoSlot)
+				run.sourceBusy = false;
+		}
+		if (!more)
+		{
+			if (finished)
+				Signal(done); // the run may be gone after this
+			return;
+		}
+		PipelineAdvance(run, item, 1); // with no `next` held, the run may be gone after this
+		if (next == kNoSlot)
+			return;
+		item = next;
+	}
+}
+
+void RunStage(PipelineRun& run, uint32_t item, size_t stage)
+{
+	const bool serial = run.stages[stage].serial;
+	for (;;)
+	{
+		if (!run.failed.load(std::memory_order_relaxed))
+			(void)CallStage(run, stage, item);
+		uint32_t next = kNoSlot;
+		if (serial)
+		{
+			// Take the next item in order straight away if it is waiting.
+			PipelineSerial& st = run.serial[stage];
+			std::lock_guard<std::mutex> lock(st.mutex);
+			st.next++;
+			uint32_t& slot = st.waiting[st.next % st.waiting.size()];
+			if (slot != kNoSlot)
+			{
+				next = slot;
+				slot = kNoSlot;
+			}
+			else
+				st.busy = false;
+		}
+		PipelineAdvance(run, item, stage + 1); // with no `next` held, the run may be gone after this
+		if (next == kNoSlot)
+			return;
+		item = next;
+	}
+}
+
+void SubmitStage(PipelineRun& run, uint32_t item, size_t stage)
+{
+	PipelineRun* r = &run;
+	const TaskDesc& desc = run.stages[stage].opts;
+	if (stage == 0)
+		Submit([r, item] { RunSource(*r, item); }, desc);
+	else
+		Submit([r, item, stage] { RunStage(*r, item, stage); }, desc);
+}
+
+void PipelineAdvance(PipelineRun& run, uint32_t item, size_t stage)
+{
+	if (stage == run.stageCount)
+	{
+		// Home: the item goes back to the source, which starts again if idle.
+		uint32_t source = kNoSlot;
+		bool finished = false;
+		const CounterHandle done = run.done;
+		{
+			std::lock_guard<std::mutex> lock(run.mutex);
+			run.freeItems.push_back(item);
+			run.inFlight--;
+			if (!run.sourceBusy)
+			{
+				source = TakeSourceItem(run);
+				run.sourceBusy = source != kNoSlot;
+			}
+			finished = FinishedLocked(run);
+		}
+		if (source != kNoSlot)
+			SubmitStage(run, source, 0);
+		if (finished)
+			Signal(done); // the run may be gone after this
+		return;
+	}
+	if (run.stages[stage].serial)
+	{
+		PipelineSerial& st = run.serial[stage];
+		std::lock_guard<std::mutex> lock(st.mutex);
+		if (st.busy || run.order[item] != st.next)
+		{
+			st.waiting[run.order[item] % st.waiting.size()] = item;
+			return;
+		}
+		st.busy = true;
+	}
+	SubmitStage(run, item, stage);
+}
+
+} // namespace
+
+void RunPipeline(const PipelineStage* stages, size_t stageCount, void* const* items, size_t itemCount)
+{
+	assert(stageCount >= 1 && itemCount >= 1);
+	for (size_t i = 0; i < stageCount; i++)
+		assert(stages[i].opts.fn == nullptr && stages[i].opts.signals == kInvalidCounter && stages[i].opts.waitsFor == kInvalidCounter
+			&& stages[i].opts.waitsForAll.empty() && "a pipeline stage's TaskDesc gives no fn, signals or waits");
+	PipelineRun run;
+	run.stages = stages;
+	run.stageCount = stageCount;
+	run.items = items;
+	run.order.assign(itemCount, 0);
+	run.serial.reset(new PipelineSerial[stageCount]);
+	for (size_t i = 0; i < stageCount; i++)
+		run.serial[i].waiting.assign(itemCount, kNoSlot);
+	for (uint32_t i = (uint32_t)itemCount; i-- > 0;)
+		run.freeItems.push_back(i);
+	ScopedCounter done(1);
+	run.done = done.Get();
+	uint32_t first;
+	{
+		std::lock_guard<std::mutex> lock(run.mutex);
+		first = TakeSourceItem(run);
+		run.sourceBusy = true;
+	}
+	SubmitStage(run, first, 0);
+	WaitFor(done);
+#if defined(__cpp_exceptions)
+	if (run.error)
+		std::rethrow_exception(run.error);
+#endif
+}
+
+} // namespace detail
+
 // ---- Debug dump ---------------------------------------------------------------
 // Meant for a pool that may be stuck, so it never waits long for a lock: a
 // thread stuck while holding one must not take the dump down with it.

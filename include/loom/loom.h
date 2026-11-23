@@ -1123,6 +1123,126 @@ void ParallelSort(It first, It last, Comp comp = {})
 	detail::SortPieces(first, bounds, 1, comp, depth, leaf);
 }
 
+// ---- Pipelines -------------------------------------------------------------------
+// A stream of items through a fixed series of stages, with at most
+// `inFlight` items in the pipeline at once: read, then decompress, then
+// upload, with the reading of item 5 overlapping the decompressing of item 4
+// and the upload of item 3.
+//
+//   struct Chunk { std::vector<char> raw; Mesh mesh; };
+//   loom::Pipeline<Chunk> p(8);
+//   p.Source([&](Chunk& c) { return file.ReadNext(c.raw); })      // false: no more
+//    .Parallel([](Chunk& c) { c.mesh = Decode(c.raw); })
+//    .Serial([&](Chunk& c) { Upload(c.mesh); }, loom::TaskDesc{ .affinity = loom::Affinity::MainThread });
+//   p.Run();
+//
+// The source fills one item at a time and gives them their order. A Serial
+// stage takes one item at a time, in that order; a Parallel stage takes as
+// many as are ready. Each stage step is a task with that stage's TaskDesc
+// (affinity, priority, limiter, name; not signals or waits). The pipeline
+// owns `inFlight` items and reuses them: an item comes back to the source as
+// it was when it left the last stage.
+//
+// Run blocks, helping, until the source has returned false and every item
+// has left the last stage. If a stage throws, the source stops, the items in
+// flight skip their remaining stages, and Run rethrows the first exception.
+// Run may be called again; the stages and items stay. A MainThread stage
+// needs the main thread to wait or pump while the pipeline runs.
+namespace detail {
+struct PipelineStage
+{
+	bool  serial = false;
+	bool (*run)(void* stage, void* item) = nullptr; // the source's false ends the stream
+	void* stage = nullptr;
+	TaskDesc opts;
+};
+void RunPipeline(const PipelineStage* stages, size_t stageCount, void* const* items, size_t itemCount);
+} // namespace detail
+
+template <typename T>
+class Pipeline
+{
+public:
+	explicit Pipeline(uint32_t inFlight) requires std::is_default_constructible_v<T>
+		: m_Items(std::max<uint32_t>(1, inFlight))
+	{
+	}
+	Pipeline(const Pipeline&) = delete;
+	Pipeline& operator=(const Pipeline&) = delete;
+
+	// The first stage: fn(item) fills it and returns true, or returns false
+	// when there are no more items.
+	template <typename F> requires std::is_invocable_r_v<bool, std::decay_t<F>&, T&>
+	Pipeline& Source(F&& fn, const TaskDesc& opts = {})
+	{
+		if (!m_Stages.empty())
+			std::terminate(); // the source is the first stage, and there is one
+		return Add<true>(std::forward<F>(fn), true, opts);
+	}
+	template <typename F> requires std::is_invocable_v<std::decay_t<F>&, T&>
+	Pipeline& Serial(F&& fn, const TaskDesc& opts = {})
+	{
+		return Add<false>(std::forward<F>(fn), true, opts);
+	}
+	template <typename F> requires std::is_invocable_v<std::decay_t<F>&, T&>
+	Pipeline& Parallel(F&& fn, const TaskDesc& opts = {})
+	{
+		return Add<false>(std::forward<F>(fn), false, opts);
+	}
+
+	void Run()
+	{
+		if (m_Stages.empty())
+			std::terminate(); // a pipeline needs a source
+		std::vector<void*> items(m_Items.size());
+		for (size_t i = 0; i < m_Items.size(); i++)
+			items[i] = &m_Items[i];
+		detail::RunPipeline(m_Descs.data(), m_Descs.size(), items.data(), items.size());
+	}
+
+private:
+	struct StageBase
+	{
+		virtual ~StageBase() = default;
+		virtual bool Run(T& item) = 0;
+	};
+	template <typename G, bool IsSource>
+	struct Stage final : StageBase
+	{
+		explicit Stage(G&& g) : fn(std::move(g)) {}
+		explicit Stage(const G& g) : fn(g) {}
+		bool Run(T& item) override
+		{
+			if constexpr (IsSource)
+				return static_cast<bool>(fn(item));
+			else
+			{
+				fn(item);
+				return true;
+			}
+		}
+		G fn;
+	};
+
+	template <bool IsSource, typename F>
+	Pipeline& Add(F&& fn, bool serial, const TaskDesc& opts)
+	{
+		using G = std::decay_t<F>;
+		m_Stages.push_back(std::make_unique<Stage<G, IsSource>>(std::forward<F>(fn)));
+		detail::PipelineStage desc;
+		desc.serial = serial;
+		desc.run = [](void* stage, void* item) { return static_cast<StageBase*>(stage)->Run(*static_cast<T*>(item)); };
+		desc.stage = m_Stages.back().get();
+		desc.opts = opts;
+		m_Descs.push_back(desc);
+		return *this;
+	}
+
+	std::vector<T> m_Items;
+	std::vector<std::unique_ptr<StageBase>> m_Stages;
+	std::vector<detail::PipelineStage> m_Descs;
+};
+
 // ---- Task graphs ------------------------------------------------------------
 // A DAG of tasks built once and run many times: the frame's systems (input,
 // then physics and animation, then culling, then the render submit on the

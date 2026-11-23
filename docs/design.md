@@ -372,6 +372,25 @@ count reaches zero and the sort rethrows. Leaf size, buckets and splits
 depend on the data and the length only, so the order of equal keys is the
 same whatever the pool.
 
+### Pipelines
+
+A pipeline run keeps its state on `Run`'s stack: the free items, each
+item's place in the stream, and for each serial stage the place it takes
+next and the items that came early, in a ring indexed by place (at most
+the item count of places can be waiting, so it never collides). Every task
+of a run holds an item that is still in the pipeline and touches the run
+only while it does. The task that brings the last item home after the
+source has ended signals the run's counter as its last step.
+
+The source fills items in one task for as long as free ones are left; an
+item coming home restarts it if it stopped. A serial stage likewise takes
+the next item in place order straight away when it is already waiting, and
+otherwise lets the item that arrives in its turn start it as a new task.
+So a busy pipeline pays a task per parallel step, and the serial steps
+mostly run in a row on one thread. If a stage throws, the source stops and
+every item in flight passes the remaining stages without running them, so
+all of them come home and the counter still reaches zero.
+
 ### Per-thread storage
 
 `PerThread<T>` is two levels of cells indexed by `CurrentThreadIndex`, a
