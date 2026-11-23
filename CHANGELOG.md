@@ -7,8 +7,8 @@ callers need to change anything.
 
 ## Updating from an older version
 
-Only two releases changed behaviour for existing callers. Updating from
-0.9.0 to any later version, check these:
+Three releases changed things for existing callers. Updating from 0.9.0 to
+any later version, check these:
 
 - 0.10.0: `Shutdown` drains every live task first, and may block for up to
   `LoomConfig::shutdownTimeoutMs`. `DedicatedId`s are handed out once per pool
@@ -18,6 +18,52 @@ Only two releases changed behaviour for existing callers. Updating from
 - 0.11.0: `ParallelFor` with `chunkSize` 0 now chunks automatically (it did
   nothing). A task's exception now cancels its counter: that counter's tasks
   that have not started are skipped.
+- 0.19.0: names changed across the API, all at once (the full list is in
+  its entry below; the compiler finds every use). Handles are their own
+  types: code that stores one as an integer needs a cast
+  (`static_cast<uint32_t>(h)`, `CounterHandle{ v }`), and a positional
+  `TaskDesc{ ... }` that gives 0 for `thread` gives `{}`. A Dedicated task
+  with no `thread` now asserts instead of going to the first dedicated
+  thread.
+
+## 0.19.0 (2026-11-23): consistent names, and handles as types
+
+Every rename is in this one release, with no old names kept alongside, so
+a caller updates once.
+
+- `CounterHandle`, `LimiterHandle` and `DedicatedId` are each an enum class
+  over 32 bits, so passing one where another belongs, or a plain integer,
+  no longer compiles. `LaneId` is a `DedicatedId`. `TaskDesc::thread`
+  defaults to `kInvalidDedicated`, so a Dedicated task with no thread
+  asserts instead of going to the first dedicated thread.
+- "Park" now means only what `ParkAll` does to threads: the debug dump
+  calls the tasks held back by a counter "waiting", as it already did for a
+  limiter's, and the threads asleep on it "sleepers".
+- Yes-or-no queries all start with `Is` or `Has`, and the limiter queries,
+  which no longer need the type in their names, drop it.
+
+Changes for existing callers (old name, then new):
+
+- Pool: `LoomConfig` is `PoolConfig`; `IsInitialised()` is
+  `HasActivePool()`; `SnapshotThreadStats()` is `SnapshotPool()`;
+  `PoolSnapshot::anyQueueDepth` is `queueDepth`; `ThreadStats::helpedRun`
+  and `ThreadStatsView::helpedRun` are `tasksHelped`.
+- Counters: `Load(counter)` is `Count(counter)`.
+- Limiters: `LimiterHeld` is `HeldUnits`, `LimiterWaiting` is
+  `WaitingTasks`, `SetLimiterLimit` is `SetLimit`, `LimiterLimit` is
+  `Limit`, and `LimiterUnit()` is `CurrentLimiterUnit()`.
+- Futures and graphs: `Future::Valid()` and `Ready()` are `IsValid()` and
+  `IsReady()`; `TaskGraph::Running()` is `IsRunning()`.
+- Parking: `ParkRequested()` is `IsParkRequested()`.
+- Tasks: `TaskDesc::window` is `profilerTag`, as is the matching
+  `ProfilerZoneFn` parameter.
+- Debug dump: `DebugCounter::parked`, `parkedTotal` and `waiters` are
+  `waiting`, `waitingTotal` and `sleepers` (and the text says "N waiting");
+  `DebugThread::running` and `runningName` are `runningDepth` and
+  `runningNameId`; `DebugState::queued`, `queuedHigh`, `queuedLow` and
+  `mainQueued` are `queueDepth`, `highQueueDepth`, `lowQueueDepth` and
+  `mainQueueDepth`.
+- Handles: see the first point above.
 
 ## 0.18.1 (2026-11-23): a pipeline fix, and CI
 
