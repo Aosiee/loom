@@ -1,5 +1,9 @@
 # loom
 
+[![Linux](https://github.com/Aosiee/loom/actions/workflows/linux.yml/badge.svg?branch=main)](https://github.com/Aosiee/loom/actions/workflows/linux.yml)
+[![Windows: not supported](https://img.shields.io/badge/Windows-not%20supported-lightgrey)](#building)
+[![macOS: not supported](https://img.shields.io/badge/macOS-not%20supported-lightgrey)](#building)
+
 A task and threading library for C++20: one pool of worker threads,
 dedicated threads and lanes, atomic counters as the only synchronisation
 primitive, and **help-while-waiting**, so a thread that waits on work runs
@@ -200,9 +204,11 @@ sanitizer; under TSAN run the suite with
 with `add_subdirectory` (tests off by default there) or compiles
 `src/loom.cpp` with `include/` on its include path.
 
-Linux is supported and tested. Other platforms are not yet: the thread
-naming, the OS thread id and the stack walk used by parking are Linux and
-POSIX calls today.
+Linux is supported, and every push is built and tested there with GCC and
+Clang, in Debug and Release and under each sanitizer (the Linux badge
+above). Windows and macOS are not supported yet: the thread naming, the OS
+thread id and the stack walk used by parking are Linux and POSIX calls
+today.
 
 ## Licence
 

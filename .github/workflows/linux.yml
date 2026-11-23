@@ -3,7 +3,7 @@
 # instead of the futex, and the address, undefined-behaviour and thread
 # sanitizers. A last job builds loom as an engine embeds it, without
 # exceptions and without the suite.
-name: CI
+name: Linux
 
 on:
   push:
@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: linux-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

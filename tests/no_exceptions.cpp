@@ -2,7 +2,7 @@
 // header and library compile that way and that the parts with exception
 // handling inside them (futures, promises, continuations, sort, pipelines)
 // still run. Returns non-zero, naming the check, if one fails. CI builds it
-// in its embedded job (.github/workflows/ci.yml), which shows the commands.
+// in its embedded job (.github/workflows/linux.yml), which shows the commands.
 #include "loom/loom.h"
 
 #include <algorithm>
