@@ -26,6 +26,33 @@ any later version, check these:
   with no `thread` now asserts instead of going to the first dedicated
   thread.
 
+## 0.20.0 (2026-11-23): coroutines, an installable package, and a stress test
+
+- Coroutines: a coroutine can return a `Future<T>`, and `co_await` a
+  future (`co_await f`, or `co_await After(f, opts)`), a counter
+  (`After(counter)`) or several (`After({ a, b })`) without holding a
+  thread while it waits: a task resumes it once they are ready.
+  `co_await ResumeOn(opts)` moves the rest of a coroutine onto a task with
+  those options, to the main thread, a dedicated thread, a priority or a
+  limiter. Errors reach the coroutine at its `co_await`, and its future if
+  it does not catch them. `LOOM_COROUTINES` says whether the compiler
+  supports them. docs/rules.md has what not to hold across a `co_await`.
+- `loom/loom_version.h` (included by `loom/loom.h`) defines
+  `LOOM_VERSION_MAJOR`, `_MINOR`, `_PATCH`, `LOOM_VERSION_STRING`, and
+  `LOOM_VERSION` with `LOOM_MAKE_VERSION` to compare it against.
+- `cmake --install` installs the library, headers and a CMake package:
+  `find_package(loom 0.20)` and the `loom::loom` target, which
+  `add_subdirectory` users get too. The package accepts only its own minor
+  version, since a minor release before 1.0 may change the API.
+- The library a host links, installs or benchmarks never has the test
+  hooks: the suite now links its own copy that does.
+- `loom_stress` runs random mixes of every feature on random pools for as
+  long as asked, checking what each promises, and names the seed of a
+  failing round so it can be run again. CI runs it for a minute in every
+  configuration.
+
+No changes for existing callers.
+
 ## 0.19.0 (2026-11-23): consistent names, and handles as types
 
 Every rename is in this one release, with no old names kept alongside, so
