@@ -28,6 +28,92 @@ loom::ParallelFor(0, meshes.size(), 64, [&](size_t begin, size_t end) {
 });
 ```
 
+## More examples
+
+A frame's systems declared once as a graph, then run every frame:
+
+```cpp
+loom::TaskGraph frame;
+auto input   = frame.Add([&] { PollInput(); });
+auto physics = frame.Add([&] { StepPhysics(); });
+auto anim    = frame.Add([&] { Animate(); });
+auto submit  = frame.Add([&] { SubmitDraws(); }, { .affinity = loom::Affinity::MainThread });
+frame.Precede(input, physics);
+frame.Precede(input, anim);
+frame.Precede(physics, submit);
+frame.Precede(anim, submit);
+loom::Run(frame);                         // each frame
+```
+
+A value from a task, a continuation on it, and a value from outside loom:
+
+```cpp
+loom::Future<Mesh> mesh = loom::Async([&] { return LoadMesh(path); });
+loom::Future<size_t> bytes = mesh.Then([](Mesh& m) { return Upload(m); });
+
+loom::Promise<Texture> texture;
+loom::Future<Texture> ready = texture.GetFuture();
+io.ReadAsync(file, [p = std::move(texture)](Texture t) mutable { p.SetValue(std::move(t)); });
+```
+
+Background work on at most four workers, each with a staging buffer of its own:
+
+```cpp
+loom::ScopedLimiter decoders(4);
+std::vector<StagingBuffer> staging(4);
+loom::ScopedCounter decoded((int)assets.size());
+for (Asset& a : assets)
+    loom::Submit([&] { Decode(a, staging[loom::LimiterUnit()]); },
+                 { .signals = decoded, .priority = loom::Priority::Low, .limiter = decoders });
+loom::WaitFor(decoded);
+```
+
+Work that finds more work as it goes, on one counter and one wait:
+
+```cpp
+void Visit(Node* node, loom::CounterHandle done)
+{
+    if (!Visible(node))
+        return;
+    for (Node* child : node->children)
+    {
+        loom::AddToCounter(done);         // before the child's task can signal
+        loom::Submit([=] { Visit(child, done); }, { .signals = done });
+    }
+}
+loom::ScopedCounter done(1);
+loom::Submit([&] { Visit(root, done); }, { .signals = done });
+loom::WaitFor(done);
+```
+
+Per-thread results, sorting and prefix sums:
+
+```cpp
+loom::PerThread<std::vector<Hit>> hits;
+loom::ParallelFor(0, rays.size(), [&](size_t b, size_t e) {
+    for (size_t i = b; i < e; i++)
+        Trace(rays[i], hits.Local());
+});
+hits.ForEach([&](std::vector<Hit>& h) { all.insert(all.end(), h.begin(), h.end()); });
+
+loom::ParallelSort(keys.begin(), keys.end());
+loom::ParallelExclusiveScan(counts.begin(), counts.end(), offsets.begin(), size_t(0));
+```
+
+A stream of items through stages, uploads in order on the main thread:
+
+```cpp
+struct Chunk { std::vector<char> raw; Mesh mesh; };
+loom::Pipeline<Chunk> stream(8);          // at most 8 chunks in flight
+stream.Source([&](Chunk& c) { return file.ReadNext(c.raw); })
+      .Parallel([](Chunk& c) { c.mesh = Decode(c.raw); })
+      .Serial([&](Chunk& c) { Upload(c.mesh); }, { .affinity = loom::Affinity::MainThread });
+stream.Run();
+```
+
+When a wait does not return, `loom::DebugDump()` says what every thread,
+counter and limiter is doing.
+
 ## The model
 
 - **Pool tasks** (`Affinity::AnyWorker`) run on any worker, or on a waiting
@@ -88,7 +174,9 @@ loom::ParallelFor(0, meshes.size(), 64, [&](size_t begin, size_t end) {
 The rules that keep this safe (no helping while holding a lock, no blocking
 IO on workers, no ambient thread-local assumptions) are in
 [`docs/rules.md`](docs/rules.md); the internals in
-[`docs/design.md`](docs/design.md).
+[`docs/design.md`](docs/design.md). [`CHANGELOG.md`](CHANGELOG.md) lists
+what each release added and what, if anything, an existing caller must
+change.
 
 ## Process state
 

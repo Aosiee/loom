@@ -1,0 +1,202 @@
+# Changelog
+
+Each release is an annotated tag (`v0.x.0`) whose message is the entry below.
+Versions before 1.0 may change the API; every entry says whether existing
+callers need to change anything.
+
+## Updating from an older version
+
+Only two releases changed behaviour for existing callers. Updating from
+0.9.0 to any later version, check these:
+
+- 0.10.0: `Shutdown` drains every live task first, and may block for up to
+  `LoomConfig::shutdownTimeoutMs`. `DedicatedId`s are handed out once per pool
+  and are no longer small, dense indices. `ThreadStats::tasksRun` includes
+  tasks run while helping. `LiveTaskCount` and `Load` can lag briefly behind
+  finished tasks.
+- 0.11.0: `ParallelFor` with `chunkSize` 0 now chunks automatically (it did
+  nothing). A task's exception now cancels its counter: that counter's tasks
+  that have not started are skipped.
+
+## 0.18.0 (2026-11-23): counter increments
+
+- `AddToCounter(counter, n)` raises a count that has not reached zero yet, so
+  work that finds more work as it runs (a tree walk, culling a
+  bounding-volume hierarchy) adds 1 for each task it submits and the whole
+  tree runs on one counter and one wait, with no task waiting for its
+  children. It returns false, changing nothing, once the count has reached
+  zero; a running task of that counter always succeeds.
+- The README has examples of everything added since 0.9.0 (each checked to
+  compile and run against this release), and this changelog collects the
+  release notes.
+- loom's own test build has hooks to hold a thread at a point inside loom;
+  a test uses one to check that a limiter unit's index is free before the
+  unit is. Builds that embed loom do not have them.
+
+No changes for existing callers.
+
+## 0.17.0 (2026-11-23): parallel algorithms, pipelines, per-thread storage, limiter units
+
+- LimiterUnit() gives a running limited task a stable index in [0, limit),
+  unique among that limiter's running tasks, to pick a scratch or staging
+  buffer without a lock. SetLimiterLimit changes a limit while tasks run;
+  lowering it never stops a task. LimiterLimit reads it back.
+- PerThread<T>: one T per thread, made on first use on its own cache lines,
+  merged with ForEach after the work's wait.
+- ParallelInclusiveScan / ParallelExclusiveScan: the arguments of the
+  std scans with an initial value, in place allowed, the same bits whatever
+  the pool. Faster than std on cache-sized arrays; bandwidth bound beyond.
+- ParallelSort: a drop-in for std::sort, sample sort into a three-way
+  parallel quicksort, the same order whatever the pool; ~12.6x std::sort
+  on 4M keys with 31 workers. A throwing comparator is rethrown, leaving
+  the range valid in no particular order, as std::sort does.
+- Pipeline<T>(inFlight): a source, serial stages in source order and
+  parallel stages, each with its own TaskDesc (a main-thread upload stage,
+  a limited decode stage); a few hundred ns per item.
+
+No changes for existing callers.
+
+## 0.16.0 (2026-11-22): debug dump
+
+- DebugDump(nameOf) prints what every pool thread and the main thread is
+  running and waiting on (and for how long), every live counter with its
+  count, the tasks parked on it and the threads asleep on it, and every
+  limiter with its held units and waiting tasks. nameOf maps a task's
+  nameId to a name, such as the profiler's name table.
+- CaptureDebugState returns the same as plain structs (for an editor
+  view); FormatDebugState prints one.
+- Hints for the common reasons a wait never returns: nothing running or
+  queued, main-thread work nobody pumps, and a limited task waiting on
+  work of its own limiter.
+- Safe to call from any thread on a stuck pool: each lock is tried for
+  about 2 ms and marked busy rather than waited on.
+- A few relaxed stores per task and one clock read per wait; no change in
+  loom_bench's submit cost.
+
+No changes for existing callers.
+
+## 0.15.0 (2026-11-22): futures, promises and continuations
+
+- Async(fn, opts) runs fn as a task and returns a Future<T>. Get() waits
+  (helping, by default) and returns the value, or rethrows what fn threw,
+  every time it is called. Ready, Wait and TryWait check or wait without
+  reading. Works for void and move-only results.
+- A future is also a counter: a task can wait for Counter() through
+  waitsFor or waitsForAll and then read Get() without blocking. A future
+  can be dropped before its task runs; the task still runs and frees it.
+- Promise<T> makes a future for a value produced outside loom, such as an
+  IO callback. SetValue or SetException completes it from any thread; a
+  promise destroyed unset completes it with BrokenPromise.
+- future.Then(fn) runs fn on the value as a task once it is ready and
+  returns the future of its result. A chain may be built from
+  temporaries; a failure skips the rest of the chain and reaches its end.
+- The TaskDesc passes affinity, priority, limiter and waits on to a
+  future's task. Futures ignore Cancel. A limited future gives its unit
+  back before its value is ready.
+- About 2x a plain task per result (~130-155 ns), and ~1.7-1.95x a
+  hand-written counter per step for Then chains (~190-260 ns per step).
+- Fix: a task released by a counter now always reads that counter as
+  zero; before, it could briefly read 1 while the final signal was still
+  releasing the counter's other tasks.
+
+No changes for existing callers.
+
+## 0.14.0 (2026-11-22): limiters
+
+- CreateLimiter(n), or ScopedLimiter: at most n tasks with
+  TaskDesc::limiter run at once, so background work (asset loading,
+  decompression, uploads) cannot take every worker. A limit of 1 is a
+  serial queue.
+- A task takes a unit when it becomes runnable and gives it back when it
+  finishes; while none is free it waits in the limiter, not in a run
+  queue. High tasks go first, otherwise in the order they became runnable.
+- Works with every affinity, dependencies, Cancel, exceptions and
+  TaskGraph nodes. LimiterHeld and LimiterWaiting report its state;
+  LoomConfig::maxLimiters sizes the table (64 by default).
+- About 4-15 ns per task while units are free. In loom_bench, a frame
+  beside 1 ms background tasks on every worker went from a ~986 us median
+  to ~124 us (the same as with no background) with the background limited
+  to 4 workers.
+
+No changes for existing callers.
+
+## 0.13.0 (2026-11-22): task graphs
+
+- TaskGraph: a dependency graph declared once and run every frame, with
+  no counters to rebuild. Nodes take a TaskDesc or a callable; Precede
+  orders them; cycles are found once per change.
+- A run acts as one task: Submit(graph, signals, waitsFor) waits on a
+  counter and signals one when done, and a node's exception or a Cancel
+  skips the nodes not yet started. Run(graph) submits and waits.
+- Nodes with the same predecessors share one wait, ready nodes are queued
+  in groups and a run's completion is batched, so a run matches or beats
+  the cheapest hand-built counter form on every shape in loom_bench.
+- loom_bench times a frame-shaped DAG and four graph shapes against their
+  counter equivalents.
+
+No changes for existing callers.
+
+## 0.12.0 (2026-11-21): any callable, timed waits, a portable waiter
+
+- Submit(F) takes any callable. A nothrow-movable one of up to 40 bytes is
+  moved into the task slot; anything larger or over-aligned goes to the
+  heap. It is destroyed after the task runs, throws or is skipped.
+  Trivially copyable callables of up to 48 bytes are stored as before.
+- TryWaitFor(counter, timeoutMs, help): a wait with a time limit, returning
+  false if the time runs out first; 0 only checks.
+- Off Linux, threads sleep on a mutex and condition variable (it supports
+  a timeout, unlike std::atomic::wait); LOOM_NO_FUTEX tests that path on
+  Linux.
+- Fix: two dedicated threads with the same name no longer share a stats
+  row's queue depth.
+
+No changes for existing callers.
+
+## 0.11.0 (2026-11-21): dependencies, priorities, cancellation, isolation, auto-chunking
+
+- TaskDesc::waitsForAll: a task can wait for several counters.
+- TaskDesc::priority: High runs before Normal; Low only when no other pool
+  work is queued. High goes to the front of main and dedicated queues.
+- Cancel and IsCancelled: skip a counter's tasks that have not started.
+- Isolated(fn): a wait inside the region helps only with the region's own
+  tasks, so a frame-critical wait never picks up an unrelated long task.
+- ParallelFor chunks automatically with chunkSize 0 (or no chunk size),
+  splitting work whenever a worker is idle.
+- ParallelReduce: a reduction that gives the same bits on every run and
+  with any number of workers.
+- The counter table moved off the free-slot stack's cache line (about
+  40 ns per task back to 20-28 ns at 16 workers).
+- docs/design.md and docs/rules.md cover all of the above, and the
+  scheduler internals are commented throughout.
+
+**Changes for existing callers:**
+- ParallelFor with chunkSize 0 now chunks automatically (it did nothing).
+- A task's exception now cancels its counter: that counter's tasks that
+  have not started are skipped.
+
+## 0.10.0 (2026-11-21): a work-stealing scheduler
+
+The same API on a lock-free core, and the correctness fixes found while
+building it.
+
+- Task slots in chunks that never move, with per-thread free-slot caches:
+  submitting and finishing a task takes no lock.
+- One Chase-Lev deque per worker and one for the main thread; idle threads
+  steal. Submit(span) hands tasks over in groups of up to 32.
+- A counter is one atomic; only the final signal locks, and a worker
+  applies its finished tasks' signals to a counter in one go.
+- A task's exception is kept on its counter and rethrown by WaitFor
+  (before, it terminated the program). Builds without exceptions still work.
+- Fixes: long thread names are cut to the OS limit; thread stats count
+  helped tasks and own their names (a use-after-free); a submit to a
+  dedicated thread can no longer race its unregister.
+
+**Changes for existing callers:**
+- Shutdown drains every live task first, and may block for up to
+  LoomConfig::shutdownTimeoutMs.
+- DedicatedIds are handed out once per pool and are no longer small,
+  dense indices.
+- ThreadStats::tasksRun includes the tasks a thread ran while helping.
+- LiveTaskCount and Load can lag briefly behind finished tasks.
+
+## 0.9.0 (2026-11-20): the library as extracted from TinyEngine, before generalisation
