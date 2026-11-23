@@ -56,7 +56,9 @@ loom::ParallelFor(0, meshes.size(), 64, [&](size_t begin, size_t end) {
   future for a value that comes from outside loom, such as an IO callback.
 - **Limiters** (`CreateLimiter`): at most N tasks of a kind run at once, so
   background work (asset decompression, uploads) cannot take every worker;
-  a limit of 1 is a serial queue.
+  a limit of 1 is a serial queue. `LimiterUnit()` tells a task which of the
+  N units it holds (one staging buffer each), and `SetLimiterLimit` changes
+  N while the work runs.
 - **Isolation** (`Isolated`): a wait inside an isolated region helps only
   with that region's tasks, so a frame-critical wait never picks up an
   unrelated long task.

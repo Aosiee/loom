@@ -245,6 +245,22 @@ Limited tasks are never grouped (each takes its own unit); a task's limiter
 is a 16-bit index in a free byte pair of the slot's first line, so a task
 without one pays a load it already makes and an untaken branch.
 
+`SetLimiterLimit` raising the limit gives out the new units the way
+finishing tasks give theirs back, so waiting tasks start at once. Lowering
+it takes free units out of the count at once. For each held unit it would
+need, it leaves a *retiring* debt instead: the count goes down as if a task
+waited, and the next finisher that takes the lock to hand its unit on finds
+the debt and drops the unit. So no task waits behind a debt, and the count
+stays the one number the fast paths read. `LimiterHeld` is the limit plus
+the debts still open while the count is negative.
+
+A unit's index (`LimiterUnit`) is handed out only when a task asks for one,
+from a stack of the free indices below the limit, under the limiter's lock.
+The index goes back before the unit does, so whoever takes the unit next
+finds one free. After the limit is lowered, more tasks can hold units than
+there are indices below it; such a task gets the lowest unused index above
+the limit, and that index is dropped again when its task finishes.
+
 ## Sleeping and waking
 
 Every sleep in loom goes through one `Waiter` per thread, a 32-bit word the

@@ -272,6 +272,26 @@ void          DestroyLimiter(LimiterHandle); // asserts none of its tasks is liv
 uint32_t      LimiterHeld(LimiterHandle);
 uint32_t      LimiterWaiting(LimiterHandle);
 
+// Changes the limit while tasks use the limiter, from any thread. Raising it
+// starts waiting tasks at once. Lowering it never stops a task: free units go
+// at once, held ones as their tasks finish, and no task takes a unit until
+// fewer than the new limit are held. LimiterHeld can exceed the limit
+// meanwhile.
+void          SetLimiterLimit(LimiterHandle, uint32_t limit); // limit >= 1
+uint32_t      LimiterLimit(LimiterHandle);
+
+// Which of its limiter's units the running task holds: an index in
+// [0, limit), the same for the whole run and different from every other task
+// of that limiter running at the same time, so it can pick one of `limit`
+// scratch buffers or staging slots without a lock. Indices are reused, the
+// most recently freed first (0 first while all are free), so the buffers in
+// use stay few and warm. kNoUnit outside a limited task.
+// After the limit is lowered, a task over the new limit can get an index at
+// or above it (until enough tasks have finished); size buffers for the
+// highest limit used. A future's task has none once its value is ready.
+inline constexpr uint32_t kNoUnit = ~0u;
+uint32_t      LimiterUnit();
+
 // RAII wrapper over a limiter handle: destroys on scope exit; non-copyable.
 class ScopedLimiter
 {

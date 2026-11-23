@@ -399,13 +399,24 @@ struct alignas(64) CounterState
 // first task, or, when the waiter has decremented but not yet queued itself,
 // as a handoff that the waiter takes instead of queueing.
 
+//
+// Lowering the limit takes free units out at once and, for units that are
+// held, leaves "retiring" debts: a finishing task that finds one pays it with
+// its unit instead of handing it on. Raising it gives the new units back as
+// finishing tasks would. Unit indices (LimiterUnit) are handed out lazily from
+// a stack of free ones below the limit; a task over a lowered limit may get
+// one above it, which is dropped again when it finishes.
+
 struct alignas(64) LimiterState
 {
 	std::atomic<int>     count{ 0 };
 	std::mutex           mutex;
 	std::deque<uint32_t> waiting;      // slots, High first, under mutex
 	uint32_t             handoffs = 0; // units left for a waiter not yet queued, under mutex
-	uint32_t             limit = 0;
+	std::atomic<uint32_t> limit{ 0 };    // written under mutex
+	std::atomic<uint32_t> retiring{ 0 }; // held units to drop when they come back, written under mutex
+	std::vector<uint32_t> freeUnits;     // unit indices below the limit nobody holds, under mutex
+	std::vector<uint8_t>  unitInUse;     // by index, under mutex
 	// Read lock-free by ResolveLimiter, as a counter's are.
 	alignas(64) std::atomic<bool> alive{ false };
 	std::atomic<uint32_t> generation{ 0 };
@@ -618,6 +629,8 @@ static thread_local uint16_t        t_Isolation = 0;
 // its own counter from inside, as a future's does, can give its unit back
 // first. Null outside a task; saved and restored around nested runs.
 static thread_local uint16_t*       t_RunningLimiter = nullptr;
+// Its unit index once LimiterUnit asked for one (kNoUnitIndex before), beside it.
+static thread_local uint32_t*       t_RunningUnit = nullptr;
 
 static PoolState& ActivePool()
 {
@@ -760,6 +773,12 @@ static uint32_t ReleaseUnit(LimiterState& l)
 	if (l.count.fetch_add(1, std::memory_order_acq_rel) >= 0)
 		return kNoSlot;
 	std::lock_guard<std::mutex> lock(l.mutex);
+	const uint32_t retiring = l.retiring.load(std::memory_order_relaxed);
+	if (retiring > 0)
+	{
+		l.retiring.store(retiring - 1, std::memory_order_relaxed); // the limit was lowered: drop it
+		return kNoSlot;
+	}
 	if (l.waiting.empty())
 	{
 		l.handoffs++;
@@ -768,6 +787,39 @@ static uint32_t ReleaseUnit(LimiterState& l)
 	const uint32_t next = l.waiting.front();
 	l.waiting.pop_front();
 	return next;
+}
+
+static constexpr uint32_t kNoUnitIndex = ~0u;
+
+// A unit index for a task holding a unit: a free one below the limit, or,
+// when a lowered limit has more holders than indices, the lowest one unused.
+static uint32_t TakeUnitIndex(LimiterState& l)
+{
+	std::lock_guard<std::mutex> lock(l.mutex);
+	uint32_t index;
+	if (!l.freeUnits.empty())
+	{
+		index = l.freeUnits.back();
+		l.freeUnits.pop_back();
+	}
+	else
+	{
+		index = 0;
+		while (index < l.unitInUse.size() && l.unitInUse[index])
+			index++;
+		if (index == l.unitInUse.size())
+			l.unitInUse.push_back(0);
+	}
+	l.unitInUse[index] = 1;
+	return index;
+}
+
+static void ReturnUnitIndex(LimiterState& l, uint32_t index)
+{
+	std::lock_guard<std::mutex> lock(l.mutex);
+	l.unitInUse[index] = 0;
+	if (index < l.limit.load(std::memory_order_relaxed))
+		l.freeUnits.push_back(index);
 }
 
 // ---- Forward decls --------------------------------------------------------------
@@ -2487,8 +2539,16 @@ LimiterHandle CreateLimiter(uint32_t limit)
 	const uint32_t i = P.freeLimiters.back();
 	P.freeLimiters.pop_back();
 	LimiterState& l = P.limiters[i];
-	l.limit = std::max(1u, limit);
-	l.count.store((int)l.limit, std::memory_order_relaxed);
+	{
+		std::lock_guard<std::mutex> unitLock(l.mutex);
+		l.limit.store(limit, std::memory_order_relaxed);
+		l.retiring.store(0, std::memory_order_relaxed);
+		l.unitInUse.assign(limit, 0);
+		l.freeUnits.clear();
+		for (uint32_t u = limit; u-- > 0;)
+			l.freeUnits.push_back(u); // index 0 on top
+	}
+	l.count.store((int)limit, std::memory_order_relaxed);
 	l.alive.store(true, std::memory_order_release);
 	return PackCounter(i, l.generation.load(std::memory_order_relaxed));
 }
@@ -2502,8 +2562,8 @@ void DestroyLimiter(LimiterHandle h)
 		return;
 	{
 		std::lock_guard<std::mutex> lock(l->mutex);
-		assert(l->count.load(std::memory_order_relaxed) == (int)l->limit && l->waiting.empty() && l->handoffs == 0
-			&& "destroying a limiter whose tasks are live");
+		assert(l->count.load(std::memory_order_relaxed) == (int)l->limit.load(std::memory_order_relaxed) && l->waiting.empty()
+			&& l->handoffs == 0 && l->retiring.load(std::memory_order_relaxed) == 0 && "destroying a limiter whose tasks are live");
 	}
 	std::lock_guard<std::mutex> lock(P.limiterMutex);
 	if (!l->alive.load(std::memory_order_relaxed) || l->generation.load(std::memory_order_relaxed) != CounterGeneration(h))
@@ -2517,14 +2577,88 @@ void DestroyLimiter(LimiterHandle h)
 	P.freeLimiters.push_back(CounterIndex(h));
 }
 
+// count is free units less waiters less retiring debts. While it is negative
+// no unit is free, and the held ones are the limit plus those still to retire.
+static uint32_t HeldUnits(const LimiterState& l)
+{
+	const int count = l.count.load(std::memory_order_acquire);
+	const uint32_t limit = l.limit.load(std::memory_order_relaxed);
+	if (count >= 0)
+		return (uint32_t)count <= limit ? limit - (uint32_t)count : 0;
+	return limit + l.retiring.load(std::memory_order_relaxed);
+}
+
+void SetLimiterLimit(LimiterHandle h, uint32_t limit)
+{
+	PoolState& P = ActivePool();
+	assert(limit >= 1 && limit < (uint32_t)INT_MAX && "limiter limit out of range");
+	LimiterState* l = ResolveLimiter(P, h);
+	assert(l && "invalid/destroyed limiter");
+	if (!l || limit < 1)
+		return;
+	uint32_t raise = 0;
+	{
+		std::lock_guard<std::mutex> lock(l->mutex);
+		const uint32_t old = l->limit.load(std::memory_order_relaxed);
+		if (limit == old)
+			return;
+		l->limit.store(limit, std::memory_order_relaxed);
+		if (l->unitInUse.size() < limit)
+			l->unitInUse.resize(limit, 0);
+		if (limit > old)
+		{
+			raise = limit - old;
+			for (uint32_t u = limit; u-- > old;)
+				if (!l->unitInUse[u])
+					l->freeUnits.push_back(u);
+		}
+		else
+		{
+			// A free unit goes at once; a held one when its task gives it back.
+			for (uint32_t k = 0; k < old - limit; k++)
+				if (l->count.fetch_sub(1, std::memory_order_acq_rel) <= 0)
+					l->retiring.store(l->retiring.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+			l->freeUnits.erase(std::remove_if(l->freeUnits.begin(), l->freeUnits.end(), [&](uint32_t u) { return u >= limit; }),
+				l->freeUnits.end());
+		}
+	}
+	// New units go out as finishing tasks' would: to a retiring debt, to a
+	// waiting task, or into the free count.
+	WorkerCtx* ctx = CurrentCtx(P);
+	size_t woken = 0;
+	for (uint32_t k = 0; k < raise; k++)
+	{
+		const uint32_t next = ReleaseUnit(*l);
+		if (next != kNoSlot && EnqueueSlot(P, next, ctx))
+			woken++;
+	}
+	WakeForWork(P, woken);
+}
+
+uint32_t LimiterUnit()
+{
+	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
+	if (!pool || !t_RunningLimiter || *t_RunningLimiter == 0)
+		return kNoUnit;
+	if (*t_RunningUnit == kNoUnitIndex)
+		*t_RunningUnit = TakeUnitIndex(pool->limiters[*t_RunningLimiter - 1]);
+	return *t_RunningUnit;
+}
+
+uint32_t LimiterLimit(LimiterHandle h)
+{
+	const LimiterState* l = ResolveLimiter(ActivePool(), h);
+	assert(l && "invalid/destroyed limiter");
+	return l ? l->limit.load(std::memory_order_relaxed) : 0;
+}
+
 uint32_t LimiterHeld(LimiterHandle h)
 {
 	LimiterState* l = ResolveLimiter(ActivePool(), h);
 	assert(l && "invalid/destroyed limiter");
 	if (!l)
 		return 0;
-	const int count = l->count.load(std::memory_order_acquire);
-	return count >= 0 ? l->limit - (uint32_t)count : l->limit;
+	return HeldUnits(*l);
 }
 
 uint32_t LimiterWaiting(LimiterHandle h)
@@ -2534,7 +2668,10 @@ uint32_t LimiterWaiting(LimiterHandle h)
 	if (!l)
 		return 0;
 	const int count = l->count.load(std::memory_order_acquire);
-	return count < 0 ? (uint32_t)-count : 0;
+	if (count >= 0)
+		return 0;
+	const uint32_t short_ = (uint32_t)-count, retiring = l->retiring.load(std::memory_order_relaxed);
+	return short_ > retiring ? short_ - retiring : 0; // retiring debts are no task's
 }
 
 int Load(CounterHandle h)
@@ -2916,7 +3053,13 @@ static void ReleaseRunningUnit(PoolState& P, WorkerCtx* ctx)
 	uint16_t* const limiter = t_RunningLimiter;
 	if (!limiter || *limiter == 0)
 		return;
-	const uint32_t next = ReleaseUnit(P.limiters[*limiter - 1]);
+	LimiterState& l = P.limiters[*limiter - 1];
+	if (*t_RunningUnit != kNoUnitIndex)
+	{
+		ReturnUnitIndex(l, *t_RunningUnit); // free before the unit, for whoever gets it
+		*t_RunningUnit = kNoUnitIndex;
+	}
+	const uint32_t next = ReleaseUnit(l);
 	*limiter = 0;
 	if (next != kNoSlot && EnqueueSlot(P, next, ctx))
 		WakeForWork(P, 1);
@@ -2954,8 +3097,11 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	// restore below always happens).
 	const uint16_t outerRegion = t_Isolation;
 	uint16_t* const outerLimiter = t_RunningLimiter;
+	uint32_t* const outerUnit = t_RunningUnit;
+	uint32_t unitIndex = kNoUnitIndex;
 	t_Isolation = t.isolation;
 	t_RunningLimiter = &limiter;
+	t_RunningUnit = &unitIndex;
 	ThreadDebug* const debug = DebugRow(P, ctx);
 	uint32_t outerName = 0;
 	CounterHandle outerSignals = kInvalidCounter;
@@ -2982,6 +3128,7 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	}
 	t_Isolation = outerRegion;
 	t_RunningLimiter = outerLimiter;
+	t_RunningUnit = outerUnit;
 	// An owned callable dies whether it ran, threw or was skipped, and before
 	// the slot it may live in is released.
 	if (destroy)
@@ -2991,6 +3138,8 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	// once a WaitFor on the task's counter returns, it holds none.
 	if (limiter != 0)
 	{
+		if (unitIndex != kNoUnitIndex)
+			ReturnUnitIndex(P.limiters[limiter - 1], unitIndex); // free before the unit, for whoever gets it
 		const uint32_t next = ReleaseUnit(P.limiters[limiter - 1]);
 		if (next != kNoSlot && EnqueueSlot(P, next, ctx))
 			WakeForWork(P, 1);
@@ -3695,9 +3844,8 @@ DebugState CaptureDebugState()
 				continue;
 			DebugLimiter dl;
 			dl.handle = PackCounter(i, l.generation.load(std::memory_order_relaxed));
-			dl.limit = l.limit;
-			const int count = l.count.load(std::memory_order_acquire);
-			dl.held = count >= 0 ? l.limit - (uint32_t)count : l.limit;
+			dl.limit = l.limit.load(std::memory_order_relaxed);
+			dl.held = HeldUnits(l);
 			if (LockBriefly(l.mutex))
 			{
 				dl.waitingTotal = (int)l.waiting.size();

@@ -2228,6 +2228,152 @@ TEST_CASE("loom: counters — a task released by a counter already sees it at ze
 	CHECK(notZero.load() == 0);
 }
 
+TEST_CASE("loom: limiters — each running task holds its own unit index")
+{
+	for (int workers : { 0, 1, -1 })
+	{
+		loom::Pool pool(loom::LoomConfig{ .workerCount = workers });
+		CHECK(loom::LimiterUnit() == loom::kNoUnit); // not in a task
+		loom::ScopedLimiter four(4), other(2);
+		CHECK(loom::LimiterLimit(four) == 4);
+		std::atomic<bool> inUse[4] = {};
+		std::atomic<int> errors{ 0 }, ran{ 0 };
+		constexpr int kTasks = 400;
+		loom::ScopedCounter done(kTasks + 1);
+		for (int i = 0; i < kTasks; i++)
+			loom::Submit([&, i] {
+				const uint32_t u = loom::LimiterUnit();
+				if (u >= 4 || inUse[u].exchange(true))
+				{
+					errors++;
+					return;
+				}
+				if (i % 50 == 0)
+				{
+					// Another limiter's task run inside this one (helping) has its own
+					// index, and this task's comes back afterwards.
+					loom::ScopedCounter nested(1);
+					loom::Submit([&] { if (loom::LimiterUnit() >= 2) errors++; }, loom::TaskDesc{ .signals = nested, .limiter = other });
+					loom::WaitFor(nested);
+				}
+				SpinFor(std::chrono::microseconds(5));
+				if (loom::LimiterUnit() != u)
+					errors++;
+				inUse[u] = false;
+				ran++;
+			}, loom::TaskDesc{ .signals = done, .limiter = four });
+		loom::Submit([&] { if (loom::LimiterUnit() != loom::kNoUnit) errors++; }, loom::TaskDesc{ .signals = done });
+		loom::WaitFor(done);
+		CHECK(errors.load() == 0);
+		CHECK(ran.load() == kTasks);
+		CHECK(loom::LimiterHeld(four) == 0);
+	}
+}
+
+TEST_CASE("loom: limiters — raising a limit starts waiting tasks, lowering it waits for holders")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 6 });
+	loom::ScopedLimiter limiter(1);
+	std::atomic<int> active{ 0 }, started{ 0 };
+	std::atomic<int> release{ 0 }; // the long tasks numbered below this may finish
+	loom::ScopedCounter longDone(4);
+	for (int i = 0; i < 4; i++)
+		loom::Submit([&, i] {
+			active++;
+			started++;
+			while (release.load() <= i)
+				std::this_thread::yield();
+			active--;
+		}, loom::TaskDesc{ .signals = longDone, .limiter = limiter });
+	auto waitUntil = [](auto&& ready) {
+		const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		while (!ready() && std::chrono::steady_clock::now() < until)
+			std::this_thread::yield();
+		return ready();
+	};
+	REQUIRE(waitUntil([&] { return started.load() == 1; }));
+	CHECK(loom::LimiterWaiting(limiter) == 3);
+
+	loom::SetLimiterLimit(limiter, 4); // the three waiting start now, beside the first
+	REQUIRE(waitUntil([&] { return started.load() == 4; }));
+	CHECK(loom::LimiterHeld(limiter) == 4);
+	CHECK(loom::LimiterWaiting(limiter) == 0);
+
+	loom::SetLimiterLimit(limiter, 2); // four hold units: two must finish, and one more, before a new task starts
+	CHECK(loom::LimiterLimit(limiter) == 2);
+	CHECK(loom::LimiterHeld(limiter) == 4);
+	std::atomic<int> newStarted{ 0 }, maxActive{ 0 }, badUnit{ 0 };
+	constexpr int kNew = 20;
+	loom::ScopedCounter newDone(kNew);
+	for (int i = 0; i < kNew; i++)
+		loom::Submit([&] {
+			newStarted++;
+			const int now = ++active;
+			int seen = maxActive.load();
+			while (now > seen && !maxActive.compare_exchange_weak(seen, now)) {}
+			if (loom::LimiterUnit() >= 2)
+				badUnit++;
+			SpinFor(std::chrono::microseconds(20));
+			active--;
+		}, loom::TaskDesc{ .signals = newDone, .limiter = limiter });
+	CHECK(loom::LimiterWaiting(limiter) == kNew);
+	for (int finished = 1; finished <= 2; finished++)
+	{
+		release = finished;
+		REQUIRE(waitUntil([&] { return loom::LimiterHeld(limiter) == (uint32_t)(4 - finished); }));
+		CHECK(newStarted.load() == 0); // still at or over the new limit
+	}
+	release = 4; // the rest finish; the new tasks then run two at a time
+	loom::WaitFor(newDone);
+	loom::WaitFor(longDone);
+	CHECK(newStarted.load() == kNew);
+	CHECK(maxActive.load() <= 2);
+	CHECK(badUnit.load() == 0);
+	CHECK(loom::LimiterHeld(limiter) == 0);
+	CHECK(loom::LimiterWaiting(limiter) == 0);
+}
+
+TEST_CASE("loom: limiters — a limit changed at random under load keeps every count straight")
+{
+	loom::Pool pool(loom::LoomConfig{});
+	loom::ScopedLimiter limiter(3);
+	constexpr uint32_t kMaxLimit = 8;
+	std::atomic<bool> inUse[64] = {};
+	std::atomic<int> errors{ 0 };
+	std::atomic<bool> stop{ false };
+	std::thread changer([&] {
+		uint32_t x = 12345;
+		while (!stop)
+		{
+			x = x * 1664525u + 1013904223u;
+			loom::SetLimiterLimit(limiter, 1 + (x >> 16) % kMaxLimit);
+			std::this_thread::yield();
+		}
+	});
+	constexpr int kTasks = 4000;
+	loom::ScopedCounter done(kTasks);
+	for (int i = 0; i < kTasks; i++)
+		loom::Submit([&] {
+			const uint32_t u = loom::LimiterUnit();
+			if (u >= 64 || inUse[u].exchange(true)) // distinct even across changes
+			{
+				errors++;
+				return;
+			}
+			SpinFor(std::chrono::microseconds(2));
+			inUse[u] = false;
+		}, loom::TaskDesc{ .signals = done, .limiter = limiter });
+	loom::WaitFor(done);
+	stop = true;
+	changer.join();
+	CHECK(errors.load() == 0);
+	CHECK(loom::LimiterHeld(limiter) == 0);
+	CHECK(loom::LimiterWaiting(limiter) == 0);
+	loom::SetLimiterLimit(limiter, 2);
+	CHECK(loom::LimiterLimit(limiter) == 2);
+	// Destroying it asserts every unit came back and no debt is left.
+}
+
 TEST_CASE("loom: futures — values, void, move-only results and repeated Get, any pool")
 {
 	for (int workers : { 0, 1, -1 })
