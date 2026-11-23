@@ -42,6 +42,8 @@
 #include <type_traits>
 #include <utility>
 
+#include "loom/loom_version.h"
+
 namespace loom {
 
 using TaskFn = void (*)(void* userData);

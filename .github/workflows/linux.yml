@@ -1,8 +1,9 @@
 # Builds loom and runs its suite in each configuration it is checked in
 # before a release: GCC and Clang, Debug and Release, the portable sleep
 # instead of the futex, and the address, undefined-behaviour and thread
-# sanitizers. A last job builds loom as an engine embeds it, without
-# exceptions and without the suite.
+# sanitizers. Two more jobs build loom as an engine embeds it, without
+# exceptions and without the suite, and as a package: installed and found
+# with find_package, and added with add_subdirectory.
 name: Linux
 
 on:
@@ -80,3 +81,37 @@ jobs:
           g++ -std=c++20 -O2 -Wall -Wextra -Werror -fno-exceptions -Iinclude \
             tests/no_exceptions.cpp build/libloom.a -pthread -o build/no_exceptions
           build/no_exceptions
+
+  package:
+    name: install and find_package
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build and install loom
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/prefix"
+          cmake --build build -j "$(nproc)" --target loom
+          cmake --install build
+
+      # The suite links its own copy with the hooks; the installed one has none.
+      - name: Check the installed library has no test hooks
+        run: |
+          if nm -C "$RUNNER_TEMP/prefix/lib/libloom.a" | grep -q SetTestHook; then
+            echo "the installed libloom.a has test hooks"
+            exit 1
+          fi
+
+      - name: Build a program against the installed package
+        run: |
+          version=$(sed -n 's/^#define LOOM_VERSION_STRING "\(.*\)"/\1/p' include/loom/loom_version.h)
+          cmake -S tests/package -B consumer -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/prefix" -DLOOM_EXPECT_VERSION="$version"
+          cmake --build consumer
+          consumer/loom_package_check
+
+      - name: Build a program that adds loom with add_subdirectory
+        run: |
+          cmake -S tests/package -B consumer-source -DLOOM_SOURCE_DIR="$GITHUB_WORKSPACE"
+          cmake --build consumer-source -j "$(nproc)"
+          consumer-source/loom_package_check

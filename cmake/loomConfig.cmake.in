@@ -1,0 +1,9 @@
+# find_package(loom): the loom::loom target, a static library that brings
+# its include directory, C++20 and the thread library with it.
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+include("${CMAKE_CURRENT_LIST_DIR}/loomTargets.cmake")
+check_required_components(loom)

@@ -203,9 +203,22 @@ cmake -S . -B build && cmake --build build
 
 `-DLOOM_SANITIZE=thread|address|undefined` builds everything with a
 sanitizer; under TSAN run the suite with
-`TSAN_OPTIONS=suppressions=tests/tsan.supp`. A host build adds the library
-with `add_subdirectory` (tests off by default there) or compiles
-`src/loom.cpp` with `include/` on its include path.
+`TSAN_OPTIONS=suppressions=tests/tsan.supp`.
+
+A host project uses loom in one of three ways, and links `loom::loom` in
+the first two:
+
+- installed: `cmake --install build --prefix <dir>`, then
+  `find_package(loom 0.20 REQUIRED)` with `<dir>` on `CMAKE_PREFIX_PATH`.
+  Before 1.0 the package accepts only its own minor version, since a minor
+  release may change the API.
+- `add_subdirectory(loom)`, which builds neither the tests nor the install
+  rules;
+- or compiling `src/loom.cpp` with `include/` on the include path.
+
+`LOOM_VERSION` (from `loom/loom_version.h`, which `loom/loom.h` includes)
+lets code build against more than one release:
+`#if LOOM_VERSION >= LOOM_MAKE_VERSION(0, 20, 0)`.
 
 Linux is supported, and every push is built and tested there with GCC and
 Clang, in Debug and Release and under each sanitizer (the Linux badge

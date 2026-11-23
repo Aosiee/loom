@@ -786,7 +786,7 @@ void SetTestHook(TestHookFn fn) { s_TestHook.store(fn, std::memory_order_release
 #define LOOM_TEST_POINT(point) \
 	do { if (detail::TestHookFn hook = detail::s_TestHook.load(std::memory_order_relaxed)) hook(point); } while (0)
 #else
-#define LOOM_TEST_POINT(point) do {} while (0)
+#define LOOM_TEST_POINT(point) do { (void)(point); } while (0)
 #endif
 // A limiter unit has just become free for anyone to take.
 static constexpr int kTestPointUnitFreed = 1;
