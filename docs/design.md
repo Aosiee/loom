@@ -335,6 +335,14 @@ the chunk size, if given), keeps one partial per chunk, and folds the
 partials in index order on the calling thread. Nothing about the result
 depends on timing or the number of workers.
 
+### Per-thread storage
+
+`PerThread<T>` is two levels of cells indexed by `CurrentThreadIndex`, a
+fixed array of chunk pointers and chunks of 64 cells allocated on first
+use. Each cell is on cache lines of its own, and only its thread constructs
+or touches it, so `Local()` takes no lock once its chunk exists. The rest
+of the API walks the cells and so must not race with `Local()`.
+
 ## Thread identity
 
 Every thread loom runs gets a small index (`CurrentThreadIndex`): 0 for the

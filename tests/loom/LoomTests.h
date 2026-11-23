@@ -2374,6 +2374,100 @@ TEST_CASE("loom: limiters — a limit changed at random under load keeps every c
 	// Destroying it asserts every unit came back and no debt is left.
 }
 
+TEST_CASE("loom: per-thread storage — one per thread, merged after the work")
+{
+	loom::Pool pool(loom::LoomConfig{});
+	// A histogram per thread, merged once the loop is done.
+	constexpr size_t kN = 200000, kBins = 16;
+	loom::PerThread<std::vector<uint64_t>> bins(std::vector<uint64_t>(kBins, 0));
+	loom::ParallelFor(0, kN, [&](size_t b, size_t e) {
+		std::vector<uint64_t>& mine = bins.Local();
+		REQUIRE(mine.size() == kBins); // a copy of the exemplar
+		for (size_t i = b; i < e; i++)
+			mine[(i * 2654435761u) % kBins]++;
+	});
+	std::vector<uint64_t> merged(kBins, 0), serial(kBins, 0);
+	bins.ForEach([&](std::vector<uint64_t>& v) {
+		for (size_t k = 0; k < kBins; k++)
+			merged[k] += v[k];
+	});
+	for (size_t i = 0; i < kN; i++)
+		serial[(i * 2654435761u) % kBins]++;
+	CHECK(merged == serial);
+	CHECK(bins.Size() >= 1);
+	CHECK(bins.Size() <= (size_t)loom::WorkerCount() + 1);
+
+	// Each thread sees its own, on its own cache line, and the same one each time.
+	struct Slot { int owner = -1; int uses = 0; };
+	loom::PerThread<Slot> slots;
+	std::atomic<int> wrongOwner{ 0 };
+	loom::ParallelFor(0, 2000, size_t(1), [&](size_t, size_t) {
+		Slot& s = slots.Local();
+		if (s.owner == -1)
+			s.owner = loom::CurrentThreadIndex();
+		else if (s.owner != loom::CurrentThreadIndex())
+			wrongOwner++;
+		s.uses++;
+		if (&slots.Local() != &s)
+			wrongOwner++;
+	});
+	CHECK(wrongOwner.load() == 0);
+	int uses = 0;
+	std::vector<uintptr_t> addresses;
+	slots.ForEach([&](Slot& s) { uses += s.uses; addresses.push_back((uintptr_t)&s); });
+	CHECK(uses == 2000);
+	std::sort(addresses.begin(), addresses.end());
+	for (size_t k = 1; k < addresses.size(); k++)
+		CHECK(addresses[k] - addresses[k - 1] >= 64);
+}
+
+TEST_CASE("loom: per-thread storage — move-only, over-aligned, threads outside the pool, Clear")
+{
+	loom::Pool pool(loom::LoomConfig{ .workerCount = 2 });
+	{
+		loom::PerThread<std::unique_ptr<int>> owned;
+		owned.Local() = std::make_unique<int>(5);
+		CHECK(*owned.Local() == 5);
+		std::thread outside([&] { owned.Local() = std::make_unique<int>(7); });
+		outside.join();
+		int sum = 0;
+		owned.ForEach([&](std::unique_ptr<int>& p) { sum += p ? *p : 0; });
+		CHECK(sum == 12); // the outside thread's stays after it ended
+	}
+	{
+		struct alignas(128) Wide { double v[4] = {}; };
+		loom::PerThread<Wide> wide;
+		loom::ScopedCounter done(8);
+		for (int i = 0; i < 8; i++)
+			loom::Submit([&] {
+				if ((uintptr_t)&wide.Local() % 128 != 0)
+					std::terminate();
+			}, loom::TaskDesc{ .signals = done });
+		loom::WaitFor(done);
+		CHECK((uintptr_t)&wide.Local() % 128 == 0);
+	}
+	{
+		Tracked::live = 0;
+		{
+			loom::PerThread<Tracked> tracked;
+			loom::ScopedCounter done(50);
+			for (int i = 0; i < 50; i++)
+				loom::Submit([&] { (void)tracked.Local(); }, loom::TaskDesc{ .signals = done });
+			loom::WaitFor(done);
+			(void)tracked.Local();
+			const int made = Tracked::live.load();
+			CHECK(made == (int)tracked.Size());
+			CHECK(made >= 1);
+			tracked.Clear();
+			CHECK(Tracked::live.load() == 0);
+			CHECK(tracked.Size() == 0);
+			(void)tracked.Local(); // made again after Clear
+			CHECK(Tracked::live.load() == 1);
+		}
+		CHECK(Tracked::live.load() == 0); // destroyed with the PerThread
+	}
+}
+
 TEST_CASE("loom: futures — values, void, move-only results and repeated Get, any pool")
 {
 	for (int workers : { 0, 1, -1 })

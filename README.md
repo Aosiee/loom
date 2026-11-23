@@ -65,6 +65,8 @@ loom::ParallelFor(0, meshes.size(), 64, [&](size_t begin, size_t end) {
 - **Parallel loops**: `ParallelFor` chunks automatically (or by a chunk size
   you give), and `ParallelReduce` combines per-chunk results in a fixed
   order, so the result is the same on every run.
+- **Per-thread storage** (`PerThread<T>`): one scratch buffer or partial
+  result per thread, made on first use, merged once the work is done.
 - **Parking** (`ParkAll` / `UnparkAll`) stops every pool thread at a known
   point with its stack recorded: the hook a live code reloader needs.
 - **Introspection**: `SnapshotThreadStats()` for a thread-pool view, and

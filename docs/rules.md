@@ -107,3 +107,11 @@ twice terminates; setting or destroying it after `Shutdown` touches a
 counter of a pool that is gone, so finish or drop it first. An IO
 callback that may never fire should still destroy its promise, so whoever
 waits on the future sees the broken promise instead of waiting forever.
+
+## Merge per-thread storage only after the work is done
+
+`PerThread<T>::Local()` may run on many threads at once, but `ForEach`,
+`Size` and `Clear` walk every thread's cell without a lock. Call them after
+the wait for the work that writes the cells, never while a task may still
+call `Local()`. That wait is also what makes each thread's writes visible
+to the merge.

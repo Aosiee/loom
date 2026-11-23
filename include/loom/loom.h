@@ -894,6 +894,123 @@ void         UnregisterDedicatedThread(DedicatedId);         // drains + joins
 // (debug_draw's command chunks) on this index.
 int CurrentThreadIndex();
 
+// ---- Per-thread storage --------------------------------------------------------
+// One T per thread, made on that thread's first Local() call: a scratch
+// buffer per worker, or a per-thread partial result (a histogram, a list of
+// hits) merged once the work is done. Each T sits on its own cache lines, so
+// threads never share one, and Local() after the first call is an index
+// lookup with no lock.
+//
+// Local() may be called from any thread at once. ForEach, Size and Clear may
+// not run while any thread can still call Local(): call them after the wait
+// for that work has returned (the wait orders every thread's writes before
+// them). A T outlives its thread (a finished worker's partial stays until
+// Clear), and every one is destroyed with the PerThread. Keyed by
+// CurrentThreadIndex, so a process that creates more than 65536 threads in
+// all cannot use it.
+template <typename T>
+class PerThread
+{
+public:
+	PerThread() = default;
+	// Every thread's T starts as a copy of `exemplar` (a sized buffer, a zeroed tally).
+	explicit PerThread(const T& exemplar) requires std::is_copy_constructible_v<T> : m_Exemplar(exemplar) {}
+	~PerThread() { Destroy(); }
+	PerThread(const PerThread&) = delete;
+	PerThread& operator=(const PerThread&) = delete;
+
+	// The calling thread's T, made on first use.
+	T& Local()
+	{
+		const int index = CurrentThreadIndex();
+		if (index < 0 || (size_t)index >= kChunks * kChunkSize)
+			std::terminate(); // more threads than PerThread can key
+		Chunk* chunk = m_Chunks[(size_t)index / kChunkSize].load(std::memory_order_acquire);
+		if (!chunk)
+			chunk = AddChunk((size_t)index / kChunkSize);
+		Cell& cell = chunk->cells[(size_t)index % kChunkSize];
+		if (!cell.constructed) // only this thread touches its cell
+		{
+			if constexpr (std::is_copy_constructible_v<T>)
+			{
+				if (m_Exemplar)
+					::new (static_cast<void*>(cell.storage)) T(*m_Exemplar);
+				else
+					::new (static_cast<void*>(cell.storage)) T();
+			}
+			else
+				::new (static_cast<void*>(cell.storage)) T();
+			cell.constructed = true;
+		}
+		return *std::launder(reinterpret_cast<T*>(cell.storage));
+	}
+
+	// fn(T&) for every T made so far, in thread-index order.
+	template <typename F>
+	void ForEach(F&& fn)
+	{
+		for (auto& slot : m_Chunks)
+			if (Chunk* chunk = slot.load(std::memory_order_acquire))
+				for (Cell& cell : chunk->cells)
+					if (cell.constructed)
+						fn(*std::launder(reinterpret_cast<T*>(cell.storage)));
+	}
+
+	size_t Size()
+	{
+		size_t n = 0;
+		ForEach([&](T&) { n++; });
+		return n;
+	}
+
+	// Destroys every T; the next Local() on a thread makes a new one.
+	void Clear()
+	{
+		for (auto& slot : m_Chunks)
+			if (Chunk* chunk = slot.load(std::memory_order_acquire))
+				for (Cell& cell : chunk->cells)
+					if (cell.constructed)
+					{
+						std::launder(reinterpret_cast<T*>(cell.storage))->~T();
+						cell.constructed = false;
+					}
+	}
+
+private:
+	static constexpr size_t kChunkSize = 64;
+	static constexpr size_t kChunks = 1024;
+	static constexpr size_t kCellAlign = alignof(T) > 64 ? alignof(T) : 64;
+	struct alignas(kCellAlign) Cell
+	{
+		alignas(T) unsigned char storage[sizeof(T)];
+		bool constructed = false;
+	};
+	struct Chunk
+	{
+		Cell cells[kChunkSize];
+	};
+
+	Chunk* AddChunk(size_t i)
+	{
+		Chunk* fresh = new Chunk();
+		Chunk* expected = nullptr;
+		if (m_Chunks[i].compare_exchange_strong(expected, fresh, std::memory_order_acq_rel, std::memory_order_acquire))
+			return fresh;
+		delete fresh; // another thread of the same chunk got there first
+		return expected;
+	}
+
+	void Destroy()
+	{
+		Clear();
+		for (auto& slot : m_Chunks)
+			delete slot.load(std::memory_order_relaxed);
+	}
+
+	std::atomic<Chunk*>  m_Chunks[kChunks] = {};
+	std::optional<T>     m_Exemplar;
+};
+
 // ---- Thread-pool introspection (the editor's thread-pool visualizer) --------
 // Per-frame snapshots drive the CTOP-style panel: each pool thread
 // reports its state (Idle/Running/Helping), the tasks it has run, and its
