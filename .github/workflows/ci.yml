@@ -33,7 +33,7 @@ jobs:
           - { name: thread sanitizer,     cxx: g++,     type: RelWithDebInfo, flags: -DLOOM_SANITIZE=thread }
           - { name: thread sanitizer no-futex, cxx: g++, type: RelWithDebInfo, flags: -DLOOM_SANITIZE=thread -DLOOM_NO_FUTEX=ON }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The sanitizers' shadow memory does not fit beside the runner's
       # default address randomisation.
@@ -60,7 +60,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build loom without exceptions or the suite
         run: |
