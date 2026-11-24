@@ -1,0 +1,138 @@
+// loom's suite for hamr (github.com/Aosiee/hamr): `hamr run` here.
+//
+// The configurations the CI checks, each built in its own build-hamr-<name>
+// directory: the suite (every test case's time from doctest's JUnit
+// report) and a stress run. The fast tier is the release and debug builds
+// with GCC and a Clang release; the nightly tier adds the portable sleep,
+// the three sanitizers, the no-exceptions embedding and the installed
+// package.
+//
+//     hamr run                      the fast tier
+//     hamr run --tier nightly       every configuration
+//     hamr run --set stress=60      a longer stress run
+
+const hamr = require("@hamr")
+type Context = hamr.Context
+
+const suite = hamr.suite("loom", { budgets = { fast = 180, nightly = 900 } })
+const gcc = suite:var("gcc", "g++")
+const clang = suite:var("clang", "clang++")
+const stress = suite:var("stress", "10")
+
+type Config = { name: string, cxx: string, type: string, flags: { string }, tier: string, sanitizer: string? }
+
+const configs: { Config } = {
+	{ name = "gcc-release", cxx = gcc, type = "Release", flags = {}, tier = "fast" },
+	{ name = "gcc-debug", cxx = gcc, type = "Debug", flags = {}, tier = "fast" },
+	{ name = "clang-release", cxx = clang, type = "Release", flags = {}, tier = "fast" },
+	{ name = "gcc-release-no-futex", cxx = gcc, type = "Release", flags = { "-DLOOM_NO_FUTEX=ON" }, tier = "nightly" },
+	{ name = "asan", cxx = gcc, type = "RelWithDebInfo", flags = { "-DLOOM_SANITIZE=address" }, tier = "nightly", sanitizer = "address" },
+	{ name = "ubsan", cxx = gcc, type = "RelWithDebInfo", flags = { "-DLOOM_SANITIZE=undefined" }, tier = "nightly", sanitizer = "undefined" },
+	{ name = "tsan", cxx = gcc, type = "RelWithDebInfo", flags = { "-DLOOM_SANITIZE=thread" }, tier = "nightly", sanitizer = "thread" },
+	{ name = "tsan-no-futex", cxx = gcc, type = "RelWithDebInfo", flags = { "-DLOOM_SANITIZE=thread", "-DLOOM_NO_FUTEX=ON" }, tier = "nightly", sanitizer = "thread" },
+}
+
+const kPaths = { "include/**", "src/**", "tests/**", "CMakeLists.txt", "cmake/**" }
+
+for (_, c in configs) {
+	const dir = `build-hamr-{c.name}`
+	suite:step(`build:{c.name}`, {
+		tier = c.tier,
+		doc = `Configures and builds loom ({c.cxx}, {c.type}).`,
+		resources = { exclusive = true },
+		timeout = 1200,
+		// A sanitizer build takes about twice as long as a plain one.
+		budget = if (c.sanitizer != nil) 150 else 60,
+		paths = kPaths,
+		run = function(ctx: Context) {
+			const configure = { "cmake", "-S", ".", "-B", dir, "-G", "Ninja", `-DCMAKE_BUILD_TYPE={c.type}`, `-DCMAKE_CXX_COMPILER={c.cxx}` }
+			for (_, flag in c.flags) {
+				table.insert(configure, flag)
+			}
+			ctx:run(configure)
+			ctx:run({ "cmake", "--build", dir, "-j", tostring(host.cores()) })
+		},
+	})
+	const env: { [string]: string } = {
+		TSAN_OPTIONS = "suppressions=tests/tsan.supp",
+		UBSAN_OPTIONS = "halt_on_error=1:print_stacktrace=1",
+	}
+	const junit = `{dir}/junit.xml`
+	suite:step(`tests:{c.name}`, {
+		tier = c.tier,
+		needs = { `build:{c.name}` },
+		doc = "The suite, each case timed.",
+		run = { `{dir}/loom_tests`, "--reporters=junit", `--out={junit}` },
+		env = env,
+		resources = { cpu = 8, tags = { c.name } },
+		timeout = 1200,
+		budget = if (c.sanitizer != nil) 120 else 30,
+		paths = kPaths,
+		findings = hamr.findings.junit(junit),
+	})
+	suite:step(`stress:{c.name}`, {
+		tier = c.tier,
+		needs = { `build:{c.name}` },
+		doc = "The stress test for the seconds --set stress names.",
+		run = { `{dir}/loom_stress`, "--seconds", stress, "--quiet" },
+		env = env,
+		resources = { cpu = 8, tags = { c.name } },
+		timeout = 900,
+		budget = (tonumber(stress) or 10) + 15,
+		paths = kPaths,
+	})
+}
+
+// loom as an engine embeds it: without exceptions or the suite, and without
+// the test hooks.
+suite:step("embedded", {
+	tier = "nightly",
+	doc = "Builds loom without exceptions or the suite, checks it has no test hooks, and runs the no-exceptions checks.",
+	resources = { exclusive = true },
+	timeout = 900,
+	budget = 60,
+	run = function(ctx: Context) {
+		const dir = "build-hamr-embedded"
+		ctx:run({ "cmake", "-S", ".", "-B", dir, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DLOOM_BUILD_TESTS=OFF",
+			"-DCMAKE_CXX_FLAGS=-fno-exceptions", `-DCMAKE_CXX_COMPILER={gcc}` })
+		ctx:run({ "cmake", "--build", dir, "-j", tostring(host.cores()) })
+		const hooks = ctx:run({ "sh", "-c", `nm -C {dir}/libloom.a | grep -q SetTestHook` }, { allowFail = true })
+		if (hooks.code == 0) {
+			ctx:fail("libloom.a built without the suite still has test hooks")
+		}
+		ctx:run({ gcc, "-std=c++20", "-O2", "-Wall", "-Wextra", "-Werror", "-fno-exceptions", "-Iinclude",
+			"tests/no_exceptions.cpp", `{dir}/libloom.a`, "-pthread", "-o", `{dir}/no_exceptions` })
+		ctx:run({ `{dir}/no_exceptions` })
+	},
+})
+
+// loom as a package: installed and found with find_package, and added with
+// add_subdirectory.
+suite:step("package", {
+	tier = "nightly",
+	doc = "Installs loom, then builds a program against the installed package and one that adds loom with add_subdirectory.",
+	resources = { exclusive = true },
+	timeout = 900,
+	budget = 60,
+	run = function(ctx: Context) {
+		const dir = "build-hamr-package"
+		const prefix = host.join(ctx.root, dir, "prefix")
+		ctx:run({ "cmake", "-S", ".", "-B", dir, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release", `-DCMAKE_INSTALL_PREFIX={prefix}` })
+		ctx:run({ "cmake", "--build", dir, "-j", tostring(host.cores()), "--target", "loom" })
+		ctx:run({ "cmake", "--install", dir })
+		const hooks = ctx:run({ "sh", "-c", `nm -C {prefix}/lib/libloom.a | grep -q SetTestHook` }, { allowFail = true })
+		if (hooks.code == 0) {
+			ctx:fail("the installed libloom.a has test hooks")
+		}
+		const header = host.read(host.join(ctx.root, "include", "loom", "loom_version.h")) or ""
+		const version = string.match(header, "#define LOOM_VERSION_STRING \"([^\"]+)\"") or ""
+		ctx:run({ "cmake", "-S", "tests/package", "-B", `{dir}/consumer`, `-DCMAKE_PREFIX_PATH={prefix}`, `-DLOOM_EXPECT_VERSION={version}` })
+		ctx:run({ "cmake", "--build", `{dir}/consumer` })
+		ctx:run({ `{dir}/consumer/loom_package_check` })
+		ctx:run({ "cmake", "-S", "tests/package", "-B", `{dir}/consumer-source`, `-DLOOM_SOURCE_DIR={ctx.root}` })
+		ctx:run({ "cmake", "--build", `{dir}/consumer-source`, "-j", tostring(host.cores()) })
+		ctx:run({ `{dir}/consumer-source/loom_package_check` })
+	},
+})
+
+return suite

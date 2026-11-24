@@ -238,6 +238,14 @@ the first two:
 lets code build against more than one release:
 `#if LOOM_VERSION >= LOOM_MAKE_VERSION(0, 20, 0)`.
 
+The configurations the CI checks also run locally as a
+[hamr](https://github.com/Aosiee/hamr) suite, `hamr.cluau`: `hamr run` builds
+and tests the GCC release and debug builds and a Clang release, and
+`hamr run --tier nightly` adds the portable sleep, the three sanitizers,
+the no-exceptions embedding and the installed package. Each build lives in
+its own `build-hamr-<name>` directory, and the report times every test
+case. `hamr list` shows each step's budget and recent times.
+
 Linux is supported, and every push is built and tested there with GCC and
 Clang, in Debug and Release and under each sanitizer (the Linux badge
 above). Windows and macOS are not supported yet: the thread naming, the OS
