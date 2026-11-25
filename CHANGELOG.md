@@ -26,6 +26,25 @@ any later version, check these:
   with no `thread` now asserts instead of going to the first dedicated
   thread.
 
+## 0.20.1 (2026-11-25): thread indices are given back, and GitHub releases
+
+- A thread gives its index back when it exits, and a new thread takes
+  the lowest index free, so indices stay below the most threads alive at
+  once. A process that kept creating and destroying pools used to run
+  through them: `PerThread` keys at most 65536, and past that `Local()`
+  terminated. What was keyed on an index passes to the next thread that
+  takes it, whole: a `PerThread` value carries on, and a dedicated thread
+  takes over the stats row of the thread whose index it took, under its
+  own name.
+- `hamr.cluau` runs, locally, the configurations the Linux workflow checks
+  (`hamr run`; `--tier nightly` adds the portable sleep, the sanitizers,
+  the no-exceptions embedding and the installed package).
+- Releases: `main` holds tagged releases only, work gathers on `dev` (where
+  CI runs) and is built on streams (`CONTRIBUTING.md`). A version tag
+  publishes a GitHub release.
+
+Nothing changes for existing callers.
+
 ## 0.20.0 (2026-11-23): coroutines, an installable package, and a stress test
 
 - Coroutines: a coroutine can return a `Future<T>`, and `co_await` a
