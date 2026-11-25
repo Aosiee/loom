@@ -246,11 +246,18 @@ the no-exceptions embedding and the installed package. Each build lives in
 its own `build-hamr-<name>` directory, and the report times every test
 case. `hamr list` shows each step's budget and recent times.
 
-Linux is supported, and every push is built and tested there with GCC and
-Clang, in Debug and Release and under each sanitizer (the Linux badge
-above). Windows and macOS are not supported yet: the thread naming, the OS
+Linux is supported, and every push to `dev` and `main` is built and tested
+there with GCC and Clang, in Debug and Release and under each sanitizer (the
+Linux badge above shows `main`, the latest release). Windows and macOS are not supported yet: the thread naming, the OS
 thread id and the stack walk used by parking are Linux and POSIX calls
 today.
+
+## Branches and releases
+
+`main` holds releases only, each one tagged. New work is built on a stream
+branched from `dev`, lands on `dev` once it passes locally, and is checked
+there by CI; when enough has gathered, `dev` becomes the next release. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Licence
 
