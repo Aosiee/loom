@@ -42,6 +42,9 @@ When `dev` has gathered enough for a release:
 3. Fast-forward `main` to it.
 4. Tag it: an annotated `v0.x.y` whose message is the changelog entry,
    headed `loom 0.x.y: <summary>`.
-5. Push `main` and the tag.
+5. Push `main` and the tag. The tag starts the Release workflow: it checks
+   the tag against the version header, builds loom, runs the suite and a
+   short stress run, and publishes the GitHub release with the tag's
+   message as its notes.
 
 `main` then holds exactly the commit CI passed on `dev`.

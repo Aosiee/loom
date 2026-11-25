@@ -4,6 +4,8 @@
 [![Windows: not supported](https://img.shields.io/badge/Windows-not%20supported-lightgrey)](#building)
 [![macOS: not supported](https://img.shields.io/badge/macOS-not%20supported-lightgrey)](#building)
 
+[![Release](https://img.shields.io/github/v/release/Aosiee/loom)](https://github.com/Aosiee/loom/releases/latest)
+
 A task and threading library for C++20: one pool of worker threads,
 dedicated threads and lanes, atomic counters as the only synchronisation
 primitive, and **help-while-waiting**, so a thread that waits on work runs
