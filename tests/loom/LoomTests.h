@@ -2677,6 +2677,117 @@ TEST_CASE("loom: per-thread storage — move-only, over-aligned, threads outside
 	}
 }
 
+TEST_CASE("loom: thread indices — given back when a thread exits, and taken again")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
+
+	// Threads alive at the same time never share one.
+	{
+		constexpr int kThreads = 8;
+		std::vector<int> seen(kThreads, -1);
+		std::atomic<int> arrived{ 0 };
+		std::vector<std::thread> threads;
+		for (int i = 0; i < kThreads; i++)
+			threads.emplace_back([&, i] {
+				seen[i] = loom::CurrentThreadIndex();
+				arrived++;
+				while (arrived.load() < kThreads)
+					std::this_thread::yield();
+			});
+		for (auto& t : threads)
+			t.join();
+		std::sort(seen.begin(), seen.end());
+		CHECK(std::adjacent_find(seen.begin(), seen.end()) == seen.end());
+	}
+
+	// The next thread takes the index of the one that exited, with the
+	// PerThread value it left.
+	loom::PerThread<int> partial;
+	int first = -1, second = -1;
+	std::thread([&] { first = loom::CurrentThreadIndex(); partial.Local() = 41; }).join();
+	std::thread([&] { second = loom::CurrentThreadIndex(); partial.Local() += 1; }).join();
+	CHECK(second == first);
+	CHECK(partial.Size() == 1);
+	partial.ForEach([](int& v) { CHECK(v == 42); });
+
+	// A thread-local made before the thread's first call is destroyed after
+	// the index went back; asking from its destructor still gets an index.
+	struct Late
+	{
+		std::atomic<int>* out = nullptr;
+		~Late() { if (out) out->store(loom::CurrentThreadIndex()); }
+	};
+	std::atomic<int> late{ -100 };
+	std::thread([&] {
+		static thread_local Late t_Late;
+		t_Late.out = &late;
+		(void)loom::CurrentThreadIndex();
+	}).join();
+	CHECK(late.load() >= 0);
+
+	// A dedicated thread that takes an index takes over its stats row too.
+	const loom::DedicatedId a = loom::RegisterDedicatedThread({ .name = "index-first" });
+	int aIndex = -1;
+	{
+		loom::ScopedCounter done(1);
+		loom::Submit([&] { aIndex = loom::CurrentThreadIndex(); }, { .affinity = loom::Affinity::Dedicated, .thread = a, .signals = done });
+		loom::WaitFor(done);
+	}
+	loom::UnregisterDedicatedThread(a);
+	const loom::DedicatedId b = loom::RegisterDedicatedThread({ .name = "index-second" });
+	int bIndex = -1;
+	{
+		loom::ScopedCounter done(1);
+		loom::Submit([&] { bIndex = loom::CurrentThreadIndex(); }, { .affinity = loom::Affinity::Dedicated, .thread = b, .signals = done });
+		loom::WaitFor(done);
+	}
+	CHECK(bIndex == aIndex);
+	int rows = 0;
+	for (const loom::ThreadStatsView& t : loom::SnapshotPool().threads)
+		if (t.index == bIndex)
+		{
+			rows++;
+			CHECK(t.name == "index-second");
+		}
+	CHECK(rows == 1);
+	loom::UnregisterDedicatedThread(b);
+}
+
+TEST_CASE("loom: thread indices — stay small however many pools come and go")
+{
+	int first = -1, highest = 0;
+	loom::PerThread<long> partial; // outlives every pool
+	long want = 0;
+	for (int round = 0; round < 100; round++)
+	{
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 4 });
+		const loom::DedicatedId io = loom::RegisterDedicatedThread({ .name = "index-round" });
+		std::atomic<int> top{ 0 };
+		auto note = [&] {
+			const int me = loom::CurrentThreadIndex();
+			int seen = top.load();
+			while (me > seen && !top.compare_exchange_weak(seen, me)) {}
+		};
+		loom::ParallelFor(0, 64, size_t(1), [&](size_t, size_t) { note(); partial.Local() += 1; });
+		loom::ScopedCounter done(1);
+		loom::Submit([&] { note(); partial.Local() += 1; }, { .affinity = loom::Affinity::Dedicated, .thread = io, .signals = done });
+		loom::WaitFor(done);
+		std::thread([&] { note(); partial.Local() += 1; }).join();
+		want += 66;
+		if (first < 0)
+			first = top.load();
+		highest = std::max(highest, top.load());
+		loom::UnregisterDedicatedThread(io);
+	}
+	// 100 pools started 600 threads, with at most seven alive at once: every
+	// round takes the same few indices again.
+	CHECK(highest <= first + 6);
+	long sum = 0;
+	partial.ForEach([&](long& v) { sum += v; });
+	CHECK(sum == want);
+	CHECK(partial.Size() <= (size_t)highest + 1);
+}
+
 TEST_CASE("loom: ParallelInclusiveScan / ParallelExclusiveScan — match std, in place, reproducible")
 {
 	for (int workers : { 0, 1, -1 })

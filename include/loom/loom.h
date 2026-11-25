@@ -1665,6 +1665,13 @@ void         UnregisterDedicatedThread(DedicatedId);         // drains + joins
 // (main) thread, 1..N = the pool workers and dedicated threads, and any
 // other thread gets one on first use. Consumers key per-thread scratch
 // (debug_draw's command chunks) on this index.
+//
+// A thread keeps its index until it exits; then the index goes back, and the
+// next new thread takes the lowest one free. So the indices stay below the
+// most threads alive at once, however many pools come and go, and two
+// threads alive at the same time never share one. Whatever a thread left
+// keyed on its index is there for the next thread that takes it, after
+// everything the exited thread wrote.
 int CurrentThreadIndex();
 
 // ---- Per-thread storage --------------------------------------------------------
@@ -1679,8 +1686,9 @@ int CurrentThreadIndex();
 // for that work has returned (the wait orders every thread's writes before
 // them). A T outlives its thread (a finished worker's partial stays until
 // Clear), and every one is destroyed with the PerThread. Keyed by
-// CurrentThreadIndex, so a process that creates more than 65536 threads in
-// all cannot use it.
+// CurrentThreadIndex: a thread that takes the index of one that has exited
+// carries on with the T that thread left, so a partial keeps adding up and
+// a scratch buffer is reused. At most 65536 threads alive at once can use it.
 template <typename T>
 class PerThread
 {
@@ -1697,7 +1705,7 @@ public:
 	{
 		const int index = CurrentThreadIndex();
 		if (index < 0 || (size_t)index >= kChunks * kChunkSize)
-			std::terminate(); // more threads than PerThread can key
+			std::terminate(); // more threads alive at once than PerThread can key
 		Chunk* chunk = m_Chunks[(size_t)index / kChunkSize].load(std::memory_order_acquire);
 		if (!chunk)
 			chunk = AddChunk((size_t)index / kChunkSize);

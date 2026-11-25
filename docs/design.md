@@ -460,6 +460,16 @@ main thread, then the workers and dedicated threads; any other thread gets
 one on first use. The index allocator outlives pools, so a thread keeps its
 index, and per-thread scratch keyed on it stays valid.
 
+A thread gives its index back when it exits, from the destructor of a
+thread-local made on its first call, and a new thread takes the lowest
+index free. The allocator's mutex is taken only then, and it orders the
+exited thread's writes before the next owner's reads, so a `PerThread`
+value or a stats row keyed on the index passes from one to the next
+whole. The indices therefore stay below the most threads alive at once
+rather than growing with every pool a process creates. A thread-local
+destructor that runs after the index went back and asks for it again gets
+a fresh index that is never returned.
+
 ## Parking
 
 `ParkAll` raises a park request: every pool thread finishes its current task,

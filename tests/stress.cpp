@@ -39,10 +39,10 @@ using Clock = std::chrono::steady_clock;
 
 std::atomic<int> g_Failures{ 0 };
 uint64_t g_RoundSeed = 0;
-// Threads started so far (an upper bound on the thread indices handed out):
-// PerThread keys up to 65536 of them per process, which a long run passes.
-std::atomic<long> g_ThreadsStarted{ 0 };
-constexpr long kPerThreadLimit = 60000;
+// More than a round ever has alive at once (16 workers, 2 dedicated threads,
+// the watchdog, main and a few outside threads per scenario), and far fewer
+// than a long run starts.
+constexpr int kMostThreadsAlive = 256;
 
 // What a scenario may use: the round's dedicated threads, if any.
 struct Env
@@ -394,7 +394,6 @@ void FutureChain(Rng& rng, uint64_t seed, const Env& env)
 	if (fromPromise)
 	{
 		const int delayUs = Pick(rng, 0, 500);
-		g_ThreadsStarted++;
 		setter = std::thread([&promise, delayUs, failAt] {
 			std::this_thread::sleep_for(std::chrono::microseconds(delayUs));
 #if defined(__cpp_exceptions)
@@ -647,17 +646,21 @@ void Algorithms(Rng& rng, uint64_t seed, const Env&)
 		std::sort(expect.begin(), expect.end());
 		STRESS_CHECK(sorted == expect, "ParallelSort differs from std::sort", 0, 1);
 
-		if (g_ThreadsStarted.load() < kPerThreadLimit)
-		{
-			loom::PerThread<long> partial;
-			loom::ParallelFor(0, n, [&](size_t b, size_t e) {
-				for (size_t i = b; i < e; i++)
-					partial.Local() += v[i];
-			});
-			long merged = 0;
-			partial.ForEach([&](long& x) { merged += x; });
-			STRESS_CHECK(merged == want, "PerThread partials do not add up", merged, want);
-		}
+		loom::PerThread<long> partial;
+		std::atomic<int> topIndex{ 0 };
+		loom::ParallelFor(0, n, [&](size_t b, size_t e) {
+			const int me = loom::CurrentThreadIndex();
+			int seen = topIndex.load();
+			while (me > seen && !topIndex.compare_exchange_weak(seen, me)) {}
+			for (size_t i = b; i < e; i++)
+				partial.Local() += v[i];
+		});
+		long merged = 0;
+		partial.ForEach([&](long& x) { merged += x; });
+		STRESS_CHECK(merged == want, "PerThread partials do not add up", merged, want);
+		// Indices are given back when threads exit, so however many rounds
+		// have come and gone they stay below the threads alive at once.
+		STRESS_CHECK(topIndex.load() < kMostThreadsAlive, "a thread index past the threads alive at once", topIndex.load(), kMostThreadsAlive);
 	};
 	if (Chance(rng, 0.3))
 		loom::Isolated(body);
@@ -672,7 +675,6 @@ void TimedWaits(Rng& rng, uint64_t seed, const Env&)
 	static constexpr const char* kName = "timed waits";
 	loom::ScopedCounter gate(1);
 	const int delayUs = Pick(rng, 0, 3000);
-	g_ThreadsStarted++;
 	std::thread opener([&gate, delayUs] {
 		std::this_thread::sleep_for(std::chrono::microseconds(delayUs));
 		loom::Signal(gate);
@@ -774,9 +776,8 @@ void RunRound(uint64_t roundSeed, bool quiet)
 	const int workerChoice = Pick(rng, 0, 5);
 	const int workers = workerChoice == 0 ? 0 : workerChoice == 1 ? 1 : workerChoice == 2 ? 2 : Pick(rng, 1, std::min(hw, 16));
 	loom::Pool pool(loom::PoolConfig{ .workerCount = workers, .maxTasks = 65536, .maxCounters = 16384 });
-	g_ThreadsStarted += workers;
 	Env env;
-	for (int d = Pick(rng, 0, 2); d > 0; d--, g_ThreadsStarted++)
+	for (int d = Pick(rng, 0, 2); d > 0; d--)
 		env.dedicated.push_back(loom::RegisterDedicatedThread({ .name = "stress-dedicated",
 			.idle = Chance(rng, 0.5) ? loom::DedicatedConfig::Idle::Sleep : loom::DedicatedConfig::Idle::StealFromPool }));
 

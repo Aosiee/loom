@@ -611,7 +611,21 @@ struct PoolState
 //   per-pool counter restarting at 0 would hand a fresh worker the main
 //   thread's 0 after a re-init).
 static std::atomic<PoolState*> s_ActivePool{ nullptr };
-static std::atomic<int>         s_NextThreadIndex{ 0 };
+
+// The indices of threads that have exited, for new threads to take (the
+// lowest first), and the next index never handed out. Made once and never
+// destroyed: a thread may exit after main has returned.
+struct ThreadIndices
+{
+	std::mutex       mutex;
+	std::vector<int> free; // a min-heap
+	int              next = 0;
+};
+static ThreadIndices& TheThreadIndices()
+{
+	static ThreadIndices* indices = new ThreadIndices();
+	return *indices;
+}
 
 // A worker's own state. Worker threads die with their pool, so a stale value
 // can never point at a later pool.
@@ -1256,15 +1270,57 @@ int WorkerCount()
 	return pool ? pool->workerCount : 0;
 }
 
-// Assigned on a thread's first call and kept for the thread's life. No lock:
-// only the thread itself ever writes its own t_index.
+// The calling thread's index: -1 before its first call, and kReturnedIndex
+// once its exit has given the index back.
+static constexpr int kReturnedIndex = -2;
+static thread_local int t_ThreadIndex = -1;
+
+// Gives the thread's index back when the thread exits. The thread's writes
+// before then (to its PerThread values, its stats row) happen before the next
+// thread that takes the index reads them, through the allocator's mutex.
+struct ThreadIndexReturn
+{
+	int index = -1;
+	~ThreadIndexReturn()
+	{
+		ThreadIndices& indices = TheThreadIndices();
+		std::lock_guard<std::mutex> lock(indices.mutex);
+		indices.free.push_back(index);
+		std::push_heap(indices.free.begin(), indices.free.end(), std::greater<int>());
+		t_ThreadIndex = kReturnedIndex;
+	}
+};
+
+// Assigned on a thread's first call and kept for the thread's life; the
+// lock is only taken then.
 int CurrentThreadIndex()
 {
-	static thread_local int t_index = -1;
-	if (t_index >= 0)
-		return t_index;
-	t_index = s_NextThreadIndex.fetch_add(1);
-	return t_index;
+	if (t_ThreadIndex >= 0)
+		return t_ThreadIndex;
+	const bool exiting = t_ThreadIndex == kReturnedIndex;
+	int index;
+	{
+		ThreadIndices& indices = TheThreadIndices();
+		std::lock_guard<std::mutex> lock(indices.mutex);
+		if (!indices.free.empty())
+		{
+			std::pop_heap(indices.free.begin(), indices.free.end(), std::greater<int>());
+			index = indices.free.back();
+			indices.free.pop_back();
+		}
+		else
+			index = indices.next++;
+	}
+	t_ThreadIndex = index;
+	// A call from a thread-local destructor that runs after the index went
+	// back gets one of its own, which is never given back: t_Return is
+	// already destroyed and may not be used again.
+	if (!exiting)
+	{
+		static thread_local ThreadIndexReturn t_Return;
+		t_Return.index = index;
+	}
+	return index;
 }
 
 int LiveTaskCount()
@@ -3456,14 +3512,19 @@ static void WorkerLoop(PoolState& P, WorkerCtx& ctx)
 
 // ---- Thread stats (the pool visualizer) ------------------------------------------------
 
-// The row for a thread index, created on first use. A thread index is never
-// reused, so an existing row with the index is this thread's own.
+// The row for a thread index, created on first use. A thread that takes the
+// index of one that has exited takes over its row, under its own name; the
+// counts carry on.
 static PaddedStats* RegisterThreadStats(PoolState& P, int index, const char* name)
 {
 	std::lock_guard<std::mutex> lock(P.statsMutex);
 	for (auto& t : P.threadStats)
 		if (t->s.index == index)
+		{
+			t->name = name ? name : "";
+			t->s.name = t->name.c_str();
 			return t.get();
+		}
 	auto stats = std::make_unique<PaddedStats>();
 	stats->s.index = index;
 	stats->name = name ? name : "";
