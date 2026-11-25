@@ -4,7 +4,8 @@ loom keeps three kinds of branch.
 
 - **`main`** is the latest release. Every commit on it is a release and has
   an annotated tag, `v0.x.y`. Nothing is committed to `main` directly: it
-  only moves forward to a `dev` commit that CI has passed.
+  only moves forward to a `dev` commit that CI has passed, so CI does not
+  run on `main` again.
 - **`dev`** is where work gathers between releases. Every push to it runs
   the Linux workflow: each compiler, build type and sanitizer, a minute of
   the stress test, the no-exceptions build and the installed package.

@@ -6,14 +6,14 @@
 # with find_package, and added with add_subdirectory.
 name: Linux
 
-# dev is where streams land and every push is checked; main moves only to a
-# dev commit that passed here, at a release. A stream runs it only when
-# started by hand (Run workflow on the Actions tab).
+# dev is where streams land and every push is checked. main moves only to a
+# dev commit that already passed here, so it is not checked again. A stream
+# runs it only when started by hand (Run workflow on the Actions tab).
 on:
   push:
-    branches: [main, dev]
+    branches: [dev]
   pull_request:
-    branches: [main, dev]
+    branches: [dev]
   workflow_dispatch:
 
 concurrency:
