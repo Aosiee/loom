@@ -5242,6 +5242,66 @@ TEST_CASE("loom: priorities — a value outside the enum is refused, or runs as 
 #endif
 }
 
+// ---- Counters and limiters at their edges ---------------------------------------------
+
+TEST_CASE("loom: counters — a wait woken by the last signal returns though the counter is destroyed and its entry reused")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1, .maxCounters = 1 });
+	int stuck = 0;
+	for (int round = 0; round < 50; round++)
+	{
+		loom::CounterHandle c = loom::CreateCounter(1);
+		std::atomic<int> phase{ 0 };
+		std::thread waiter([&] {
+			phase = 1;
+			loom::WaitFor(c, loom::Help::BlockOnly);
+			phase = 2;
+		});
+		while (phase.load() != 1)
+			std::this_thread::yield();
+		std::this_thread::sleep_for(std::chrono::microseconds(200)); // asleep on c
+		loom::Signal(c);
+		loom::DestroyCounter(c);
+		loom::CounterHandle next = loom::CreateCounter(1); // the same entry (maxCounters 1)
+		const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+		while (phase.load() != 2 && std::chrono::steady_clock::now() < until)
+			std::this_thread::sleep_for(std::chrono::microseconds(100));
+		if (phase.load() != 2)
+			stuck++;
+		loom::Signal(next);
+		waiter.join();
+		loom::DestroyCounter(next);
+	}
+	CHECK(stuck == 0);
+}
+
+TEST_CASE("loom: limiters — lowering a huge limit is one step, and the lower limit holds")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
+	loom::LimiterHandle l = loom::CreateLimiter(2147483646u);
+	const auto t0 = std::chrono::steady_clock::now();
+	loom::SetLimit(l, 1);
+	const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	CHECK(ms < 100.0); // one atomic per unit took about 9 s
+	CHECK(loom::Limit(l) == 1);
+	// The lowered limit holds: one task at a time.
+	std::atomic<int> running{ 0 }, peak{ 0 };
+	loom::ScopedCounter done(16);
+	for (int i = 0; i < 16; i++)
+		loom::Submit([&] {
+			const int now = ++running;
+			int p = peak.load();
+			while (now > p && !peak.compare_exchange_weak(p, now)) {}
+			std::this_thread::sleep_for(std::chrono::microseconds(200));
+			running--;
+		}, { .signals = done, .limiter = l });
+	loom::WaitFor(done);
+	CHECK(peak.load() == 1);
+	loom::SetLimit(l, 4);
+	CHECK(loom::Limit(l) == 4);
+	loom::DestroyLimiter(l);
+}
+
 } // namespace
 
 }} // namespace loom::tests

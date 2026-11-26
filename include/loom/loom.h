@@ -124,7 +124,8 @@ struct PoolConfig
 	// the program ends.
 	uint32_t maxTasks    = 4096;
 	// Counters and limiters live at once. These tables are fixed: creating
-	// one more ends the program, with a message naming the setting.
+	// one more ends the program, with a message naming the setting. At most
+	// 1048575 counters and 65535 limiters (a larger value is taken as that).
 	uint32_t maxCounters = 2048;
 	uint32_t maxLimiters = 64;
 	// Runs first on every worker and dedicated thread (the engine's crash
@@ -230,7 +231,10 @@ void Submit(F&& fn, const TaskDesc& opts = {})
 
 // ---- Counters (the only synchronization primitive) -------------------------
 CounterHandle CreateCounter(int initial); // PoolConfig::maxCounters at once
-void           DestroyCounter(CounterHandle);  // asserts count == 0, no waiters
+// Asserts the count is zero and no task waits for it. A WaitFor that the
+// last signal woke may still be returning: it returns as if it had seen
+// zero, even once the entry is handed out to a new counter.
+void           DestroyCounter(CounterHandle);
 void           Signal(CounterHandle, int n = 1);
 // Raises a count that has not reached zero yet by n, for work that finds
 // more work as it runs (a tree walk, culling a bounding-volume hierarchy):
@@ -322,7 +326,8 @@ uint32_t      Limit(LimiterHandle);
 // [0, limit), the same for the whole run and different from every other task
 // of that limiter running at the same time, so it can pick one of `limit`
 // scratch buffers or staging slots without a lock. Indices are reused, the
-// most recently freed first (0 first while all are free), so the buffers in
+// most recently freed first (so on a new limiter 0 comes first, but not
+// necessarily later, once others have been freed since), so the buffers in
 // use stay few and warm. kNoUnit outside a limited task.
 // After the limit is lowered, a task over the new limit can get an index at
 // or above it (until enough tasks have finished); size buffers for the

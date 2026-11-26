@@ -861,6 +861,16 @@ static CounterState* ResolveCounter(PoolState& P, CounterHandle h)
 	return &c;
 }
 
+// Whether a counter a wait resolved is still the one its handle names. A
+// counter may be destroyed (once zero) while a woken waiter has yet to
+// return, and its entry handed out again: the waiter must not wait on the
+// new one. Read after an acquire load of the count, which a reused entry's
+// CreateCounter publishes with release after the destroy's generation bump.
+static bool StillCounter(const CounterState& c, CounterHandle h)
+{
+	return c.alive.load(std::memory_order_relaxed) && c.generation.load(std::memory_order_relaxed) == HandleGeneration(h);
+}
+
 // Handle -> state, or null, as ResolveCounter (limiter handles pack the same way).
 static LimiterState* ResolveLimiter(PoolState& P, LimiterHandle h)
 {
@@ -2677,14 +2687,16 @@ CounterHandle CreateCounter(int initial)
 	assert(initial >= 0 && initial < INT_MAX && "counter initial value out of range");
 	std::lock_guard<std::mutex> lock(P.counterMutex);
 	if (P.freeCounters.empty())
-		Fatal("the counter pool is exhausted: raise PoolConfig::maxCounters (every pending future and every waiting ParallelFor, sort, scan, pipeline and graph run holds one)");
+		Fatal("the counter pool is exhausted: raise PoolConfig::maxCounters, at most 1048575 (every pending future and every waiting ParallelFor, sort, scan, pipeline and graph run holds one)");
 	const uint32_t i = P.freeCounters.front();
 	P.freeCounters.pop_front();
 	CounterState& c = P.counters[i];
-	c.count.store(initial > 0 ? initial + 1 : 0, std::memory_order_relaxed);
 	c.failed.store(false, std::memory_order_relaxed); // (error was cleared by the destroy)
 	c.cancelled.store(false, std::memory_order_relaxed);
 	c.alive.store(true, std::memory_order_release);
+	// Last, with release: a late waiter of the entry's previous counter that
+	// reads this count also sees the generation it no longer matches.
+	c.count.store(initial > 0 ? initial + 1 : 0, std::memory_order_release);
 	// No generation bump here: the DESTROY path invalidates stale handles.
 	// Bumping on create too doubled the churn and overflowed the packed
 	// generation field under per-frame create/destroy cycles.
@@ -3036,7 +3048,7 @@ LimiterHandle CreateLimiter(uint32_t limit)
 	assert(limit >= 1 && limit < (uint32_t)INT_MAX && "limiter limit out of range");
 	std::lock_guard<std::mutex> lock(P.limiterMutex);
 	if (P.freeLimiters.empty())
-		Fatal("the limiter pool is exhausted: raise PoolConfig::maxLimiters");
+		Fatal("the limiter pool is exhausted: raise PoolConfig::maxLimiters, at most 65535");
 	const uint32_t i = P.freeLimiters.front();
 	P.freeLimiters.pop_front();
 	LimiterState& l = P.limiters[i];
@@ -3103,26 +3115,34 @@ void SetLimit(LimiterHandle h, uint32_t limit)
 		const uint32_t old = l->limit.load(std::memory_order_relaxed);
 		if (limit == old)
 			return;
-		l->limit.store(limit, std::memory_order_relaxed);
 		if (limit > old)
 		{
 			// The indices from old up are handed out lazily (TakeUnitIndex):
 			// a used one comes back to freeUnits only while below the limit,
 			// so those above `old` are all either held or never used yet.
+			// Room first, so a failed allocation changes nothing.
+			const uint32_t usedTop = std::min(limit, l->nextUnit);
+			if (usedTop > old)
+				l->freeUnits.reserve(l->freeUnits.size() + (usedTop - old));
 			raise = limit - old;
-			for (uint32_t u = old; u < limit && u < l->nextUnit; u++)
+			for (uint32_t u = old; u < usedTop; u++)
 				if (u >= l->unitInUse.size() || !l->unitInUse[u])
 					l->freeUnits.push_back(u);
 		}
 		else
 		{
-			// A free unit goes at once; a held one when its task gives it back.
-			for (uint32_t k = 0; k < old - limit; k++)
-				if (l->count.fetch_sub(1, std::memory_order_acq_rel) <= 0)
-					l->retiring.store(l->retiring.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+			// A free unit goes at once; a held one when its task gives it
+			// back. In one step, as that many single decrements would: those
+			// taken while the count was still above zero were free, the rest
+			// are a debt that finishing tasks pay.
+			const uint32_t lower = old - limit;
+			const int before = l->count.fetch_sub((int)lower, std::memory_order_acq_rel);
+			const uint32_t free = before > 0 ? std::min<uint32_t>(lower, (uint32_t)before) : 0;
+			l->retiring.store(l->retiring.load(std::memory_order_relaxed) + (lower - free), std::memory_order_relaxed);
 			l->freeUnits.erase(std::remove_if(l->freeUnits.begin(), l->freeUnits.end(), [&](uint32_t u) { return u >= limit; }),
 				l->freeUnits.end());
 		}
+		l->limit.store(limit, std::memory_order_relaxed);
 	}
 	// New units go out as finishing tasks' would: to a retiring debt, to a
 	// waiting task, or into the free count.
@@ -3212,7 +3232,7 @@ static bool HasEntryInRegion(PoolState& P, const std::deque<uint32_t>& q, uint16
 // whatever else this thread may run, re-checks, sleeps, and unregisters.
 // True when a waker took this thread off the idle list for pool work: that
 // wake is this thread's to use or to pass on.
-static bool SleepOnCounter(PoolState& P, CounterState& c, bool help, Deadline deadline)
+static bool SleepOnCounter(PoolState& P, CounterState& c, CounterHandle h, bool help, Deadline deadline)
 {
 	Waiter& w = t_Waiter;
 	w.isWorker = false;
@@ -3221,7 +3241,7 @@ static bool SleepOnCounter(PoolState& P, CounterState& c, bool help, Deadline de
 	w.word.store(kArmed, std::memory_order_relaxed);
 	{
 		std::lock_guard<std::mutex> lock(c.mutex);
-		if (c.count.load(std::memory_order_acquire) == 0)
+		if (c.count.load(std::memory_order_acquire) == 0 || !StillCounter(c, h))
 			return false;
 		w.threadIndex = CurrentThreadIndex();
 		c.waiters.push_back(&w);
@@ -3351,7 +3371,9 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 	// wait never needs to give up early.
 	bool reached = true;
 	bool wokenForWork = false;
-	while (c->count.load(std::memory_order_acquire) != 0)
+	// A counter destroyed once zero, while this wait had yet to return,
+	// counts as reached (StillCounter).
+	while (c->count.load(std::memory_order_acquire) != 0 && StillCounter(*c, h))
 	{
 		// Checked between tasks, never during one: a helped task can overrun.
 		if (deadline != kNoDeadline && std::chrono::steady_clock::now() >= deadline)
@@ -3359,7 +3381,7 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 			// The tasks this wait ran may be what was left: their signals
 			// count before it gives up.
 			FlushDeferredSignals(P, ctx);
-			reached = c->count.load(std::memory_order_acquire) == 0;
+			reached = c->count.load(std::memory_order_acquire) == 0 || !StillCounter(*c, h);
 			break;
 		}
 		if (help == Help::WhileWaiting && TryHelpIn(P, true, &wokenForWork))
@@ -3371,7 +3393,7 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 			FlushDeferredSignals(P, ctx);
 			continue;
 		}
-		if (SleepOnCounter(P, *c, help == Help::WhileWaiting, deadline))
+		if (SleepOnCounter(P, *c, h, help == Help::WhileWaiting, deadline))
 			wokenForWork = true;
 	}
 	// Never return to the caller holding signals: it may block on anything.
@@ -3388,7 +3410,7 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 		debug->waitingSince.store(outerSince, std::memory_order_relaxed);
 	}
 #if defined(__cpp_exceptions)
-	if (reached && c->failed.load(std::memory_order_acquire))
+	if (reached && c->failed.load(std::memory_order_acquire) && StillCounter(*c, h))
 	{
 		std::exception_ptr error;
 		{
