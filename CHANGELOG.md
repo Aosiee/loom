@@ -7,7 +7,7 @@ callers need to change anything.
 
 ## Updating from an older version
 
-Four releases changed things for existing callers. Updating from 0.9.0 to
+Five releases changed things for existing callers. Updating from 0.9.0 to
 any later version, check these:
 
 - 0.10.0: `Shutdown` drains every live task first, so it blocks until they
@@ -31,6 +31,76 @@ any later version, check these:
   `UnregisterDedicatedThread` waits for every task submitted to the
   thread, `ParkAll` refuses a second park and pool-thread callers, and
   `PumpMainThreadTasks` runs only on the main thread.
+- 0.20.3: more misuse ends the program, saying why, and so does running
+  out of memory inside loom's own bookkeeping (the list is in its entry
+  below). A Shutdown from another thread needs the main thread to only
+  pump from then on, and the default worker count follows the CPUs the
+  process may use.
+
+## 0.20.3 (2026-11-26): a second bug hunt, and running out of memory
+
+Fixes only. The ones that could hang, crash or lose work:
+
+- UnregisterDedicatedThread, and the moving `co_await` of a value that
+  cannot be copied, held back signals that other tasks waited on, so the
+  unregister never returned and the coroutine spun on a full core. The
+  moving `co_await` now suspends until the last continuation has read the
+  value. Unregistering a thread that takes pool work could also join it
+  while it was inside a pool task.
+- A helper woken for pool work could run work of its own first and keep
+  the wake, so the pool work waited with another helper asleep.
+- An isolated wait missed its own region's tasks when a thread outside
+  the region made them runnable, or when they sat below more than 64
+  other entries on its deque. Its waits on the main and dedicated threads
+  were also woken by every other region's work.
+- A worker feeding its own deque starved High work queued anywhere else,
+  and a Priority outside the enum wrote past an array.
+- A WaitFor woken by its counter's last signal could, once the counter
+  was destroyed and its entry reused, wait on the new counter.
+- Shutdown took a long task for a stuck one and dropped the main-thread
+  work it went on to submit. The Pool could be freed while the main
+  thread's pump still read it.
+- A Pool whose later worker failed to start called std::terminate, and a
+  dedicated thread or lane that failed to start left freed memory on the
+  park roster. A thread-local destructor that called loom leaked a thread
+  index each time, until PerThread ran out.
+- Running out of memory left loom broken almost anywhere: fork-joins
+  unwound while their tasks still ran, tasks were lost, locks stayed held
+  and ParallelSort lost its elements. A call now either throws with
+  nothing left behind or ends the program, saying where (rules.md has the
+  rule). `loom_faults`, a new test program, fails each allocation in turn.
+- A future made in a translation unit built with exceptions and read in
+  one built without them crashed: the two had different layouts.
+- 0.20.2's isolation of fork-joins 16 waits deep hung programs that
+  relied on helping. ParallelFor, the reductions, the scans and the sort
+  now run on the calling thread at that depth (the sort keeps the same
+  order of equal elements). Pipelines and graph runs isolate only from 64
+  waits deep.
+
+And smaller ones: lowering a limit took one step per unit removed (9 s
+from 2147483646 to 1); a SetLimit raise that could not allocate left the
+limit stored but not added; PumpMainThreadTasks ran a self-resubmitting
+task up to a million times in one call; a pinned pipeline stage ran most
+of the stream in one pump; a GCC LTO build with -Werror failed to link;
+the slot trampolines lacked std::launder; and tests/tsan.supp hid every
+race on malloc or free. The header, README and rules.md now say what the
+code does where they did not: the counter and limiter caps, no-pool
+calls, queue depths, static linking, and mixing exception modes.
+
+What existing callers may notice:
+
+- These now end the program in every build, with a message: a hook that
+  throws (a profiler hook, onThreadStart, a park wake); signalling a
+  counter past zero; submitting or waiting from a pool thread's
+  thread-local destructor; running out of memory in loom's own
+  bookkeeping. Pipeline and Promise misuse that called std::terminate now
+  prints why first.
+- A Shutdown from a thread other than the main one needs the main thread
+  to do nothing but pump from then on.
+- `PumpMainThreadTasks` runs only what was queued when it started.
+- The default worker count follows the CPUs the process may use (its
+  affinity mask and a cgroup's quota), not the machine's.
+- `CurrentThreadIndex` is no longer promised to be 0 on the main thread.
 
 ## 0.20.2 (2026-11-26): a bug hunt across the whole library
 
