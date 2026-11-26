@@ -5095,6 +5095,96 @@ TEST_CASE("loom: wakes — a dedicated thread woken for pool work that runs its 
 	}, 10000));
 }
 
+// ---- Isolated waits find their region's tasks ---------------------------------------
+
+static loom::CounterHandle s_IsoIo, s_IsoMine;
+static std::atomic<bool> s_IsoRan{ false };
+
+TEST_CASE("loom: Isolated — a region's task released by a thread outside the region reaches its wait")
+{
+	// The only worker waits inside Isolated for a task gated on an IO
+	// counter; the main thread signals it, pumps a frame loop and never
+	// helps. The released task must not sit on the main thread's deque,
+	// where the isolated wait cannot take it.
+	REQUIRE(!loom::HasActivePool());
+	CHECK(EndsWithin([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 1, .shutdownTimeoutMs = 500 });
+		s_IsoIo = loom::CreateCounter(1);
+		loom::ScopedCounter done(1);
+		loom::Submit([] {
+			loom::Isolated([] {
+				loom::ScopedCounter mine(1);
+				s_IsoMine = mine;
+				loom::Submit(loom::TaskDesc{ .fn = [](void*) {}, .signals = s_IsoMine, .waitsFor = s_IsoIo });
+				loom::WaitFor(mine);
+			});
+		}, { .signals = done });
+		std::this_thread::sleep_for(std::chrono::milliseconds(50)); // the worker is in its wait
+		loom::Signal(s_IsoIo);
+		while (loom::Count(done) != 0)
+		{
+			loom::PumpMainThreadTasks();
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		}
+		loom::DestroyCounter(s_IsoIo);
+	}, 5000));
+}
+
+TEST_CASE("loom: Isolated — a wait finds its region's task below many foreign entries in its own deque")
+{
+	// An inner region queues 100 fire-and-forget tasks above the outer
+	// region's task in the only worker's deque; the outer wait sets them all
+	// aside and runs its own.
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+	s_IsoRan = false;
+	loom::ScopedCounter outer(1);
+	loom::Submit([] {
+		loom::Isolated([] {
+			loom::ScopedCounter mine(1);
+			s_IsoMine = mine;
+			loom::Submit([] { s_IsoRan = true; }, { .signals = s_IsoMine });
+			loom::Isolated([] { for (int i = 0; i < 100; i++) loom::Submit([] {}); });
+			loom::WaitFor(mine);
+		});
+	}, { .signals = outer });
+	CHECK(loom::TryWaitFor(outer, 4000, loom::Help::BlockOnly));
+	CHECK(s_IsoRan.load());
+	loom::WaitFor(outer);
+}
+
+TEST_CASE("loom: Isolated — main-thread work of another region does not wake an isolated main-thread wait")
+{
+	// A worker outside the region streams main-thread tasks while the main
+	// thread waits in Isolated: each used to wake it to scan the whole queue.
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2, .maxTasks = 1u << 18 });
+	static std::atomic<bool> s_flooded, s_started;
+	s_flooded = false;
+	s_started = false;
+	loom::ScopedCounter flood(1);
+	loom::Submit([] {
+		while (!s_started) std::this_thread::yield();
+		for (int i = 0; i < 40000; i++)
+		{
+			loom::Submit([] {}, { .affinity = loom::Affinity::MainThread });
+			if (i % 16 == 0) std::this_thread::sleep_for(std::chrono::microseconds(20));
+		}
+		s_flooded = true;
+	}, { .signals = flood });
+	double cpu = 0;
+	loom::Isolated([&] {
+		loom::ScopedCounter regionDone(1);
+		loom::Submit([] { while (!s_flooded) std::this_thread::sleep_for(std::chrono::microseconds(100)); }, { .signals = regionDone });
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		s_started = true;
+		const double c0 = ThreadCpuMs();
+		loom::WaitFor(regionDone);
+		cpu = ThreadCpuMs() - c0;
+	});
+	CHECK(cpu < 40.0); // 100 ms and more when every submit woke it
+	loom::WaitFor(flood);
+	loom::PumpMainThreadTasks();
+}
+
 } // namespace
 
 }} // namespace loom::tests

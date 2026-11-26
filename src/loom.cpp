@@ -452,6 +452,7 @@ struct DedicatedState
 	std::deque<uint32_t>   queue;  // MPSC: anyone submits, only it pops
 	std::mutex             mutex;  // guards queue + waiter
 	Waiter*                waiter = nullptr; // set while the thread sleeps
+	uint16_t               waiterRegion = 0; // the isolated region it waits in (0: none)
 	std::atomic<bool>      stop{ false };
 	DedicatedId            id = {};
 	// Its CurrentThreadIndex, once the thread has started: the key of its
@@ -573,6 +574,9 @@ struct PoolState
 	alignas(64) std::mutex  injectMutex;
 	std::deque<uint32_t>    injectQueue[3]; // by Priority
 	std::atomic<int>        injectSize{ 0 }; // all three
+	// Isolated waits asleep, with their regions: a region's entry injected
+	// wakes its waits (they look for it here; they never steal).
+	std::vector<std::pair<Waiter*, uint16_t>> isolatedSleepers;
 
 	// High and Low entries queued anywhere (deques and injection): a search
 	// looks at those queues only when there is something in them, so Normal
@@ -595,6 +599,7 @@ struct PoolState
 	std::deque<uint32_t>    mainQueue;  // MPSC
 	std::mutex              mainMutex;  // guards mainQueue + mainWaiter
 	Waiter*                 mainWaiter = nullptr;
+	uint16_t                mainWaiterRegion = 0; // the isolated region it waits in (0: none)
 
 	std::mutex              dedicatedMutex;
 	std::vector<std::unique_ptr<DedicatedState>> dedicated;
@@ -726,6 +731,14 @@ static DedicatedState* CurrentDedicated() { return t_CurrentDedicated; }
 static bool DedicatedTakesPoolWork(const PoolState& P, const DedicatedState& d)
 {
 	return d.idle == DedicatedConfig::Idle::StealFromPool || P.workerCount == 0;
+}
+
+// Whether the calling thread may run pool (AnyWorker) tasks: every thread
+// but a dedicated thread that does not take pool work (a Sleep one, a lane).
+static bool MayRunPoolWork(const PoolState& P)
+{
+	const DedicatedState* d = CurrentDedicated();
+	return !d || DedicatedTakesPoolWork(P, *d);
 }
 
 // Counts a task submitted to dedicated thread `id` (see addressed). A thread
@@ -1555,6 +1568,38 @@ static uint32_t PopInjected(PoolState& P, Priority priority)
 	return slot;
 }
 
+// Under injectMutex: an injected entry of this isolated region, or the end.
+static bool InjectedInRegion(PoolState& P, uint16_t region, int& priority, std::deque<uint32_t>::iterator& at)
+{
+	for (priority = 0; priority < 3; priority++)
+	{
+		auto& q = P.injectQueue[priority];
+		for (at = q.begin(); at != q.end(); ++at)
+			if (Slot(P, *at & ~kGroupBit).isolation == region)
+				return true;
+	}
+	return false;
+}
+
+// The oldest injected entry of an isolated region, High first: an isolated
+// wait finds its region's tasks here when they became runnable on a thread
+// outside it (see PushPool).
+static uint32_t PopInjectedInRegion(PoolState& P, uint16_t region)
+{
+	if (P.injectSize.load(std::memory_order_seq_cst) <= 0)
+		return kNoSlot;
+	std::lock_guard<std::mutex> lock(P.injectMutex);
+	int priority = 0;
+	std::deque<uint32_t>::iterator at;
+	if (!InjectedInRegion(P, region, priority, at))
+		return kNoSlot;
+	const uint32_t slot = *at;
+	P.injectQueue[priority].erase(at);
+	P.injectSize.fetch_sub(1, std::memory_order_relaxed);
+	NoteTaken(P, (Priority)priority);
+	return slot;
+}
+
 // The injection queue, then every other thread's deque of this priority,
 // from a random victim.
 static uint32_t StealAt(PoolState& P, WorkerCtx* self, Priority priority, size_t start)
@@ -1705,6 +1750,13 @@ static void PushPool(PoolState& P, uint32_t entry, WorkerCtx* ctx)
 		P.queuedHigh.fetch_add(1, std::memory_order_relaxed);
 	else if (priority == Priority::Low)
 		P.queuedLow.fetch_add(1, std::memory_order_relaxed);
+	// An isolated region's task made runnable by a thread outside the region
+	// (its counter's last signal, or a limiter's unit handed on) goes to the
+	// injection queue, not that thread's deque: a wait isolated to the region
+	// never steals, so it could not take it from there.
+	const uint16_t region = P.workerCount > 0 ? Slot(P, entry & ~kGroupBit).isolation : 0;
+	if (ctx && region != 0 && region != t_Isolation)
+		ctx = nullptr;
 	if (ctx)
 	{
 		DequeFor(*ctx, priority).Push(entry);
@@ -1713,6 +1765,19 @@ static void PushPool(PoolState& P, uint32_t entry, WorkerCtx* ctx)
 	std::lock_guard<std::mutex> lock(P.injectMutex);
 	P.injectQueue[(int)priority].push_back(entry);
 	P.injectSize.fetch_add(1, std::memory_order_seq_cst);
+	if (region != 0)
+	{
+		for (size_t i = 0; i < P.isolatedSleepers.size();)
+		{
+			if (P.isolatedSleepers[i].second == region)
+			{
+				Wake(*P.isolatedSleepers[i].first, kWokeRecheck);
+				P.isolatedSleepers.erase(P.isolatedSleepers.begin() + (ptrdiff_t)i);
+			}
+			else
+				i++;
+		}
+	}
 }
 
 // Makes a slot runnable. True for AnyWorker work (the caller then wakes a
@@ -1732,7 +1797,9 @@ static bool EnqueueSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 			P.mainQueue.push_front(slot);
 		else
 			P.mainQueue.push_back(slot);
-		if (P.mainWaiter)
+		// A wait isolated to a region wakes only for that region's work: any
+		// other entry is not its to run.
+		if (P.mainWaiter && (P.mainWaiterRegion == 0 || P.mainWaiterRegion == t.isolation))
 		{
 			Wake(*P.mainWaiter, kWokeRecheck);
 			P.mainWaiter = nullptr;
@@ -1754,7 +1821,7 @@ static bool EnqueueSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 			d->queue.push_front(slot);
 		else
 			d->queue.push_back(slot);
-		if (d->waiter)
+		if (d->waiter && (d->waiterRegion == 0 || d->waiterRegion == t.isolation))
 		{
 			Wake(*d->waiter, kWokeRecheck);
 			d->waiter = nullptr;
@@ -3151,6 +3218,7 @@ static bool SleepOnCounter(PoolState& P, CounterState& c, bool help, Deadline de
 		else
 		{
 			P.mainWaiter = &w;
+			P.mainWaiterRegion = region;
 			inMain = true;
 		}
 	}
@@ -3162,7 +3230,23 @@ static bool SleepOnCounter(PoolState& P, CounterState& c, bool help, Deadline de
 		else
 		{
 			d->waiter = &w;
+			d->waiterRegion = region;
 			inDedicated = true;
+		}
+	}
+	// An isolated wait also takes its region's injected entries.
+	bool inIsolated = false;
+	if (!ready && region != 0 && MayRunPoolWork(P))
+	{
+		std::lock_guard<std::mutex> lock(P.injectMutex);
+		int priority = 0;
+		std::deque<uint32_t>::iterator at;
+		if (InjectedInRegion(P, region, priority, at))
+			ready = true;
+		else
+		{
+			P.isolatedSleepers.emplace_back(&w, region);
+			inIsolated = true;
 		}
 	}
 	// An isolated wait takes no pool work, so new pool work need not wake it.
@@ -3197,6 +3281,11 @@ static bool SleepOnCounter(PoolState& P, CounterState& c, bool help, Deadline de
 		std::lock_guard<std::mutex> lock(d->mutex);
 		if (d->waiter == &w)
 			d->waiter = nullptr;
+	}
+	if (inIsolated)
+	{
+		std::lock_guard<std::mutex> lock(P.injectMutex);
+		std::erase(P.isolatedSleepers, std::pair<Waiter*, uint16_t>(&w, region));
 	}
 	return inIdle && !UnregisterIdle(P, w);
 }
@@ -3338,10 +3427,11 @@ static uint32_t PopFrontInRegion(PoolState& P, std::mutex& m, std::deque<uint32_
 // where the other workers take them: an isolated wait never runs them.
 static uint32_t PopOwnInRegion(PoolState& P, WorkerCtx& ctx, uint16_t region)
 {
-	// Bounded, so a wait never spends long moving foreign work about. Past
-	// that, it leaves the rest to the other workers (who may steal the
-	// region's tasks) and sleeps.
-	for (int moved = 0; moved < 64; moved++)
+	// Until the deques are empty: the wait sleeps on its counter and the
+	// injection queue only, so a task of its region left here, below
+	// foreign entries, would wait for some other thread to steal it. Each
+	// foreign entry moves once.
+	for (;;)
 	{
 		uint32_t entry = PopOwn(P, ctx);
 		if (entry == kNoSlot && (entry = ctx.low.Pop()) != kNoSlot)
@@ -3353,7 +3443,6 @@ static uint32_t PopOwnInRegion(PoolState& P, WorkerCtx& ctx, uint16_t region)
 		PushPool(P, entry, nullptr);
 		WakeForWork(P, 1);
 	}
-	return kNoSlot;
 }
 
 // One task for a waiting (or explicitly helping) thread. Sources in order:
@@ -3381,6 +3470,8 @@ static bool TryHelpIn(PoolState& P, bool markHelping, bool* poolWake)
 			slot = PopFrontInRegion(P, d->mutex, d->queue, region);
 		if (slot == kNoSlot && ctx)
 			slot = PopOwnInRegion(P, *ctx, region);
+		if (slot == kNoSlot)
+			slot = MayRunPoolWork(P) ? PopInjectedInRegion(P, region) : kNoSlot;
 	}
 	else if (ctx && ctx->isMain)
 	{
@@ -3966,7 +4057,10 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 			std::lock_guard<std::mutex> lock(d.mutex);
 			ready = !d.queue.empty() || d.stop.load() || P.parkRequested.load(std::memory_order_seq_cst);
 			if (!ready)
+			{
 				d.waiter = &w;
+				d.waiterRegion = 0;
+			}
 		}
 		bool inIdle = false;
 		if (!ready && steals)

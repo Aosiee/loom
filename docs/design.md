@@ -346,9 +346,11 @@ it is never woken after it has moved on.
   leave its wait without using the wake (its counter reached zero first, or
   it ran one task of several); it then wakes the next sleeper if pool work
   is still queued, as the last searcher does, so the work never waits for a
-  wake that went to a thread that is gone. An isolated wait counts only its
+  wake that went to a thread that is gone. A helper woken for pool work that
+  takes main-thread or dedicated work first passes the wake on before it
+  runs that, since it may be long or block. An isolated wait counts only its
   own region's entries in its main-thread or dedicated queue as work: an
-  entry of another region there is no reason to stay awake.
+  entry of another region there is no reason to stay awake, or to wake it.
 
 The lost-wakeup pair: a sleeper bumps the idle count (a seq_cst
 read-modify-write) and then re-checks the queues; a submitter pushes (a
@@ -377,12 +379,18 @@ Isolation).
 duration of `fn`. Every task records the tag of the thread that submitted
 it, and a thread running a task takes that task's tag, so a region's tasks
 and their descendants share it. A wait whose thread has a tag helps only
-with tasks of that tag, and only from its own queues: entries of other
-regions it pops are pushed to the injection queue for the other workers, and
-it never steals. It sleeps registered on its counter (and its main-thread or
-dedicated queue) but not as a helper for pool work, since none would be its
-own. Without workers a region does not isolate: no other thread could run
-the work it would set aside.
+with tasks of that tag, from its own queues and the injection queue: entries
+of other regions it pops from its own deques are pushed to the injection
+queue for the other workers (all of them, so none of its own is left below),
+and it never steals. A region's task made runnable by a thread outside the
+region (the last signal of its counter, a limiter's unit handed on) goes to
+the injection queue rather than that thread's deque, where the region's wait
+could not take it. The wait sleeps registered on its counter, on its
+main-thread or dedicated queue (woken only for its region's entries there),
+and on a list of isolated sleepers that an injected entry of its region
+wakes; not as a helper for pool work, since most of it would not be its own.
+Without workers a region does not isolate: no other thread could run the
+work it would set aside.
 
 ### Bounded nesting
 
