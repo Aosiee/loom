@@ -994,7 +994,7 @@ static void     ReleaseRunningUnit(PoolState& P, WorkerCtx* ctx);
 static void     SignalCounter(PoolState& P, CounterHandle h, int n);
 static void     FlushDeferredSignals(PoolState& P, WorkerCtx* ctx);
 static void     WakeForWork(PoolState& P, size_t n);
-static bool     TryHelpIn(PoolState& P, bool markHelping = false);
+static bool     TryHelpIn(PoolState& P, bool markHelping = false, bool* poolWake = nullptr);
 // Who is parking: a worker or a dedicated thread names its round field and
 // its stop flag (it leaves the park once that is set); a participant neither.
 struct ParkSelf
@@ -3245,7 +3245,7 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 			reached = c->count.load(std::memory_order_acquire) == 0;
 			break;
 		}
-		if (help == Help::WhileWaiting && TryHelpIn(P, true))
+		if (help == Help::WhileWaiting && TryHelpIn(P, true, &wokenForWork))
 			continue;
 		// Nothing to run: apply what helping deferred, then re-check before
 		// sleeping (it may have been the last of this counter's signals).
@@ -3361,7 +3361,11 @@ static uint32_t PopOwnInRegion(PoolState& P, WorkerCtx& ctx, uint16_t region)
 // steal. An isolated wait narrows all of that to its region, and never steals.
 // markHelping: a WaitFor's help, which the profiler sees as helping (1)
 // while the task runs and waiting (0) again after it.
-static bool TryHelpIn(PoolState& P, bool markHelping)
+// poolWake: whether this thread was woken for pool work it has not run yet.
+// If it takes main-thread or dedicated work first, it passes that wake on
+// before it runs it (the task may block), so the pool work goes to another
+// sleeper instead of waiting for this one.
+static bool TryHelpIn(PoolState& P, bool markHelping, bool* poolWake)
 {
 	if (P.stop.load(std::memory_order_relaxed)) return false; // the workers are going
 
@@ -3391,6 +3395,12 @@ static bool TryHelpIn(PoolState& P, bool markHelping)
 		// it waits in a pool with no workers: nobody else would.
 		if (slot == kNoSlot && !DedicatedTakesPoolWork(P, *d))
 			return false;
+	}
+	if (slot != kNoSlot && poolWake && *poolWake)
+	{
+		*poolWake = false;
+		if (HasPoolWork(P))
+			WakeForWork(P, 1);
 	}
 	if (slot == kNoSlot && ctx && !ActiveIsolation(P))
 		slot = PopOwn(P, *ctx);
@@ -3915,6 +3925,7 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 	SetOsThreadName(d.name.c_str());
 	const bool steals = d.idle == DedicatedConfig::Idle::StealFromPool;
 	Waiter& w = t_Waiter;
+	bool poolWake = false; // see TryHelpIn
 	for (;;)
 	{
 		if (P.parkRequested.load(std::memory_order_acquire) && !d.stop.load(std::memory_order_acquire))
@@ -3923,6 +3934,11 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 			continue;
 		}
 		uint32_t slot = PopFront(d.mutex, d.queue);
+		// Woken for pool work but taking its own first: pass that wake on
+		// before running it (it may be long, or block), as a helper does.
+		if (slot != kNoSlot && poolWake && HasPoolWork(P))
+			WakeForWork(P, 1);
+		poolWake = false;
 		if (slot == kNoSlot && steals)
 			slot = StealOnce(P, nullptr);
 		if (slot != kNoSlot)
@@ -3970,8 +3986,10 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 			if (d.waiter == &w)
 				d.waiter = nullptr;
 		}
+		// False when a waker took this thread off the idle list: a wake for
+		// pool work, this thread's to use or to pass on.
 		if (inIdle)
-			UnregisterIdle(P, w);
+			poolWake = !UnregisterIdle(P, w);
 	}
 	t_CurrentDedicated = nullptr;
 	t_ThreadStats = nullptr;

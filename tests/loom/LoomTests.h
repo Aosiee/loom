@@ -5022,6 +5022,79 @@ TEST_CASE("loom: coroutines — a moving co_await suspends while continuations h
 }
 #endif
 
+// ---- A wake for pool work reaches a thread that runs it ------------------------------
+
+static loom::CounterHandle s_WakeX, s_WakeA;
+
+TEST_CASE("loom: wakes — a main thread woken for pool work that runs main-thread work first passes the wake on")
+{
+	// The main thread, asleep in a helping wait, is the newest helper on the
+	// idle list; a StealFromPool dedicated thread is the other. One batch
+	// queues a main-thread task that blocks on X, then X: the wake for X goes
+	// to the main thread, whose help takes the main-thread task first.
+	REQUIRE(!loom::HasActivePool());
+	CHECK(EndsWithin([] {
+		for (int round = 0; round < 5; round++)
+		{
+			loom::Pool pool(loom::PoolConfig{ .workerCount = 0, .shutdownTimeoutMs = 200 });
+			const loom::DedicatedId d = loom::RegisterDedicatedThread({ .name = "D", .idle = loom::DedicatedConfig::Idle::StealFromPool });
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+			s_WakeX = loom::CreateCounter(1);
+			s_WakeA = loom::CreateCounter(1);
+			std::thread outside([] {
+				std::this_thread::sleep_for(std::chrono::milliseconds(20));
+				loom::TaskDesc both[2];
+				both[0] = loom::TaskDesc{ .fn = [](void*) { loom::WaitFor(s_WakeX, loom::Help::BlockOnly); },
+					.affinity = loom::Affinity::MainThread, .signals = s_WakeA };
+				both[1] = loom::TaskDesc{ .fn = [](void*) {}, .signals = s_WakeX };
+				loom::Submit(std::span<const loom::TaskDesc>(both, 2));
+			});
+			loom::WaitFor(s_WakeA);
+			outside.join();
+			loom::UnregisterDedicatedThread(d);
+			loom::DestroyCounter(s_WakeX);
+			loom::DestroyCounter(s_WakeA);
+		}
+	}, 10000));
+}
+
+TEST_CASE("loom: wakes — a dedicated thread woken for pool work that runs its own task first passes the wake on")
+{
+	// The same through a StealFromPool dedicated thread: it is the newest
+	// helper, the wake for X goes to it, and it runs a task of its own queue
+	// that blocks on X. The main thread, asleep helping, could run X.
+	REQUIRE(!loom::HasActivePool());
+	CHECK(EndsWithin([] {
+		for (int round = 0; round < 5; round++)
+		{
+			loom::Pool pool(loom::PoolConfig{ .workerCount = 0, .shutdownTimeoutMs = 200 });
+			const loom::DedicatedId d = loom::RegisterDedicatedThread({ .name = "D", .idle = loom::DedicatedConfig::Idle::StealFromPool });
+			s_WakeX = loom::CreateCounter(1);
+			std::atomic<bool> yDone{ false };
+			std::thread outside([d, &yDone] {
+				std::this_thread::sleep_for(std::chrono::milliseconds(20));
+				loom::ScopedCounter z(1);
+				loom::Submit([] {}, loom::TaskDesc{ .affinity = loom::Affinity::Dedicated, .thread = d, .signals = z });
+				loom::WaitFor(z, loom::Help::BlockOnly); // D slept again after the main thread
+				std::this_thread::sleep_for(std::chrono::milliseconds(20));
+				loom::TaskDesc both[2];
+				both[0] = loom::TaskDesc{ .fn = [](void* done) {
+					loom::WaitFor(s_WakeX, loom::Help::BlockOnly);
+					static_cast<std::atomic<bool>*>(done)->store(true);
+				}, .userData = &yDone, .affinity = loom::Affinity::Dedicated, .thread = d };
+				both[1] = loom::TaskDesc{ .fn = [](void*) {}, .signals = s_WakeX };
+				loom::Submit(std::span<const loom::TaskDesc>(both, 2));
+			});
+			loom::WaitFor(s_WakeX);
+			outside.join();
+			while (!yDone)
+				loom::TryHelp();
+			loom::UnregisterDedicatedThread(d);
+			loom::DestroyCounter(s_WakeX);
+		}
+	}, 10000));
+}
+
 } // namespace
 
 }} // namespace loom::tests
