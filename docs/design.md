@@ -333,7 +333,14 @@ it is never woken after it has moved on.
 - A helper asleep in `WaitFor` registers on the counter, in the idle list
   (when it may run pool work), and on the main-thread queue (the main
   thread) or its dedicated queue (a dedicated thread). Whichever comes first,
-  zero or eligible work, wakes it; there is no polling.
+  zero or eligible work, wakes it; there is no polling. A submit wakes idle
+  workers first and helpers for the rest. A helper woken for pool work may
+  leave its wait without using the wake (its counter reached zero first, or
+  it ran one task of several); it then wakes the next sleeper if pool work
+  is still queued, as the last searcher does, so the work never waits for a
+  wake that went to a thread that is gone. An isolated wait counts only its
+  own region's entries in its main-thread or dedicated queue as work: an
+  entry of another region there is no reason to stay awake.
 
 The lost-wakeup pair: a sleeper bumps the idle count (a seq_cst
 read-modify-write) and then re-checks the queues; a submitter pushes (a

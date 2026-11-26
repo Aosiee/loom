@@ -19,6 +19,7 @@
 #include <random>
 #include <set>
 #include <cstring>
+#include <ctime>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -2768,6 +2769,93 @@ TEST_CASE("loom: Shutdown — the drain never sees zero while a task is live")
 	}
 	CHECK(shutdown_drain::mainRan.load() == shutdown_drain::mainSubmitted.load());
 	CHECK(shutdown_drain::mainSubmitted.load() == 1200);
+}
+
+namespace helper_wake {
+	loom::CounterHandle c1, c2, cX;
+}
+
+TEST_CASE("loom: wakes — a wake for pool work that a waiting thread does not use is passed on")
+{
+	using namespace std::chrono_literals;
+	using namespace helper_wake;
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+	c1 = loom::CreateCounter(1);
+	c2 = loom::CreateCounter(1);
+	cX = loom::CreateCounter(1);
+	// X on the worker waits (helping) for c1, which only B signals.
+	loom::Submit([] { loom::WaitFor(c1); }, loom::TaskDesc{ .signals = cX });
+	std::this_thread::sleep_for(100ms); // the worker is asleep inside its wait
+	std::thread outside([] {
+		std::this_thread::sleep_for(100ms); // main is asleep in WaitFor(c2)
+		loom::TaskDesc d[2];
+		d[0].fn = [](void*) { loom::Signal(c2); }; // A ends main's wait itself
+		d[1].fn = [](void*) {};                    // B is what the worker waits for
+		d[1].signals = c1;
+		loom::Submit(std::span<const loom::TaskDesc>(d, 2));
+	});
+	loom::WaitFor(c2); // woken for the pair, runs A and returns
+	outside.join();
+	// The worker must have been woken for B: main does not help here.
+	CHECK(loom::TryWaitFor(cX, 3000, loom::Help::BlockOnly));
+	loom::WaitFor(cX);
+	loom::DestroyCounter(c1);
+	loom::DestroyCounter(c2);
+	loom::DestroyCounter(cX);
+}
+
+#if defined(__linux__)
+static double ThreadCpuMs()
+{
+	timespec ts{};
+	clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+	return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+TEST_CASE("loom: Isolated — a wait sleeps while another region's task sits in its own queue")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
+	const loom::DedicatedId io = loom::RegisterDedicatedThread({ .name = "io" });
+	loom::ScopedCounter foreignDone(1);
+	// A main-thread task from outside the region; nothing runs it until later.
+	loom::Submit([] {}, loom::TaskDesc{ .affinity = loom::Affinity::MainThread, .signals = foreignDone });
+	double cpu = 0;
+	loom::Isolated([&] {
+		loom::ScopedCounter mine(1);
+		loom::Submit([] { std::this_thread::sleep_for(std::chrono::milliseconds(300)); },
+			loom::TaskDesc{ .affinity = loom::Affinity::Dedicated, .thread = io, .signals = mine });
+		const double c0 = ThreadCpuMs();
+		loom::WaitFor(mine);
+		cpu = ThreadCpuMs() - c0;
+	});
+	CHECK(loom::Count(foreignDone) == 1); // the region's wait left it alone
+	CHECK(cpu < 100.0);                   // and slept, rather than spinning for 300 ms
+	loom::WaitFor(foreignDone);
+	loom::UnregisterDedicatedThread(io);
+}
+#endif
+
+TEST_CASE("loom: no workers — a dedicated thread's fork-join runs its own chunks")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 0 });
+	const loom::DedicatedId io = loom::RegisterDedicatedThread({ .name = "io" });
+	std::atomic<long> sum{ 0 };
+	std::vector<int> v(5000);
+	std::iota(v.begin(), v.end(), 0);
+	loom::ScopedCounter done(1);
+	loom::Submit([&] {
+		loom::ParallelFor(0, 1000, [&](size_t b, size_t e) {
+			for (size_t i = b; i < e; i++)
+				sum += (long)i;
+		});
+		loom::ParallelSort(v.begin(), v.end(), std::greater<int>());
+	}, loom::TaskDesc{ .affinity = loom::Affinity::Dedicated, .thread = io, .signals = done });
+	// Without helping: the main thread runs none of the chunks.
+	CHECK(loom::TryWaitFor(done, 5000, loom::Help::BlockOnly));
+	loom::WaitFor(done);
+	CHECK(sum.load() == 499500);
+	CHECK(std::is_sorted(v.begin(), v.end(), std::greater<int>()));
+	loom::UnregisterDedicatedThread(io);
 }
 
 TEST_CASE("loom: thread indices — given back when a thread exits, and taken again")

@@ -1675,6 +1675,10 @@ void PumpMainThreadTasks();
 struct DedicatedConfig
 {
 	const char* name = nullptr; // thread + profiler name
+	// Sleep: the thread runs only its own queue, and sleeps when it is empty.
+	// StealFromPool: it also runs pool work when its queue is empty. Either
+	// way, in a pool with no workers its waits run pool work (a ParallelFor
+	// it starts, say), since nobody else would.
 	enum class Idle : uint8_t { Sleep, StealFromPool };
 	Idle idle = Idle::Sleep;
 };

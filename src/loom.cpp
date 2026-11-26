@@ -676,6 +676,13 @@ static WorkerCtx* CurrentCtx(PoolState& P)
 
 static DedicatedState* CurrentDedicated() { return t_CurrentDedicated; }
 
+// Whether a dedicated thread runs pool work: when it is set to steal it, and
+// in a pool with no workers, where nobody else would run what it waits for.
+static bool DedicatedTakesPoolWork(const PoolState& P, const DedicatedState& d)
+{
+	return d.idle == DedicatedConfig::Idle::StealFromPool || P.workerCount == 0;
+}
+
 // The calling thread's debug record: a pool thread's own, the main
 // thread's, or none (a thread outside the pool shows up only as a sleeper
 // on the counters it waits for).
@@ -1527,8 +1534,9 @@ static bool UnregisterIdle(PoolState& P, Waiter& w)
 	return true;
 }
 
-// Wakes up to `max` idle workers (each counted as searching before it wakes),
-// or one sleeping helper when no worker is idle.
+// Wakes up to `max` sleepers: idle workers first (each counted as searching
+// before it wakes), then helpers (threads asleep in a wait that may run pool
+// work) for the rest.
 static void WakeIdle(PoolState& P, int max, bool onlyIfNoSearcher)
 {
 	std::lock_guard<std::mutex> lock(P.idleMutex);
@@ -1547,12 +1555,13 @@ static void WakeIdle(PoolState& P, int max, bool onlyIfNoSearcher)
 		Wake(*w, kWokeSearching);
 		woken++;
 	}
-	if (woken == 0 && !P.idle.empty())
+	while (woken < max && !P.idle.empty())
 	{
-		Waiter* w = P.idle.back();
+		Waiter* w = P.idle.back(); // only helpers are left
 		P.idle.pop_back();
 		P.numIdle.fetch_sub(1, std::memory_order_seq_cst);
 		Wake(*w, kWokeRecheck);
+		woken++;
 	}
 }
 
@@ -2900,9 +2909,22 @@ int Count(CounterHandle h)
 	return v > 1 ? v - 1 : v;
 }
 
+// Under q's lock: whether a wait in `region` (0: none) could run anything in q.
+static bool HasEntryInRegion(PoolState& P, const std::deque<uint32_t>& q, uint16_t region)
+{
+	if (region == 0)
+		return !q.empty();
+	for (uint32_t slot : q)
+		if (Slot(P, slot).isolation == region)
+			return true;
+	return false;
+}
+
 // One sleep of a WaitFor: registers on the counter, and (when helping) on
 // whatever else this thread may run, re-checks, sleeps, and unregisters.
-static void SleepOnCounter(PoolState& P, CounterState& c, bool help, Deadline deadline)
+// True when a waker took this thread off the idle list for pool work: that
+// wake is this thread's to use or to pass on.
+static bool SleepOnCounter(PoolState& P, CounterState& c, bool help, Deadline deadline)
 {
 	Waiter& w = t_Waiter;
 	w.isWorker = false;
@@ -2912,7 +2934,7 @@ static void SleepOnCounter(PoolState& P, CounterState& c, bool help, Deadline de
 	{
 		std::lock_guard<std::mutex> lock(c.mutex);
 		if (c.count.load(std::memory_order_acquire) == 0)
-			return;
+			return false;
 		w.threadIndex = CurrentThreadIndex();
 		c.waiters.push_back(&w);
 	}
@@ -2921,14 +2943,17 @@ static void SleepOnCounter(PoolState& P, CounterState& c, bool help, Deadline de
 	// source after registering on it. One Waiter serves every list; a second
 	// waker before we unregister only sets the word again, which is harmless.
 
+	// An isolated wait runs only its region's entries of its own queues, so
+	// another region's entry there is no reason to stay awake.
 	bool ready = false;
 	bool inMain = false, inIdle = false;
 	DedicatedState* d = help ? CurrentDedicated() : nullptr;
 	bool inDedicated = false;
+	const uint16_t region = ActiveIsolation(P);
 	if (!ready && help && std::this_thread::get_id() == P.mainThreadId)
 	{
 		std::lock_guard<std::mutex> lock(P.mainMutex);
-		if (!P.mainQueue.empty())
+		if (HasEntryInRegion(P, P.mainQueue, region))
 			ready = true;
 		else
 		{
@@ -2939,7 +2964,7 @@ static void SleepOnCounter(PoolState& P, CounterState& c, bool help, Deadline de
 	if (!ready && d)
 	{
 		std::lock_guard<std::mutex> lock(d->mutex);
-		if (!d->queue.empty())
+		if (HasEntryInRegion(P, d->queue, region))
 			ready = true;
 		else
 		{
@@ -2948,7 +2973,7 @@ static void SleepOnCounter(PoolState& P, CounterState& c, bool help, Deadline de
 		}
 	}
 	// An isolated wait takes no pool work, so new pool work need not wake it.
-	const bool poolEligible = help && (!d || d->idle == DedicatedConfig::Idle::StealFromPool) && !ActiveIsolation(P);
+	const bool poolEligible = help && (!d || DedicatedTakesPoolWork(P, *d)) && region == 0;
 	if (!ready && poolEligible)
 	{
 		RegisterIdle(P, w);
@@ -2980,8 +3005,7 @@ static void SleepOnCounter(PoolState& P, CounterState& c, bool help, Deadline de
 		if (d->waiter == &w)
 			d->waiter = nullptr;
 	}
-	if (inIdle)
-		UnregisterIdle(P, w);
+	return inIdle && !UnregisterIdle(P, w);
 }
 
 // WaitFor and TryWaitFor. True when the count reached zero (and then
@@ -3016,6 +3040,7 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 	// Untimed, until zero: Shutdown drains before it stops anything, so a
 	// wait never needs to give up early.
 	bool reached = true;
+	bool wokenForWork = false;
 	while (c->count.load(std::memory_order_acquire) != 0)
 	{
 		// Checked between tasks, never during one: a helped task can overrun.
@@ -3036,10 +3061,16 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 			FlushDeferredSignals(P, ctx);
 			continue;
 		}
-		SleepOnCounter(P, *c, help == Help::WhileWaiting, deadline);
+		if (SleepOnCounter(P, *c, help == Help::WhileWaiting, deadline))
+			wokenForWork = true;
 	}
 	// Never return to the caller holding signals: it may block on anything.
 	FlushDeferredSignals(P, ctx);
+	// A wake for pool work that this wait took and may not have used (its
+	// counter reached zero first, or it ran one task of several): pass it on,
+	// as a worker that finds work does, or that work waits for the next wake.
+	if (wokenForWork && HasPoolWork(P))
+		WakeForWork(P, 1);
 	MarkProfilerState(P, threadIndex, 2); // wait over
 	if (debug)
 	{
@@ -3161,7 +3192,9 @@ static bool TryHelpIn(PoolState& P)
 	else if (DedicatedState* d = CurrentDedicated())
 	{
 		slot = PopFront(d->mutex, d->queue);
-		if (slot == kNoSlot && d->idle != DedicatedConfig::Idle::StealFromPool)
+		// A dedicated thread that does not take pool work still runs it while
+		// it waits in a pool with no workers: nobody else would.
+		if (slot == kNoSlot && !DedicatedTakesPoolWork(P, *d))
 			return false;
 	}
 	if (slot == kNoSlot && ctx && !ActiveIsolation(P))
