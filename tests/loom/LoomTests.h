@@ -2677,6 +2677,43 @@ TEST_CASE("loom: per-thread storage — move-only, over-aligned, threads outside
 	}
 }
 
+namespace shutdown_drain {
+	std::atomic<long> mainSubmitted{ 0 }, mainRan{ 0 };
+	void MainFinal(void*) { mainRan++; }
+	void Noop(void*) {}
+	// A chain of tasks, each submitting a few quick siblings (whose live counts
+	// move between the threads' shards) and the next step; the last one queues
+	// work for the main thread.
+	void Step(void* p)
+	{
+		const uintptr_t k = (uintptr_t)p;
+		if (k == 0)
+		{
+			mainSubmitted++;
+			loom::Submit(loom::TaskDesc{ .fn = &MainFinal, .affinity = loom::Affinity::MainThread });
+			return;
+		}
+		for (int i = 0; i < 3; i++)
+			loom::Submit(loom::TaskDesc{ .fn = &Noop });
+		loom::Submit(loom::TaskDesc{ .fn = &Step, .userData = (void*)(k - 1) });
+	}
+}
+
+TEST_CASE("loom: Shutdown — the drain never sees zero while a task is live")
+{
+	shutdown_drain::mainSubmitted = 0;
+	shutdown_drain::mainRan = 0;
+	for (int round = 0; round < 300; round++)
+	{
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 8 });
+		for (int c = 0; c < 4; c++)
+			loom::Submit(loom::TaskDesc{ .fn = &shutdown_drain::Step, .userData = (void*)(uintptr_t)(200 + round % 50) });
+		// ~Pool drains: every chain's main-thread task must run.
+	}
+	CHECK(shutdown_drain::mainRan.load() == shutdown_drain::mainSubmitted.load());
+	CHECK(shutdown_drain::mainSubmitted.load() == 1200);
+}
+
 TEST_CASE("loom: thread indices — given back when a thread exits, and taken again")
 {
 	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });

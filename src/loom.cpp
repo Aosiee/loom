@@ -441,14 +441,24 @@ struct DedicatedState
 
 // ---- Per-thread scheduler state (the main thread and each worker) ------------------
 
+// One shard of the live-task count. Two totals that only grow, rather than
+// one count that goes up and down, so that a reader adding up the shards one
+// after another can never come out low (see LiveTasksIn).
+struct LiveCounts
+{
+	std::atomic<uint64_t> submitted{ 0 };
+	std::atomic<uint64_t> finished{ 0 };
+};
+
 struct alignas(64) WorkerCtx
 {
 	WorkDeque deque; // Normal priority (and every group)
 	WorkDeque high;
 	WorkDeque low;
-	// This thread's share of the live-task count: +1 per task it submits, -1
-	// per task it finishes. Only the owner writes it; LiveTaskCount sums them.
-	alignas(64) std::atomic<int64_t> live{ 0 };
+	// This thread's share of the live-task count: the tasks it has submitted
+	// and the tasks it has finished, both only ever growing. Only the owner
+	// writes them; LiveTasksIn sums them.
+	alignas(64) LiveCounts live;
 	// xorshift state for picking a first steal victim. Seeded per worker so
 	// the thieves start their scans at different deques.
 	uint32_t rng = 0x9E3779B9u;
@@ -541,7 +551,7 @@ struct PoolState
 	alignas(64) std::atomic<int> queuedLow{ 0 };
 
 	// Live tasks submitted or finished by threads without a deque.
-	alignas(64) std::atomic<int64_t> externalLive{ 0 };
+	alignas(64) LiveCounts externalLive;
 
 	// Sleep and wake. numSearching counts workers looking for work (a pusher
 	// wakes nobody while one is); numIdle mirrors idle.size() for the
@@ -685,20 +695,39 @@ static uint16_t ActiveIsolation(PoolState& P)
 
 // The live-task count is sharded so that submitting and finishing write only
 // the thread's own line. A task submitted on one thread and finished on
-// another leaves one shard +1 and the other -1; only the sum means anything.
-static std::atomic<int64_t>& LiveShard(PoolState& P, WorkerCtx* ctx)
+// another counts in one shard's `submitted` and the other's `finished`; only
+// the sums mean anything.
+static LiveCounts& LiveShard(PoolState& P, WorkerCtx* ctx)
 {
 	return ctx ? ctx->live : P.externalLive;
 }
 
-// Not a snapshot: the shards are read one after another while tasks move, so
-// the sum can be briefly off (never below zero once everything settles).
+static void AddSubmitted(PoolState& P, WorkerCtx* ctx, uint64_t n)
+{
+	LiveShard(P, ctx).submitted.fetch_add(n, std::memory_order_relaxed);
+}
+
+// Release: whoever reads this task's finish then also sees its submit, which
+// happened before the task could run.
+static void AddFinished(PoolState& P, WorkerCtx* ctx)
+{
+	LiveShard(P, ctx).finished.fetch_add(1, std::memory_order_release);
+}
+
+// Not a snapshot: the shards are read one after another while tasks move.
+// Every `finished` is read before any `submitted`, so each finish counted has
+// its submit counted too, and the result is never below the tasks really
+// live at the end of the reads (it may be above). Shutdown's drain relies on
+// that: zero means none is left.
 static int64_t LiveTasksIn(PoolState& P)
 {
-	int64_t n = P.externalLive.load(std::memory_order_acquire);
+	uint64_t finished = P.externalLive.finished.load(std::memory_order_acquire);
 	for (WorkerCtx* c : P.deques)
-		n += c->live.load(std::memory_order_acquire);
-	return n;
+		finished += c->live.finished.load(std::memory_order_acquire);
+	uint64_t submitted = P.externalLive.submitted.load(std::memory_order_acquire);
+	for (WorkerCtx* c : P.deques)
+		submitted += c->live.submitted.load(std::memory_order_acquire);
+	return (int64_t)(submitted - finished);
 }
 
 static void MarkProfilerState(PoolState& P, int threadIndex, uint8_t state)
@@ -1088,9 +1117,9 @@ Pool::Pool(const PoolConfig& config)
 	P.running = true;
 	P.stop = false;
 	P.mainThreadId = std::this_thread::get_id(); // the initializing thread is "main"
-	// The initializing thread claims index 0 BEFORE the workers spawn; the
-	// allocator is monotonic across pools (a dead worker's index is never
-	// reused - restarting at 0 would hand a fresh worker the main thread's 0).
+	// The initializing thread takes its index BEFORE the workers spawn (the
+	// lowest free one: 0 in a fresh process). The allocator outlives pools,
+	// so a thread keeps its index from one pool to the next.
 	P.mainThreadIndex = CurrentThreadIndex();
 
 	{
@@ -1692,7 +1721,7 @@ static uint32_t PrepareSlot(PoolState& P, const TaskDesc& desc, WorkerCtx* ctx)
 	t.nameId = desc.nameId;
 	t.profilerTag = desc.profilerTag;
 	t.limiter = LimiterTag(P, desc.limiter);
-	LiveShard(P, ctx).fetch_add(1, std::memory_order_relaxed);
+	AddSubmitted(P, ctx, 1);
 	return slot;
 }
 
@@ -2153,7 +2182,7 @@ static size_t QueueGraphSet(PoolState& P, GraphState& g, uint32_t set, WorkerCtx
 	};
 	// Live from here, before any of them is queued (and can finish): one
 	// add for the set, not one per node.
-	LiveShard(P, ctx).fetch_add(last - first, std::memory_order_relaxed);
+	AddSubmitted(P, ctx, last - first);
 	const CounterHandle nodesLeft = g.nodesLeft;
 	const uint16_t isolation = t_Isolation; // a node belongs to the region it was queued in
 	for (uint32_t m = first; m < last; m++)
@@ -3312,7 +3341,7 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 
 	// Live count and slot are given back before the signal: once a WaitFor on
 	// this counter returns, the task no longer counts as live.
-	LiveShard(P, ctx).fetch_sub(1, std::memory_order_relaxed);
+	AddFinished(P, ctx);
 	ReleaseSlot(P, slot, ctx);
 	if (signals == kInvalidCounter)
 		return;
