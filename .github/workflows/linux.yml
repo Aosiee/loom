@@ -25,8 +25,7 @@ jobs:
   test:
     name: ${{ matrix.name }}
     runs-on: ubuntu-26.04
-    # The thread sanitizer's fault sweeps alone take about 13 minutes.
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -66,7 +65,7 @@ jobs:
         env:
           TSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/tsan.supp
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: timeout 30m build/loom_faults
+        run: timeout 15m build/loom_faults
 
       - name: Stress
         env:

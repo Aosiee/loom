@@ -107,6 +107,13 @@ void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
 
+// The thread sanitizer sleeps a second as a process exits, to catch races
+// with threads still running then. Every child here exits, and most of
+// them cleanly: without this, each costs that second.
+#if defined(__SANITIZE_THREAD__)
+extern "C" const char* __tsan_default_options() { return "atexit_sleep_ms=0"; }
+#endif
+
 // ---- Running a scenario in a child ----------------------------------------------------
 
 namespace {
@@ -224,15 +231,7 @@ loom::PoolConfig Config()
 
 // ---- Scenarios ------------------------------------------------------------------------
 
-// Under the thread sanitizer each pool started in a forked child takes
-// about a second, and this sweep starts some 470: the other builds check it.
-#if defined(__SANITIZE_THREAD__)
-constexpr bool kThreadSanitizer = true;
-#else
-constexpr bool kThreadSanitizer = false;
-#endif
-
-TEST_CASE("faults: a Pool whose threads cannot all start" * doctest::skip(kThreadSanitizer))
+TEST_CASE("faults: a Pool whose threads cannot all start")
 {
 	Sweep([](int n) {
 		Arm(n);
