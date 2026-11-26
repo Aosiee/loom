@@ -224,7 +224,15 @@ loom::PoolConfig Config()
 
 // ---- Scenarios ------------------------------------------------------------------------
 
-TEST_CASE("faults: a Pool whose threads cannot all start")
+// Under the thread sanitizer each pool started in a forked child takes
+// about a second, and this sweep starts some 470: the other builds check it.
+#if defined(__SANITIZE_THREAD__)
+constexpr bool kThreadSanitizer = true;
+#else
+constexpr bool kThreadSanitizer = false;
+#endif
+
+TEST_CASE("faults: a Pool whose threads cannot all start" * doctest::skip(kThreadSanitizer))
 {
 	Sweep([](int n) {
 		Arm(n);

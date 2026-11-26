@@ -81,8 +81,9 @@ for (_, c in configs) {
 		run = { `{dir}/loom_faults` },
 		env = env,
 		resources = { cpu = 4, tags = { c.name } },
-		timeout = 900,
-		budget = if (c.sanitizer != nil) 120 else 20,
+		// Under the thread sanitizer, about 12 minutes on 4 CPUs.
+		timeout = 1800,
+		budget = if (c.sanitizer == "thread") 780 else if (c.sanitizer != nil) 120 else 20,
 		paths = kPaths,
 	})
 	suite:step(`fuzz:{c.name}`, {
