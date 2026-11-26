@@ -425,8 +425,18 @@ struct alignas(64) LimiterState
 	uint32_t             handoffs = 0; // units left for a waiter not yet queued, under mutex
 	std::atomic<uint32_t> limit{ 0 };    // written under mutex
 	std::atomic<uint32_t> retiring{ 0 }; // held units to drop when they come back, written under mutex
-	std::vector<uint32_t> freeUnits;     // unit indices below the limit nobody holds, under mutex
-	std::vector<uint8_t>  unitInUse;     // by index, under mutex
+	// Unit indices, handed out lazily: the free ones below the limit that have
+	// been used before, the next never used (every index from nextUnit up is
+	// unused), and which are held. All under mutex. So a large limit costs
+	// nothing until that many run.
+	std::vector<uint32_t> freeUnits;
+	uint32_t              nextUnit = 0;
+	std::vector<uint8_t>  unitInUse;
+	// Tasks of this limiter that have not given their unit back, wherever
+	// they are (still waiting for their counters too): DestroyLimiter asserts
+	// there are none. A task leaves the count when its unit goes back, at its
+	// end or earlier (a future's task, a coroutine stretch).
+	std::atomic<uint32_t> tasks{ 0 };
 	// Read lock-free by ResolveLimiter, as a counter's are.
 	alignas(64) std::atomic<bool> alive{ false };
 	std::atomic<uint32_t> generation{ 0 };
@@ -536,14 +546,16 @@ struct PoolState
 	alignas(64) std::mutex  counterMutex;
 	std::unique_ptr<CounterState[]> counters;
 	uint32_t                counterCount = 0;
-	std::vector<uint32_t>   freeCounters;
+	// Free entries, oldest freed first: a destroyed entry is reused as late as
+	// possible, so a stale handle stays stale through as many cycles as can be.
+	std::deque<uint32_t>    freeCounters;
 
 	// Limiters, the same way. The table never moves: a task's slot keeps its
 	// limiter's index.
 	std::mutex              limiterMutex;
 	std::unique_ptr<LimiterState[]> limiters;
 	uint32_t                limiterCount = 0;
-	std::vector<uint32_t>   freeLimiters;
+	std::deque<uint32_t>    freeLimiters; // oldest freed first, as freeCounters
 
 	// false from the first instruction of Shutdown (HasActivePool then
 	// reports the pool as down while it drains).
@@ -895,15 +907,11 @@ static constexpr int kTestPointUnitFreed = 1;
 // A task's function has returned; its runner has given nothing back yet.
 static constexpr int kTestPointTaskReturned = 2;
 
-// Gives a unit back. Returns the waiting task it went to (which must now be
-// queued), or kNoSlot.
-static uint32_t ReleaseUnit(LimiterState& l)
+// A unit given back while the count was below zero: someone is owed it, a
+// lowered limit's debt or a waiting task. Returns the task it went to (which
+// must now be queued), or kNoSlot.
+static uint32_t ReleaseOwedUnit(LimiterState& l)
 {
-	if (l.count.fetch_add(1, std::memory_order_acq_rel) >= 0)
-	{
-		LOOM_TEST_POINT(kTestPointUnitFreed);
-		return kNoSlot;
-	}
 	std::lock_guard<std::mutex> lock(l.mutex);
 	const uint32_t retiring = l.retiring.load(std::memory_order_relaxed);
 	if (retiring > 0)
@@ -921,6 +929,18 @@ static uint32_t ReleaseUnit(LimiterState& l)
 	return next;
 }
 
+// Gives a unit back. Returns the waiting task it went to (which must now be
+// queued), or kNoSlot.
+static uint32_t ReleaseUnit(LimiterState& l)
+{
+	if (l.count.fetch_add(1, std::memory_order_acq_rel) >= 0)
+	{
+		LOOM_TEST_POINT(kTestPointUnitFreed);
+		return kNoSlot;
+	}
+	return ReleaseOwedUnit(l);
+}
+
 static constexpr uint32_t kNoUnitIndex = ~0u;
 
 // A unit index for a task holding a unit: a free one below the limit, or,
@@ -934,14 +954,20 @@ static uint32_t TakeUnitIndex(LimiterState& l)
 		index = l.freeUnits.back();
 		l.freeUnits.pop_back();
 	}
+	else if (l.nextUnit < l.limit.load(std::memory_order_relaxed))
+		index = l.nextUnit++;
 	else
 	{
+		// A lowered limit with more holders than indices: the lowest unused.
+		// Every index from nextUnit up stays unused, so it moves past this one.
 		index = 0;
 		while (index < l.unitInUse.size() && l.unitInUse[index])
 			index++;
-		if (index == l.unitInUse.size())
-			l.unitInUse.push_back(0);
+		if (index >= l.nextUnit)
+			l.nextUnit = index + 1;
 	}
+	if (index >= l.unitInUse.size())
+		l.unitInUse.resize((size_t)index + 1, 0);
 	l.unitInUse[index] = 1;
 	return index;
 }
@@ -1197,16 +1223,14 @@ Pool::Pool(const PoolConfig& config)
 		std::lock_guard<std::mutex> lock(P.counterMutex);
 		P.counterCount = std::min(std::max(1u, config.maxCounters), kCounterIndexMask);
 		P.counters = std::make_unique<CounterState[]>(P.counterCount);
-		P.freeCounters.reserve(P.counterCount);
-		for (uint32_t i = P.counterCount; i-- > 0;)
+		for (uint32_t i = 0; i < P.counterCount; i++)
 			P.freeCounters.push_back(i); // index 0 is handed out first
 	}
 	{
 		std::lock_guard<std::mutex> lock(P.limiterMutex);
 		P.limiterCount = std::min(std::max(1u, config.maxLimiters), 0xFFFFu); // a slot keeps index + 1 in 16 bits
 		P.limiters = std::make_unique<LimiterState[]>(P.limiterCount);
-		P.freeLimiters.reserve(P.limiterCount);
-		for (uint32_t i = P.limiterCount; i-- > 0;)
+		for (uint32_t i = 0; i < P.limiterCount; i++)
 			P.freeLimiters.push_back(i);
 	}
 
@@ -1819,6 +1843,8 @@ static uint32_t PrepareSlot(PoolState& P, const TaskDesc& desc, WorkerCtx* ctx)
 	t.nameId = desc.nameId;
 	t.profilerTag = desc.profilerTag;
 	t.limiter = LimiterTag(P, desc.limiter);
+	if (t.limiter != 0)
+		P.limiters[t.limiter - 1].tasks.fetch_add(1, std::memory_order_relaxed);
 	if (desc.affinity == Affinity::Dedicated)
 		AddressDedicated(P, desc.thread);
 	AddSubmitted(P, ctx, 1);
@@ -2306,6 +2332,8 @@ static size_t QueueGraphSet(PoolState& P, GraphState& g, uint32_t set, WorkerCtx
 		t.nameId = n.nameId;
 		t.profilerTag = n.profilerTag;
 		t.limiter = LimiterTag(P, n.limiter);
+		if (t.limiter != 0)
+			P.limiters[t.limiter - 1].tasks.fetch_add(1, std::memory_order_relaxed);
 		if (groupSize > 1 && n.affinity == Affinity::AnyWorker && n.priority == Priority::Normal && t.limiter == 0)
 		{
 			if (length == 0)
@@ -2555,8 +2583,8 @@ CounterHandle CreateCounter(int initial)
 	std::lock_guard<std::mutex> lock(P.counterMutex);
 	if (P.freeCounters.empty())
 		Fatal("the counter pool is exhausted: raise PoolConfig::maxCounters (every pending future and every waiting ParallelFor, sort, scan, pipeline and graph run holds one)");
-	const uint32_t i = P.freeCounters.back();
-	P.freeCounters.pop_back();
+	const uint32_t i = P.freeCounters.front();
+	P.freeCounters.pop_front();
 	CounterState& c = P.counters[i];
 	c.count.store(initial > 0 ? initial + 1 : 0, std::memory_order_relaxed);
 	c.failed.store(false, std::memory_order_relaxed); // (error was cleared by the destroy)
@@ -2837,17 +2865,16 @@ LimiterHandle CreateLimiter(uint32_t limit)
 	std::lock_guard<std::mutex> lock(P.limiterMutex);
 	if (P.freeLimiters.empty())
 		Fatal("the limiter pool is exhausted: raise PoolConfig::maxLimiters");
-	const uint32_t i = P.freeLimiters.back();
-	P.freeLimiters.pop_back();
+	const uint32_t i = P.freeLimiters.front();
+	P.freeLimiters.pop_front();
 	LimiterState& l = P.limiters[i];
 	{
 		std::lock_guard<std::mutex> unitLock(l.mutex);
 		l.limit.store(limit, std::memory_order_relaxed);
 		l.retiring.store(0, std::memory_order_relaxed);
-		l.unitInUse.assign(limit, 0);
+		l.unitInUse.clear();
 		l.freeUnits.clear();
-		for (uint32_t u = limit; u-- > 0;)
-			l.freeUnits.push_back(u); // index 0 on top
+		l.nextUnit = 0; // index 0 first
 	}
 	l.count.store((int)limit, std::memory_order_relaxed);
 	l.alive.store(true, std::memory_order_release);
@@ -2864,7 +2891,8 @@ void DestroyLimiter(LimiterHandle h)
 	{
 		std::lock_guard<std::mutex> lock(l->mutex);
 		assert(l->count.load(std::memory_order_relaxed) == (int)l->limit.load(std::memory_order_relaxed) && l->waiting.empty()
-			&& l->handoffs == 0 && l->retiring.load(std::memory_order_relaxed) == 0 && "destroying a limiter whose tasks are live");
+			&& l->handoffs == 0 && l->retiring.load(std::memory_order_relaxed) == 0
+			&& l->tasks.load(std::memory_order_acquire) == 0 && "destroying a limiter whose tasks are live");
 	}
 	std::lock_guard<std::mutex> lock(P.limiterMutex);
 	if (!l->alive.load(std::memory_order_relaxed) || l->generation.load(std::memory_order_relaxed) != HandleGeneration(h))
@@ -2904,13 +2932,14 @@ void SetLimit(LimiterHandle h, uint32_t limit)
 		if (limit == old)
 			return;
 		l->limit.store(limit, std::memory_order_relaxed);
-		if (l->unitInUse.size() < limit)
-			l->unitInUse.resize(limit, 0);
 		if (limit > old)
 		{
+			// The indices from old up are handed out lazily (TakeUnitIndex):
+			// a used one comes back to freeUnits only while below the limit,
+			// so those above `old` are all either held or never used yet.
 			raise = limit - old;
-			for (uint32_t u = limit; u-- > old;)
-				if (!l->unitInUse[u])
+			for (uint32_t u = old; u < limit && u < l->nextUnit; u++)
+				if (u >= l->unitInUse.size() || !l->unitInUse[u])
 					l->freeUnits.push_back(u);
 		}
 		else
@@ -2925,13 +2954,21 @@ void SetLimit(LimiterHandle h, uint32_t limit)
 	}
 	// New units go out as finishing tasks' would: to a retiring debt, to a
 	// waiting task, or into the free count.
+	// One add for the whole raise, as that many ReleaseUnit calls in a row
+	// would: the first units, as many as the count was below zero, are owed
+	// to a debt or a waiting task; the rest are free.
 	WorkerCtx* ctx = CurrentCtx(P);
 	size_t woken = 0;
-	for (uint32_t k = 0; k < raise; k++)
+	if (raise > 0)
 	{
-		const uint32_t next = ReleaseUnit(*l);
-		if (next != kNoSlot && EnqueueSlot(P, next, ctx))
-			woken++;
+		const int before = l->count.fetch_add((int)raise, std::memory_order_acq_rel);
+		const uint32_t owed = before < 0 ? std::min<uint32_t>(raise, (uint32_t)-(int64_t)before) : 0;
+		for (uint32_t k = 0; k < owed; k++)
+		{
+			const uint32_t next = ReleaseOwedUnit(*l);
+			if (next != kNoSlot && EnqueueSlot(P, next, ctx))
+				woken++;
+		}
 	}
 	WakeForWork(P, woken);
 }
@@ -3125,7 +3162,10 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 		// Checked between tasks, never during one: a helped task can overrun.
 		if (deadline != kNoDeadline && std::chrono::steady_clock::now() >= deadline)
 		{
-			reached = false;
+			// The tasks this wait ran may be what was left: their signals
+			// count before it gives up.
+			FlushDeferredSignals(P, ctx);
+			reached = c->count.load(std::memory_order_acquire) == 0;
 			break;
 		}
 		if (help == Help::WhileWaiting && TryHelpIn(P, true))
@@ -3401,6 +3441,7 @@ static void ReleaseRunningUnit(PoolState& P, WorkerCtx* ctx)
 	}
 	const uint32_t next = ReleaseUnit(l);
 	*limiter = 0;
+	l.tasks.fetch_sub(1, std::memory_order_release);
 	if (next != kNoSlot && EnqueueSlot(P, next, ctx))
 		WakeForWork(P, 1);
 }
@@ -3487,6 +3528,7 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 		if (unitIndex != kNoUnitIndex)
 			ReturnUnitIndex(P.limiters[limiter - 1], unitIndex); // free before the unit, for whoever gets it
 		const uint32_t next = ReleaseUnit(P.limiters[limiter - 1]);
+		P.limiters[limiter - 1].tasks.fetch_sub(1, std::memory_order_release);
 		if (next != kNoSlot && EnqueueSlot(P, next, ctx))
 			WakeForWork(P, 1);
 	}

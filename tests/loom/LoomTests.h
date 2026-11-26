@@ -2967,6 +2967,80 @@ TEST_CASE("loom: profiler hooks — a zone ends on the hook it began on, and hel
 	}
 }
 
+TEST_CASE("loom: TryWaitFor — true when the tasks it ran itself brought the count to zero")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 0 }); // the wait runs every task
+	loom::ScopedCounter c(3);
+	for (int i = 0; i < 3; i++)
+		loom::Submit([i] { std::this_thread::sleep_for(std::chrono::milliseconds(i == 0 ? 30 : 1)); }, loom::TaskDesc{ .signals = c });
+	// The deadline passes during the first task; the other two follow, and
+	// their signals were still held back when the deadline was checked.
+	CHECK(loom::TryWaitFor(c, 20));
+	CHECK(loom::Count(c) == 0);
+}
+
+TEST_CASE("loom: handles — a destroyed counter's handle stays stale through many reuses")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1, .maxCounters = 64 });
+	// From an entry's second use: the first generation is never handed out again.
+	loom::DestroyCounter(loom::CreateCounter(0));
+	const loom::CounterHandle stale = loom::CreateCounter(0);
+	loom::DestroyCounter(stale);
+	// 4095 reuses of one entry wrap its generation. Entries are reused oldest
+	// first, so with 64 of them that takes 64 times as many cycles.
+	int aliased = 0;
+	for (int i = 0; i < 20000; i++)
+	{
+		const loom::CounterHandle h = loom::CreateCounter(0);
+		aliased += h == stale ? 1 : 0;
+		loom::DestroyCounter(h);
+	}
+	CHECK(aliased == 0);
+}
+
+TEST_CASE("loom: SetLimit — a large limit costs nothing until that many run")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
+	const loom::LimiterHandle l = loom::CreateLimiter(2);
+	const auto t0 = std::chrono::steady_clock::now();
+	loom::SetLimit(l, 200'000'000);
+	const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	CHECK(ms < 100.0); // building 200M unit indices up front took seconds and a gigabyte
+	CHECK(loom::Limit(l) == 200'000'000u);
+	std::atomic<int> ran{ 0 };
+	std::set<uint32_t> units;
+	std::mutex m;
+	loom::ScopedCounter done(16);
+	for (int i = 0; i < 16; i++)
+		loom::Submit([&] {
+			const uint32_t u = loom::CurrentLimiterUnit();
+			std::lock_guard<std::mutex> lock(m);
+			units.insert(u);
+			ran++;
+		}, loom::TaskDesc{ .signals = done, .limiter = l });
+	loom::WaitFor(done);
+	CHECK(ran.load() == 16);
+	CHECK(*units.rbegin() < 3); // at most three at once here: indices from 0 up
+	loom::SetLimit(l, 1);
+	loom::DestroyLimiter(l);
+}
+
+#if defined(__linux__) && !defined(NDEBUG)
+TEST_CASE("loom: DestroyLimiter — asserts while a task of it still waits for its counter")
+{
+	REQUIRE(!loom::HasActivePool());
+	std::string err;
+	CHECK(EndsInAbort([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+		const loom::LimiterHandle l = loom::CreateLimiter(1);
+		loom::ScopedCounter gate(1);
+		loom::Submit([] {}, loom::TaskDesc{ .waitsFor = gate, .limiter = l });
+		loom::DestroyLimiter(l); // the task holds no unit yet, but it is live
+	}, err));
+	CHECK(err.find("destroying a limiter whose tasks are live") != std::string::npos);
+}
+#endif
+
 namespace shutdown_drain {
 	std::atomic<long> mainSubmitted{ 0 }, mainRan{ 0 };
 	void MainFinal(void*) { mainRan++; }

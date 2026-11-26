@@ -43,8 +43,11 @@ size; the runner reads the slot in place and owns it until it releases it.
 
 A counter is an index into a table plus a generation. `CreateCounter` takes
 an entry off a free list; `DestroyCounter` asserts the count is zero and
-nobody waits on it, then bumps the generation, so a stale handle never reaches
-a re-used entry. Limiters pack their handles the same way. Each kind of
+nobody waits on it, then bumps the generation, so a stale handle does not
+reach a re-used entry. The generation is 12 bits, so after 4095 reuses of
+one entry an old handle can match again; the free list hands out the entry
+freed longest ago, which spreads the reuses over the whole table (with 2048
+counters, about eight million create-and-destroy cycles). Limiters pack their handles the same way. Each kind of
 handle is an enum class over its 32 bits, so the compiler keeps them apart;
 inside loom they are unpacked with a cast.
 
@@ -296,7 +299,9 @@ is a 16-bit index in a free byte pair of the slot's first line, so a task
 without one pays a load it already makes and an untaken branch.
 
 `SetLimit` raising the limit gives out the new units the way
-finishing tasks give theirs back, so waiting tasks start at once. Lowering
+finishing tasks give theirs back, so waiting tasks start at once: one add
+to the count for the whole raise, and as many units as the count was below
+zero go to the debts and waiting tasks. Lowering
 it takes free units out of the count at once. For each held unit it would
 need, it leaves a *retiring* debt instead: the count goes down as if a task
 waited, and the next finisher that takes the lock to hand its unit on finds
@@ -305,7 +310,10 @@ stays the one number the fast paths read. `HeldUnits` is the limit plus
 the debts still open while the count is negative.
 
 A unit's index (`CurrentLimiterUnit`) is handed out only when a task asks for one,
-from a stack of the free indices below the limit, under the limiter's lock.
+under the limiter's lock: from a stack of indices below the limit that were
+used and given back, or else the next one never used. So the index tables
+grow with the most tasks that have held units at once, not with the limit,
+and a large limit costs nothing until that many run.
 The index goes back before the unit does, so whoever takes the unit next
 finds one free. After the limit is lowered, more tasks can hold units than
 there are indices below it; such a task gets the lowest unused index above
