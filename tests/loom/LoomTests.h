@@ -2815,6 +2815,74 @@ TEST_CASE("loom: running out of counters or limiters ends the program, saying wh
 }
 #endif
 
+TEST_CASE("loom: Shutdown from another thread — the main thread's pump runs main-thread work through the drain")
+{
+	using namespace std::chrono_literals;
+	std::atomic<bool> ran{ false }, done{ false };
+	{
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 2, .shutdownTimeoutMs = 2000 });
+		// Still running when the drain starts, it then queues main-thread work.
+		loom::Submit([&] {
+			std::this_thread::sleep_for(50ms);
+			loom::Submit([&] { ran = true; }, { .affinity = loom::Affinity::MainThread });
+		});
+		std::thread closer([&] { pool.Shutdown(); done = true; });
+		for (int i = 0; i < 400 && !done; i++)
+		{
+			loom::PumpMainThreadTasks();
+			std::this_thread::sleep_for(5ms);
+		}
+		closer.join();
+	}
+	CHECK(ran.load());
+}
+
+TEST_CASE("loom: Pool — a thread that sees the pool active sees it built")
+{
+	for (int round = 0; round < 50; round++)
+	{
+		std::atomic<int> workers{ -1 };
+		std::thread watcher([&] {
+			while (!loom::HasActivePool()) {}
+			workers = loom::WorkerCount();
+		});
+		{
+			loom::Pool pool(loom::PoolConfig{ .workerCount = 3 });
+			watcher.join();
+		}
+		CHECK(workers.load() == 3);
+	}
+}
+
+#if defined(NDEBUG)
+TEST_CASE("loom: PumpMainThreadTasks — off the main thread it runs nothing")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+	std::atomic<bool> ran{ false };
+	loom::ScopedCounter done(1);
+	loom::Submit([&] { ran = true; }, { .affinity = loom::Affinity::MainThread, .signals = done });
+	std::thread([] { loom::PumpMainThreadTasks(); }).join(); // asserts in a debug build
+	CHECK_FALSE(ran.load());
+	loom::PumpMainThreadTasks();
+	CHECK(ran.load());
+}
+#endif
+
+#if defined(__linux__)
+TEST_CASE("loom: Shutdown from inside a task ends the program, saying why")
+{
+	REQUIRE(!loom::HasActivePool());
+	std::string err;
+	CHECK(EndsInAbort([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+		loom::ScopedCounter done(1);
+		loom::Submit([&pool] { pool.Shutdown(); }, { .signals = done });
+		loom::WaitFor(done, loom::Help::BlockOnly);
+	}, err));
+	CHECK(err.find("from inside a task") != std::string::npos);
+}
+#endif
+
 namespace shutdown_drain {
 	std::atomic<long> mainSubmitted{ 0 }, mainRan{ 0 };
 	void MainFinal(void*) { mainRan++; }

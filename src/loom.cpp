@@ -545,8 +545,8 @@ struct PoolState
 	uint32_t                limiterCount = 0;
 	std::vector<uint32_t>   freeLimiters;
 
-	// false from the first instruction of Shutdown (TryHelp, PumpMainThreadTasks
-	// and HasActivePool then report the pool as down while it drains).
+	// false from the first instruction of Shutdown (HasActivePool then
+	// reports the pool as down while it drains).
 	std::atomic<bool>       running{ false };
 	std::atomic<bool>       stop{ false };
 	std::thread::id         mainThreadId;
@@ -679,6 +679,9 @@ static thread_local ThreadDebug*    t_Debug = nullptr;
 // The Isolated region the calling thread is in (0: none). A running task's
 // thread is in that task's region, so its children inherit it.
 static thread_local uint16_t        t_Isolation = 0;
+// The tasks the calling thread is inside (more than one when a wait inside a
+// task runs another while helping).
+static thread_local int             t_TaskDepth = 0;
 // The running task's limiter tag (a RunSlot local), so a task that completes
 // its own counter from inside, as a future's does, can give its unit back
 // first. Null outside a task; saved and restored around nested runs.
@@ -1167,11 +1170,9 @@ static void ReleaseSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 Pool::Pool(const PoolConfig& config)
 	: m_State(std::make_unique<PoolState>())
 {
-	// One pool at a time: the free API resolves the single active pool.
-	PoolState* expected = nullptr;
-	const bool installed = s_ActivePool.compare_exchange_strong(expected, m_State.get(), std::memory_order_acq_rel);
-	assert(installed && "loom: a pool is already active (one loom::Pool at a time)");
-	(void)installed;
+	// One pool at a time: the free API resolves the single active pool. It is
+	// installed last, once built: a thread that sees it active may use it.
+	assert(s_ActivePool.load(std::memory_order_acquire) == nullptr && "loom: a pool is already active (one loom::Pool at a time)");
 
 	PoolState& P = *m_State;
 	P.running = true;
@@ -1223,6 +1224,11 @@ Pool::Pool(const PoolConfig& config)
 	P.idle.reserve((size_t)P.workerCount + 16);
 	for (int i = 0; i < P.workerCount; i++)
 		P.workers.emplace_back(WorkerLoop, std::ref(P), std::ref(*P.workerCtx[(size_t)i]));
+
+	PoolState* expected = nullptr;
+	const bool installed = s_ActivePool.compare_exchange_strong(expected, &P, std::memory_order_acq_rel);
+	assert(installed && "loom: a pool is already active (one loom::Pool at a time)");
+	(void)installed;
 }
 
 Pool::~Pool()
@@ -1237,7 +1243,9 @@ static void WakeAllIdle(PoolState& P)
 	for (Waiter* w : P.idle)
 		Wake(*w, kWokeRecheck);
 	P.idle.clear();
-	P.numIdle.store(0, std::memory_order_seq_cst);
+	// A read-modify-write, like every other change to it: the lost-wakeup
+	// pairing (WakeForWork) relies on them all being in one release sequence.
+	P.numIdle.exchange(0, std::memory_order_seq_cst);
 }
 
 // Shutdown's drain: runs until no task is live, the calling thread helping
@@ -1277,6 +1285,10 @@ void Pool::Shutdown()
 {
 	PoolState& P = *m_State;
 	if (!P.running) return;
+	// From inside a task, the drain would wait for that task, and then the
+	// thread would join itself.
+	if (t_TaskDepth > 0)
+		Fatal("Pool::Shutdown called from inside a task (the drain would wait for that task)");
 	P.running = false; // HasActivePool and PumpMainThreadTasks report the pool as down from here
 
 	// A park still in effect (its UnparkAll skipped by an exception, say)
@@ -1306,7 +1318,9 @@ void Pool::Shutdown()
 		if (w.joinable()) w.join();
 	P.workers.clear();
 
-	// Dedicated threads last.
+	// Dedicated threads last. Joined outside the registry lock, which the
+	// introspection calls take.
+	std::vector<std::unique_ptr<DedicatedState>> dedicated;
 	{
 		std::lock_guard<std::mutex> lock(P.dedicatedMutex);
 		for (auto& d : P.dedicated)
@@ -1324,10 +1338,11 @@ void Pool::Shutdown()
 			P.parkCV.notify_all(); // a parked one leaves once its stop flag is set
 			P.parkDedicated.clear();
 		}
-		for (auto& d : P.dedicated)
-			if (d->thread.joinable()) d->thread.join();
-		P.dedicated.clear();
+		dedicated.swap(P.dedicated);
 	}
+	for (auto& d : dedicated)
+		if (d->thread.joinable()) d->thread.join();
+	dedicated.clear();
 
 	// Lanes join like every dedicated thread; a still-held lane at
 	// shutdown is a leak (the drain-or-assert policy).
@@ -3428,8 +3443,10 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 		debug->runningLimiter.store(limiter, std::memory_order_relaxed);
 		debug->running.store(debug->running.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 	}
+	t_TaskDepth++;
 	if (fn && !cancelled)
 		RunTaskFn(P, fn, userData, signals); // an inline callable's userData is the slot: release after
+	t_TaskDepth--;
 	if (debug)
 	{
 		debug->running.store(debug->running.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
@@ -3495,9 +3512,15 @@ static void FlushDeferredSignals(PoolState& P, WorkerCtx* ctx)
 
 void PumpMainThreadTasks()
 {
+	// It pumps through Shutdown's drain too: a Shutdown called from another
+	// thread relies on the main thread's frame loop for main-thread work.
 	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
-	if (!pool || !pool->running) return;
+	if (!pool || pool->stop.load(std::memory_order_acquire)) return;
 	PoolState& P = *pool;
+	// Main-thread tasks run on the main thread only.
+	assert(std::this_thread::get_id() == P.mainThreadId && "PumpMainThreadTasks off the main thread");
+	if (std::this_thread::get_id() != P.mainThreadId)
+		return;
 	WorkerCtx* ctx = CurrentCtx(P);
 	// Bounded: a main-thread task that resubmits itself must not trap the
 	// frame loop here forever.

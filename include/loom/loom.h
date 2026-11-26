@@ -153,11 +153,14 @@ public:
 	Pool& operator=(const Pool&) = delete;
 
 	// Idempotent. Drains first: every submitted task runs, including work
-	// submitted while draining (main-thread work runs on the calling thread,
-	// which should be the main thread), and every WaitFor completes. Then
-	// joins the workers and dedicated threads and uninstalls the pool.
-	// Drain-or-assert: tasks that could never run, held lanes and live tasks
-	// assert (see PoolConfig::shutdownTimeoutMs).
+	// submitted while draining, and every WaitFor completes. Main-thread work
+	// runs on the calling thread when that is the main thread; called from
+	// another thread, it relies on the main thread's PumpMainThreadTasks,
+	// which keeps pumping through the drain. Then joins the workers and
+	// dedicated threads and uninstalls the pool. Drain-or-assert: tasks that
+	// could never run, held lanes and live tasks assert (see
+	// PoolConfig::shutdownTimeoutMs). Called from inside a task (the drain
+	// would wait for that task), it ends the program.
 	void Shutdown();
 
 private:
@@ -1668,7 +1671,8 @@ void   ReleaseLane(LaneId lane);
 
 // ---- Main thread -----------------------------------------------------------
 // Call once per frame from the engine loop: a bounded drain of the
-// main-affinity queue (WaitFor on the main thread pumps it too).
+// main-affinity queue (WaitFor on the main thread pumps it too). On the main
+// thread only: elsewhere it asserts and does nothing.
 void PumpMainThreadTasks();
 
 // ---- Dedicated threads -----------------------------------------------------
