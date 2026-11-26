@@ -11,7 +11,11 @@
 // The hooks belong to the active pool: install them after the pool is
 // created; they go away with it. Installing a non-null hook with no active
 // pool asserts. They are atomic because the owner may unhook while the
-// workers are still running. A hook must not throw: it runs in the middle of
+// workers are still running, but a hook that was installed can still be
+// called after it is replaced: a task's zone ends on the hook it began with,
+// and a thread may already have loaded the state hook. Keep an old hook
+// valid until the tasks running when it was replaced have finished (a
+// WaitFor on their counters, or Shutdown). A hook must not throw: it runs in the middle of
 // loom's own work, so one that does ends the program, saying which.
 
 #include <cstdint>

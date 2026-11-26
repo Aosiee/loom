@@ -147,7 +147,11 @@ struct PoolConfig
 // subsystem owns the app's pool; standalone users (the loom and debug_draw
 // test suites) construct one themselves. Constructing a Pool spawns its
 // threads and installs it as the ACTIVE pool that every free function below
-// uses. There is no lazy init: calling them with no active pool asserts. One
+// uses. There is no lazy init: calling them with no active pool asserts in a
+// debug build, and is undefined in a release one (a null pool). The calls
+// documented to answer for no pool (introspection, TryHelp,
+// PumpMainThreadTasks, CurrentLimiterUnit, the debug dump, the park
+// participant calls) return their empty answer instead. One
 // pool at a time.
 struct PoolState;
 
@@ -203,6 +207,9 @@ void Submit(std::span<const TaskDesc>);
 // has run, or when it is skipped because its counter was cancelled.
 namespace detail {
 // Copies `size` bytes from `data` into the task slot's inline storage and
+// Ends the program, saying what went wrong ("loom: <what>" on stderr), in
+// every build: for misuse the header itself catches.
+[[noreturn]] void Misuse(const char* what) noexcept;
 // enqueues a task that calls `trampoline` with the slot's storage pointer.
 void SubmitInlineRaw(const void* data, size_t size, void (*trampoline)(void*), const TaskDesc& opts);
 // Enqueues a task that owns a callable. With `relocate`, the callable is
@@ -254,6 +261,9 @@ CounterHandle CreateCounter(int initial); // PoolConfig::maxCounters at once
 // last signal woke may still be returning: it returns as if it had seen
 // zero, even once the entry is handed out to a new counter.
 void           DestroyCounter(CounterHandle);
+// Lowers the count by n (n of 0 or less does nothing). The signal that
+// brings it to zero releases what waits for it. Signalling more than the
+// count ends the program.
 void           Signal(CounterHandle, int n = 1);
 // Raises a count that has not reached zero yet by n, for work that finds
 // more work as it runs (a tree walk, culling a bounding-volume hierarchy):
@@ -606,7 +616,7 @@ public:
 			std::rethrow_exception(m_State->error);
 #else
 		if (m_State->Failed())
-			std::terminate();
+			detail::Misuse("Future::Get of a failed future, built without exceptions");
 #endif
 		if constexpr (!std::is_void_v<T>)
 			return *m_State->value;
@@ -742,7 +752,7 @@ private:
 	static void CheckUsable(bool ok)
 	{
 		if (!ok)
-			std::terminate(); // a moved-from promise, a second set, or a second GetFuture
+			detail::Misuse("a Promise used after it was moved from or set, or a second GetFuture");
 	}
 	void Complete()
 	{
@@ -863,7 +873,7 @@ namespace detail {
 			std::rethrow_exception(state.error);
 #else
 		if (state.Failed())
-			std::terminate();
+			Misuse("co_await of a failed future, built without exceptions");
 #endif
 	}
 
@@ -1146,8 +1156,8 @@ void Isolated(F&& fn)
 // (the last takes the remainder), one task each.
 //
 // If fn throws, the pieces not yet started are skipped and ParallelFor
-// rethrows the first exception. Each call allocates one small array of
-// piece records; the tasks themselves never allocate. The lambda forms call
+// rethrows the first exception. Each call allocates its piece records (one
+// array, two for automatic chunking); the tasks themselves never allocate. The lambda forms call
 // the callable in place (it lives on the caller's stack), never a heap copy.
 using ParallelForFn = void (*)(size_t begin, size_t end, void* userData);
 
@@ -1637,7 +1647,7 @@ public:
 	Pipeline& Source(F&& fn, const TaskDesc& opts = {})
 	{
 		if (!m_Stages.empty())
-			std::terminate(); // the source is the first stage, and there is one
+			detail::Misuse("Pipeline: a second Source, or a Source after another stage (the source is the first stage, and there is one)");
 		return Add<true>(std::forward<F>(fn), true, opts);
 	}
 	// The stages after the source, in order. Each needs the source first:
@@ -1646,21 +1656,21 @@ public:
 	Pipeline& Serial(F&& fn, const TaskDesc& opts = {})
 	{
 		if (m_Stages.empty())
-			std::terminate(); // the source comes first
+			detail::Misuse("Pipeline: a Serial or Parallel stage before the Source (the source comes first)");
 		return Add<false>(std::forward<F>(fn), true, opts);
 	}
 	template <typename F> requires std::is_invocable_v<std::decay_t<F>&, T&>
 	Pipeline& Parallel(F&& fn, const TaskDesc& opts = {})
 	{
 		if (m_Stages.empty())
-			std::terminate(); // the source comes first
+			detail::Misuse("Pipeline: a Serial or Parallel stage before the Source (the source comes first)");
 		return Add<false>(std::forward<F>(fn), false, opts);
 	}
 
 	void Run()
 	{
 		if (m_Stages.empty())
-			std::terminate(); // a pipeline needs a source
+			detail::Misuse("Pipeline::Run with no stages (a pipeline needs a source)");
 		std::vector<void*> items(m_Items.size());
 		for (size_t i = 0; i < m_Items.size(); i++)
 			items[i] = &m_Items[i];
@@ -1787,7 +1797,8 @@ void Run(TaskGraph& graph, Help help = Help::WhileWaiting);
 
 // ---- Lanes ------------------------------------------------------------------
 // A lane is a long-lived worker reserved for ONE owner (e.g. a simulation
-// tick) — implemented as a dedicated thread that never steals. Shutdown
+// tick) — implemented as a dedicated thread that never steals (except, as
+// every waiting thread does, in a pool with no workers). Shutdown
 // joins lanes like every dedicated thread and asserts none are still held.
 using LaneId = DedicatedId; // a lane's tasks name it in TaskDesc::thread
 inline constexpr LaneId kInvalidLane = kInvalidDedicated;
@@ -1872,7 +1883,7 @@ public:
 	{
 		const int index = CurrentThreadIndex();
 		if (index < 0 || (size_t)index >= kChunks * kChunkSize)
-			std::terminate(); // more threads alive at once than PerThread can key
+			detail::Misuse("PerThread: more threads alive at once than it can key (65536)");
 		Chunk* chunk = m_Chunks[(size_t)index / kChunkSize].load(std::memory_order_acquire);
 		if (!chunk)
 			chunk = AddChunk((size_t)index / kChunkSize);
@@ -1989,6 +2000,8 @@ struct ThreadStatsView
 struct PoolSnapshot
 {
 	std::vector<ThreadStatsView> threads; // pool workers + dedicated threads
+	// Queue depths count entries: a batch's tasks queue in groups of up to
+	// 32, and a queued group counts once. liveTasks counts tasks.
 	int         queueDepth = 0;        // the shared AnyWorker run queue
 	int         mainQueueDepth = 0;    // the main-affinity queue
 	int         liveTasks = 0;
@@ -2123,13 +2136,17 @@ void CaptureReturnAddresses(std::vector<uintptr_t>& out, size_t max = 256);
 long CurrentOsThreadId();
 
 // ---- Introspection (tests / debug) -----------------------------------------
-// All four answer for the active pool (0/false with none).
+// All four answer for the active pool (0/false with none). HasActivePool is
+// false from the moment Shutdown starts, while WorkerCount and the counts
+// still answer through its drain.
 int  WorkerCount();
 bool HasActivePool();
 // Tasks submitted and not yet finished. A task counts until its bookkeeping
 // is done, which can be a moment after the work it was waited for (an
 // automatically chunked ParallelFor counts items, not tasks).
 int  LiveTaskCount();
-int  PendingTaskCount(); // tasks queued but not started
+// Queue entries not yet started (a batch's group of up to 32 tasks counts
+// once), across the pool's queues.
+int  PendingTaskCount();
 
 } // namespace loom

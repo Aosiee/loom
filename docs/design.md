@@ -259,7 +259,9 @@ tasks over one at a time, every task cost a steal on the submitter's deque,
 and its top and bottom bounced between up to 31 cores: with 23 ns tasks the
 workers spent about 92% of their time searching. Groups make that one steal
 per 32 tasks and spread the rest across the workers' own deques.
-`ParallelFor` does not group: its chunks are already coarse. Queue depths
+`ParallelFor` with a chunk size does not group: its chunks are already
+coarse. Automatic chunking queues its first pieces as one batch, so they
+group like any other (each then splits as workers ask). Queue depths
 (`PendingTaskCount`, `PoolSnapshot::queueDepth`) count entries, so a
 queued group counts once.
 

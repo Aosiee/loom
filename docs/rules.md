@@ -22,6 +22,12 @@ entirely.
 thread's stack, including one that takes the lock you hold. Wait with
 `Help::BlockOnly`, or release the lock before waiting.
 
+A BlockOnly wait runs nothing, so what it waits for must be able to run on
+another thread. A task's own children wait in its worker's deque, and with
+one worker (the default on a machine with two CPUs) or with every worker in
+such a wait, nobody else takes them. Wait BlockOnly only on work that does
+not need your thread, or release the lock and help.
+
 ## No ambient thread-local context
 
 Because a wait can run unrelated tasks, a task must not assume thread-local

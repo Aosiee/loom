@@ -3095,15 +3095,23 @@ TEST_CASE("loom: Promise — a moved-from promise ends the program rather than c
 #endif
 
 #if defined(__linux__)
-TEST_CASE("loom: Pipeline — a stage before the source ends the program")
+TEST_CASE("loom: Pipeline — a stage before the source ends the program, saying why")
 {
 	REQUIRE(!loom::HasActivePool());
-	std::string err;
+	std::string err, promiseErr;
 	CHECK(EndsInAbort([] {
 		loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
 		loom::Pipeline<int> p(4);
 		p.Serial([](int&) {}); // without a source first, Run would never end
 	}, err));
+	CHECK(err.find("loom: Pipeline: a Serial or Parallel stage before the Source") != std::string::npos);
+	CHECK(EndsInAbort([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+		loom::Promise<int> p;
+		p.SetValue(1);
+		p.SetValue(2);
+	}, promiseErr));
+	CHECK(promiseErr.find("loom: a Promise used after") != std::string::npos);
 }
 #endif
 
@@ -5507,6 +5515,18 @@ TEST_CASE("loom: Pipeline — a main-thread serial stage takes one item per task
 	run.Get();
 	CHECK(uploaded.load() == 200);
 	CHECK(worstMs < 50.0); // the whole stream, 100 ms and more, in one pump before
+}
+
+TEST_CASE("loom: counters — a signal past zero ends the program, saying so")
+{
+	REQUIRE(!loom::HasActivePool());
+	std::string err;
+	CHECK(EndsInAbort([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+		loom::CounterHandle c = loom::CreateCounter(1);
+		loom::Signal(c, 2);
+	}, err));
+	CHECK(err.find("signalled more times than its count") != std::string::npos);
 }
 
 } // namespace

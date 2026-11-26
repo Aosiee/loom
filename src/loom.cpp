@@ -73,6 +73,10 @@ static inline void CpuRelax()
 	std::abort();
 }
 
+namespace detail {
+void Misuse(const char* what) noexcept { Fatal(what); }
+} // namespace detail
+
 // Allocation failure where loom cannot back out: in the middle of making a
 // task runnable, releasing a counter's waiting tasks, or registering a wait
 // or a thread. Half done there would lose tasks or wake-ups, or leave a
@@ -2932,7 +2936,10 @@ static void SignalCounter(PoolState& P, CounterHandle h, int n)
 		return;
 	// The stored value is the count + 1, so `before - n == 1` is the user's zero.
 	const int before = c->count.fetch_sub(n, std::memory_order_acq_rel);
-	assert(before - n >= 1 && "counter underflow");
+	// Past zero, the count no longer means anything: its waits may never
+	// return, or return before what they wait for.
+	if (before - n < 1)
+		Fatal("a counter was signalled more times than its count");
 	if (before - n != 1)
 		return;
 
