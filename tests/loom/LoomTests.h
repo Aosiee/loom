@@ -5185,6 +5185,63 @@ TEST_CASE("loom: Isolated — main-thread work of another region does not wake a
 	loom::PumpMainThreadTasks();
 }
 
+// ---- Priorities ----------------------------------------------------------------------
+
+static std::atomic<bool> s_ChainStop{ false };
+static std::atomic<int> s_Chains{ 0 };
+
+static void SpinChain(void*)
+{
+	const auto t = std::chrono::steady_clock::now();
+	while (std::chrono::steady_clock::now() - t < std::chrono::microseconds(20)) {}
+	if (!s_ChainStop)
+		loom::Submit(loom::TaskDesc{ .fn = &SpinChain }); // its successor, onto this worker's deque
+	else
+		s_Chains--;
+}
+
+TEST_CASE("loom: priorities — High queued elsewhere runs before a worker's own Normal work")
+{
+	// Every worker feeds its own deque a chain of Normal tasks, so none ever
+	// runs out of work of its own; a High task from the main thread and one
+	// from an outside thread must still run at once.
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 4 });
+	s_ChainStop = false;
+	s_Chains = 4;
+	for (int i = 0; i < 4; i++)
+		loom::Submit(loom::TaskDesc{ .fn = &SpinChain });
+	std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	loom::ScopedCounter fromMain(1), fromOutside(1);
+	loom::Submit([] {}, { .signals = fromMain, .priority = loom::Priority::High });
+	std::thread([&] { loom::Submit([] {}, { .signals = fromOutside, .priority = loom::Priority::High }); }).join();
+	CHECK(loom::TryWaitFor(fromMain, 1000, loom::Help::BlockOnly));
+	CHECK(loom::TryWaitFor(fromOutside, 1000, loom::Help::BlockOnly));
+	s_ChainStop = true;
+	while (s_Chains > 0)
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+
+TEST_CASE("loom: priorities — a value outside the enum is refused, or runs as Normal in a release build")
+{
+	REQUIRE(!loom::HasActivePool());
+#if defined(NDEBUG)
+	// From a thread without deques it used to index a fourth injection queue.
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
+	std::thread([] {
+		loom::ScopedCounter done(1);
+		loom::Submit([] {}, { .signals = done, .priority = loom::Priority(3) });
+		CHECK(loom::TryWaitFor(done, 2000));
+	}).join();
+#else
+	std::string err;
+	CHECK(EndsInAbort([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+		loom::Submit([] {}, { .priority = loom::Priority(3) });
+	}, err));
+	CHECK(err.find("priority out of range") != std::string::npos);
+#endif
+}
+
 } // namespace
 
 }} // namespace loom::tests

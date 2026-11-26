@@ -1633,19 +1633,45 @@ static uint32_t PopOwn(PoolState& P, WorkerCtx& ctx)
 	return ctx.deque.Pop();
 }
 
-// One pass for work queued elsewhere: High anywhere, then Normal anywhere,
-// then Low (this thread's own first).
-static uint32_t StealOnce(PoolState& P, WorkerCtx* self)
+// A random first victim (xorshift32), so thieves spread over the deques
+// instead of all hammering the main thread's first. Threads without a
+// context (dedicated, outside) keep their own state.
+static size_t FirstVictim(PoolState& P, WorkerCtx* self)
 {
-	// A random first victim (xorshift32), so thieves spread over the deques
-	// instead of all hammering the main thread's first. Threads without a
-	// context (dedicated, outside) keep their own state.
 	static thread_local uint32_t t_rng = 0x2545F491u;
 	uint32_t& rng = self ? self->rng : t_rng;
 	rng ^= rng << 13;
 	rng ^= rng >> 17;
 	rng ^= rng << 5;
-	const size_t start = rng % P.deques.size();
+	return rng % P.deques.size();
+}
+
+// The next task for a thread with deques: High from anywhere (its own
+// first), then its own Normal. A thread that keeps feeding its own deque
+// never runs out of its own work, so High queued elsewhere must come first
+// here, or it would wait for as long as that lasts.
+static uint32_t PopNext(PoolState& P, WorkerCtx& ctx)
+{
+	if (P.queuedHigh.load(std::memory_order_relaxed) > 0)
+	{
+		uint32_t slot = ctx.high.Pop();
+		if (slot != kNoSlot)
+		{
+			NoteTaken(P, Priority::High);
+			return slot;
+		}
+		slot = StealAt(P, &ctx, Priority::High, FirstVictim(P, &ctx));
+		if (slot != kNoSlot)
+			return slot;
+	}
+	return ctx.deque.Pop();
+}
+
+// One pass for work queued elsewhere: High anywhere, then Normal anywhere,
+// then Low (this thread's own first).
+static uint32_t StealOnce(PoolState& P, WorkerCtx* self)
+{
+	const size_t start = FirstVictim(P, self);
 	uint32_t slot = kNoSlot;
 	if (P.queuedHigh.load(std::memory_order_relaxed) > 0)
 		slot = StealAt(P, self, Priority::High, start);
@@ -1904,7 +1930,8 @@ static uint32_t PrepareSlot(PoolState& P, const TaskDesc& desc, WorkerCtx* ctx)
 	t.affinity = desc.affinity;
 	t.thread = desc.thread;
 	t.signals = desc.signals;
-	t.priority = desc.priority;
+	assert(desc.priority <= Priority::Low && "priority out of range");
+	t.priority = desc.priority <= Priority::Low ? desc.priority : Priority::Normal; // it indexes the queues
 	t.owned = false; // byte 29 was part of the free-batch list
 	t.isolation = t_Isolation; // a task belongs to the region it was submitted in
 	t.nameId = desc.nameId;
@@ -2393,7 +2420,8 @@ static size_t QueueGraphSet(PoolState& P, GraphState& g, uint32_t set, WorkerCtx
 		if (n.affinity == Affinity::Dedicated)
 			AddressDedicated(P, n.thread);
 		t.signals = nodesLeft;
-		t.priority = n.priority;
+		assert(n.priority <= Priority::Low && "priority out of range");
+		t.priority = n.priority <= Priority::Low ? n.priority : Priority::Normal;
 		t.owned = false;
 		t.isolation = isolation;
 		t.nameId = n.nameId;
@@ -3494,7 +3522,7 @@ static bool TryHelpIn(PoolState& P, bool markHelping, bool* poolWake)
 			WakeForWork(P, 1);
 	}
 	if (slot == kNoSlot && ctx && !ActiveIsolation(P))
-		slot = PopOwn(P, *ctx);
+		slot = PopNext(P, *ctx);
 	if (slot == kNoSlot && !ActiveIsolation(P))
 		slot = StealOnce(P, ctx);
 	if (slot == kNoSlot)
@@ -3874,7 +3902,7 @@ static void WorkerLoop(PoolState& P, WorkerCtx& ctx)
 			continue;
 		}
 
-		uint32_t slot = PopOwn(P, ctx);
+		uint32_t slot = PopNext(P, ctx);
 		if (slot == kNoSlot)
 		{
 			if (!searching)

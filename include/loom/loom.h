@@ -75,10 +75,12 @@ enum class Affinity : uint8_t
 	Dedicated,   // ONLY the named dedicated thread in TaskDesc::thread
 };
 
-// Which queued work runs first. High runs before Normal; Low runs only when
-// no other pool work is queued anywhere (background work). A running task is
-// never interrupted. For MainThread and Dedicated tasks, High goes to the
-// front of that thread's queue.
+// Which queued work runs first. High runs before Normal, whichever thread
+// queued it; Low runs only when no other pool work is queued anywhere
+// (background work). A running task is never interrupted. For MainThread
+// and Dedicated tasks, High goes to the front of that thread's queue, and
+// Low queues as Normal. A value outside these three asserts, and runs as
+// Normal in a release build.
 enum class Priority : uint8_t
 {
 	High,
