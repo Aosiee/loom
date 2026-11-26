@@ -9,17 +9,20 @@
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
 #include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
 #if defined(__linux__)
 #include <linux/futex.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -1013,6 +1016,7 @@ static void ReturnUnitIndex(LimiterState& l, uint32_t index)
 // ---- Forward decls --------------------------------------------------------------
 
 static uint32_t AllocateSlot(PoolState& P, WorkerCtx* ctx);
+static void     WakeAllIdle(PoolState& P);
 static bool     EnqueueSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx);
 static void     RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx);
 static void     RunEntry(PoolState& P, uint32_t entry, WorkerCtx* ctx);
@@ -1231,6 +1235,51 @@ static void ReleaseSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 
 // ---- Lifecycle -------------------------------------------------------------------
 
+// The CPUs this process may use: those in its affinity mask, and no more
+// than its cgroup's CPU quota allows (cgroup v2 cpu.max). A pool sized to
+// the whole machine under `taskset` or a container's quota keeps workers
+// searching on CPUs it does not get, and a quota throttles the process for
+// the time they burn.
+static int UsableCpus()
+{
+	int cpus = (int)std::thread::hardware_concurrency();
+#if defined(__linux__)
+	cpu_set_t set;
+	if (sched_getaffinity(0, sizeof(set), &set) == 0 && CPU_COUNT(&set) > 0)
+		cpus = CPU_COUNT(&set);
+	// The process's own cgroup (the "0::" line of /proc/self/cgroup).
+	if (FILE* f = std::fopen("/proc/self/cgroup", "r"))
+	{
+		char line[512];
+		std::string path;
+		while (std::fgets(line, sizeof(line), f))
+			if (std::strncmp(line, "0::", 3) == 0)
+			{
+				path = line + 3;
+				while (!path.empty() && (path.back() == '\n' || path.back() == '\r'))
+					path.pop_back();
+			}
+		std::fclose(f);
+		if (!path.empty())
+		{
+			if (FILE* m = std::fopen(("/sys/fs/cgroup" + path + "/cpu.max").c_str(), "r"))
+			{
+				char quota[32] = {};
+				long long period = 0;
+				if (std::fscanf(m, "%31s %lld", quota, &period) == 2 && std::strcmp(quota, "max") != 0 && period > 0)
+				{
+					const long long q = std::atoll(quota);
+					if (q > 0)
+						cpus = std::min(cpus, (int)std::max<long long>(1, (q + period - 1) / period));
+				}
+				std::fclose(m);
+			}
+		}
+	}
+#endif
+	return std::max(1, cpus);
+}
+
 Pool::Pool(const PoolConfig& config)
 	: m_State(std::make_unique<PoolState>())
 {
@@ -1272,7 +1321,7 @@ Pool::Pool(const PoolConfig& config)
 	P.shutdownTimeoutMs = config.shutdownTimeoutMs;
 	P.workerCount = config.workerCount >= 0
 		? config.workerCount
-		: std::max(1, (int)std::thread::hardware_concurrency() - 1);
+		: std::max(1, UsableCpus() - 1);
 
 	P.mainCtx = std::make_unique<WorkerCtx>();
 	P.mainCtx->isMain = true;
@@ -1284,8 +1333,26 @@ Pool::Pool(const PoolConfig& config)
 		P.deques.push_back(P.workerCtx.back().get());
 	}
 	P.idle.reserve((size_t)P.workerCount + 16);
-	for (int i = 0; i < P.workerCount; i++)
-		P.workers.emplace_back(WorkerLoop, std::ref(P), std::ref(*P.workerCtx[(size_t)i]));
+	P.workers.reserve((size_t)P.workerCount);
+#if defined(__cpp_exceptions)
+	try
+#endif
+	{
+		for (int i = 0; i < P.workerCount; i++)
+			P.workers.emplace_back(WorkerLoop, std::ref(P), std::ref(*P.workerCtx[(size_t)i]));
+	}
+#if defined(__cpp_exceptions)
+	catch (...)
+	{
+		// A worker that could not start: stop and join the ones that did,
+		// which hold this state, before the exception frees it.
+		P.stop.store(true, std::memory_order_seq_cst);
+		WakeAllIdle(P);
+		for (auto& w : P.workers)
+			w.join();
+		throw;
+	}
+#endif
 
 	PoolState* expected = nullptr;
 	const bool installed = s_ActivePool.compare_exchange_strong(expected, &P, std::memory_order_acq_rel);
@@ -1489,18 +1556,31 @@ static thread_local int t_ThreadIndex = -1;
 // Gives the thread's index back when the thread exits. The thread's writes
 // before then (to its PerThread values, its stats row) happen before the next
 // thread that takes the index reads them, through the allocator's mutex.
-struct ThreadIndexReturn
+// A pthread key's destructor, not a thread_local's: glibc runs the key
+// destructors after every C++ thread_local destructor, so one of those
+// that calls loom still has the thread's index, rather than taking a new
+// one that nothing gives back. (A key destructor that calls loom after this
+// one sets the key again, and glibc runs this one once more.)
+static void ReturnThreadIndex(void* value)
 {
-	int index = -1;
-	~ThreadIndexReturn()
-	{
-		ThreadIndices& indices = TheThreadIndices();
-		std::lock_guard<std::mutex> lock(indices.mutex);
-		indices.free.push_back(index);
-		std::push_heap(indices.free.begin(), indices.free.end(), std::greater<int>());
-		t_ThreadIndex = kReturnedIndex;
-	}
-};
+	const int index = (int)(reinterpret_cast<intptr_t>(value) - 1);
+	ThreadIndices& indices = TheThreadIndices();
+	std::lock_guard<std::mutex> lock(indices.mutex);
+	indices.free.push_back(index);
+	std::push_heap(indices.free.begin(), indices.free.end(), std::greater<int>());
+	t_ThreadIndex = kReturnedIndex;
+}
+
+static pthread_key_t ThreadIndexKey()
+{
+	static const pthread_key_t key = [] {
+		pthread_key_t k;
+		if (pthread_key_create(&k, &ReturnThreadIndex) != 0)
+			Fatal("pthread_key_create failed (thread indices)");
+		return k;
+	}();
+	return key;
+}
 
 // Assigned on a thread's first call and kept for the thread's life; the
 // lock is only taken then.
@@ -1508,7 +1588,6 @@ int CurrentThreadIndex()
 {
 	if (t_ThreadIndex >= 0)
 		return t_ThreadIndex;
-	const bool exiting = t_ThreadIndex == kReturnedIndex;
 	int index;
 	{
 		ThreadIndices& indices = TheThreadIndices();
@@ -1523,14 +1602,7 @@ int CurrentThreadIndex()
 			index = indices.next++;
 	}
 	t_ThreadIndex = index;
-	// A call from a thread-local destructor that runs after the index went
-	// back gets one of its own, which is never given back: t_Return is
-	// already destroyed and may not be used again.
-	if (!exiting)
-	{
-		static thread_local ThreadIndexReturn t_Return;
-		t_Return.index = index;
-	}
+	pthread_setspecific(ThreadIndexKey(), reinterpret_cast<void*>((intptr_t)index + 1));
 	return index;
 }
 
@@ -2693,8 +2765,9 @@ static DedicatedId RegisterDedicated(PoolState& P, const DedicatedConfig& config
 LaneId AcquireLane(const char* name)
 {
 	PoolState& P = ActivePool();
-	P.lanesHeld.fetch_add(1, std::memory_order_relaxed);
-	return RegisterDedicated(P, DedicatedConfig{ .name = name, .idle = DedicatedConfig::Idle::Sleep }, true);
+	const LaneId lane = RegisterDedicated(P, DedicatedConfig{ .name = name, .idle = DedicatedConfig::Idle::Sleep }, true);
+	P.lanesHeld.fetch_add(1, std::memory_order_relaxed); // once it exists: a failed start holds nothing
+	return lane;
 }
 
 void ReleaseLane(LaneId lane)
@@ -4210,11 +4283,18 @@ static DedicatedId RegisterDedicated(PoolState& P, const DedicatedConfig& config
 	d->stop = false;
 	d->lane = lane;
 	DedicatedId handle = id;
+	// Room in both lists first, then the thread: if it cannot start, nothing
+	// has changed; once it runs, adding it cannot fail.
+	P.dedicated.reserve(P.dedicated.size() + 1);
+	{
+		std::lock_guard<std::mutex> park(P.parkMutex);
+		P.parkDedicated.reserve(P.parkDedicated.size() + 1);
+	}
+	d->thread = std::thread(DedicatedLoop, std::ref(P), std::ref(*d));
 	{
 		std::lock_guard<std::mutex> park(P.parkMutex);
 		P.parkDedicated.push_back(d.get());
 	}
-	d->thread = std::thread(DedicatedLoop, std::ref(P), std::ref(*d));
 	P.dedicated.push_back(std::move(d));
 	return handle;
 }

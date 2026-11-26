@@ -28,6 +28,7 @@
 
 #if defined(__linux__)
 #include <pthread.h>
+#include <sched.h>
 #include <csignal>
 #include <fcntl.h>
 #include <sys/wait.h>
@@ -5383,6 +5384,55 @@ TEST_CASE("loom: Shutdown — a pool thread's thread-local destructor that submi
 		loom::WaitFor(done, loom::Help::BlockOnly);
 	}, err));
 	CHECK(err.find("submitted after Shutdown stopped") != std::string::npos);
+}
+
+// ---- Threads that come and go ------------------------------------------------------------
+
+struct WaitsOnExit
+{
+	bool armed = false;
+	~WaitsOnExit()
+	{
+		if (!armed)
+			return;
+		loom::ScopedCounter done(1);
+		loom::Submit([] {}, { .signals = done });
+		loom::WaitFor(done);
+	}
+};
+
+TEST_CASE("loom: thread indices — a thread-local destructor that calls loom does not keep an index of its own")
+{
+	// Outside threads, one alive at a time, each flushing work from a
+	// thread-local destructor made before its first loom call: the index
+	// goes back once that destructor is done, so the next thread reuses it.
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
+	int highest = 0;
+	for (int i = 0; i < 300; i++)
+	{
+		std::thread([&highest] {
+			static thread_local WaitsOnExit t_flush; // constructed before the index is taken
+			t_flush.armed = true;
+			highest = std::max(highest, loom::CurrentThreadIndex());
+		}).join();
+	}
+	CHECK(highest < 16); // each used to take a new index, never given back
+}
+
+TEST_CASE("loom: PoolConfig — the default worker count follows the CPUs this process may use")
+{
+	REQUIRE(!loom::HasActivePool());
+	CHECK(EndsWithin([] {
+		cpu_set_t set;
+		CPU_ZERO(&set);
+		CPU_SET(0, &set);
+		CPU_SET(1, &set);
+		if (sched_setaffinity(0, sizeof(set), &set) != 0)
+			return; // not allowed here: nothing to check
+		loom::Pool pool; // max(1, usable CPUs - 1)
+		if (loom::WorkerCount() != 1)
+			_exit(3);
+	}, 5000));
 }
 
 } // namespace

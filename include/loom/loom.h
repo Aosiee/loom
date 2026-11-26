@@ -118,7 +118,9 @@ struct TaskDesc
 
 struct PoolConfig
 {
-	int      workerCount = -1;   // default max(1, hw_concurrency - 1)
+	// Default: one less than the CPUs this process may use (its affinity
+	// mask, capped by its cgroup's CPU quota), and at least 1.
+	int      workerCount = -1;
 	// The task-slot pool's starting size, rounded up to 4096s. It grows (with
 	// a warning) when more tasks are live at once, up to 4194304; past that
 	// the program ends.
@@ -1795,10 +1797,12 @@ DedicatedId RegisterDedicatedThread(const DedicatedConfig&);
 void         UnregisterDedicatedThread(DedicatedId);
 
 // ---- Thread identity -------------------------------------------------------
-// A stable small index for the CALLING thread: 0 = the initialising
-// (main) thread, 1..N = the pool workers and dedicated threads, and any
-// other thread gets one on first use. Consumers key per-thread scratch
-// (debug_draw's command chunks) on this index.
+// A stable small index for the CALLING thread, taken on its first call into
+// loom (a pool's construction, for the thread that builds it; a worker's or
+// dedicated thread's start). Consumers key per-thread scratch (debug_draw's
+// command chunks) on this index. Which thread gets which is not fixed: the
+// main thread has 0 only if it asked first, and a later pool's worker can
+// take 0 once the thread that held it has exited.
 //
 // A thread keeps its index until it exits; then the index goes back, and the
 // next new thread takes the lowest one free. So the indices stay below the
