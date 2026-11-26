@@ -163,7 +163,8 @@ public:
 	Pool(const Pool&) = delete;
 	Pool& operator=(const Pool&) = delete;
 
-	// Idempotent. Drains first: every submitted task runs, including work
+	// Idempotent; a Shutdown called while another is under way returns once
+	// that one has (pumping meanwhile, on the main thread). Drains first: every submitted task runs, including work
 	// submitted while draining, and every WaitFor completes. Main-thread work
 	// runs on the calling thread when that is the main thread; called from
 	// another thread, it relies on the main thread's PumpMainThreadTasks,

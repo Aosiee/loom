@@ -2866,6 +2866,38 @@ TEST_CASE("loom: Shutdown from another thread — the main thread's pump runs ma
 	CHECK(ran.load());
 }
 
+TEST_CASE("loom: Shutdown — called on several threads at once, one drains and the rest wait for it")
+{
+	using namespace std::chrono_literals;
+	for (int trial = 0; trial < 20; trial++)
+	{
+		std::atomic<bool> taskDone{ false }, go{ false };
+		std::atomic<int> returned{ 0 }, early{ 0 };
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 2, .shutdownTimeoutMs = 2000 });
+		loom::Submit([&] {
+			std::this_thread::sleep_for(20ms);
+			taskDone = true;
+		});
+		std::vector<std::thread> closers;
+		for (int i = 0; i < 3; i++)
+			closers.emplace_back([&] {
+				while (!go) {}
+				pool.Shutdown();
+				if (!taskDone || loom::HasActivePool())
+					early++;
+				returned++;
+			});
+		go = true;
+		pool.Shutdown(); // the main thread too: it pumps if another one drains
+		CHECK(taskDone.load());
+		for (auto& t : closers)
+			t.join();
+		CHECK(returned.load() == 3);
+		CHECK(early.load() == 0); // none returned before the pool was down
+		CHECK_FALSE(loom::HasActivePool());
+	}
+}
+
 TEST_CASE("loom: Pool — a thread that sees the pool active sees it built")
 {
 	for (int round = 0; round < 50; round++)

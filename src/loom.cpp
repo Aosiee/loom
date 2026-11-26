@@ -599,6 +599,7 @@ struct PoolState
 	// false from the first instruction of Shutdown (HasActivePool then
 	// reports the pool as down while it drains).
 	std::atomic<bool>       running{ false };
+	std::atomic<bool>       shutDown{ false }; // Shutdown has returned (a second one waits for it)
 	std::atomic<bool>       stop{ false };
 	std::thread::id         mainThreadId;
 
@@ -1467,15 +1468,32 @@ static void DrainForShutdown(PoolState& P)
 	}
 }
 
+// A Shutdown that found another under way: returns once that one has, the
+// main thread pumping meanwhile, since the other may rely on it.
+static void WaitForOtherShutdown(PoolState& P)
+{
+	const bool onMain = std::this_thread::get_id() == P.mainThreadId;
+	while (!P.shutDown.load(std::memory_order_acquire))
+	{
+		if (onMain)
+			PumpMainThreadTasks();
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+}
+
 void Pool::Shutdown()
 {
 	PoolState& P = *m_State;
-	if (!P.running) return;
+	if (P.shutDown.load(std::memory_order_acquire))
+		return;
 	// From inside a task, the drain would wait for that task, and then the
 	// thread would join itself.
 	if (t_TaskDepth > 0)
 		Fatal("Pool::Shutdown called from inside a task (the drain would wait for that task)");
-	P.running = false; // HasActivePool and PumpMainThreadTasks report the pool as down from here
+	// HasActivePool and PumpMainThreadTasks report the pool as down from
+	// here. One Shutdown runs; one called meanwhile waits for it.
+	if (!P.running.exchange(false, std::memory_order_acq_rel))
+		return WaitForOtherShutdown(P);
 
 	// A park still in effect (its UnparkAll skipped by an exception, say)
 	// would keep the parked threads from draining and from ever exiting.
@@ -1568,6 +1586,7 @@ void Pool::Shutdown()
 	// reading it: the Pool is freed once Shutdown returns.
 	while (s_Pumping.load(std::memory_order_seq_cst) > 0)
 		std::this_thread::yield();
+	P.shutDown.store(true, std::memory_order_release);
 }
 
 bool HasActivePool()
