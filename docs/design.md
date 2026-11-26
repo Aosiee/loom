@@ -498,6 +498,17 @@ participants are woken to reach their own park points. Queued work stays
 queued. `UnparkAll` releases them all. A host uses this to change code or
 data no thread may be running, such as a live code patch.
 
+`ParkAll` waits for threads, not for a number of arrivals. Each worker and
+each dedicated thread notes, under the park lock, the round it parked in
+(the count of releases so far); the request is complete once every worker
+and every dedicated thread registered at that moment shows the current
+round. A dedicated thread registered mid-park joins the threads waited for;
+one being unregistered leaves them, so neither can complete the park in
+place of a worker still in a long task. Participants are only counted.
+A parked thread also leaves the park when it is told to stop, so a
+dedicated thread can be unregistered while parked, and Shutdown releases a
+park still in effect before it drains.
+
 ## Debug dump
 
 Each pool thread, and the main thread, keeps a small record of what it is

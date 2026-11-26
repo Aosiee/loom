@@ -453,6 +453,7 @@ struct DedicatedState
 	std::atomic<int64_t>   addressed{ 0 };
 	bool                   lane = false;         // made by AcquireLane
 	bool                   laneReleased = false; // under the registry lock
+	uint64_t               parkedRound = ~0ull;  // under parkMutex (see PoolState)
 };
 
 // ---- Per-thread scheduler state (the main thread and each worker) ------------------
@@ -479,6 +480,7 @@ struct alignas(64) WorkerCtx
 	// the thieves start their scans at different deques.
 	uint32_t rng = 0x9E3779B9u;
 	bool     isMain = false;
+	uint64_t parkedRound = ~0ull; // a worker's, under parkMutex (see PoolState)
 	// Free task slots this thread may reuse without touching the shared
 	// stack: it allocates from here, finished tasks land here, and it trades
 	// with the shared stack a batch at a time. Owner only.
@@ -617,6 +619,18 @@ struct PoolState
 	struct ParkParticipant { int id; ParkWakeFn wake; void* user; };
 	std::vector<ParkParticipant> participants;
 	int nextParticipant = 1;
+	// Who must check in, all under parkMutex. A worker or a dedicated thread
+	// notes the round it parked in on its own state (see ParkSelf); ParkAll
+	// waits for every worker and every dedicated thread registered NOW to
+	// show this round, so a thread that arrives in another's place (one
+	// registered mid-park, one being unregistered) cannot complete it.
+	// Participants have no identity: their check-ins are counted.
+	std::vector<DedicatedState*> parkDedicated;
+	size_t                  parkedOthers = 0;
+	// ParkAll calls the participants' wakes outside the lock; an unregister
+	// waits for none to be in flight (its `user` may be freed after it).
+	int                     parkWakesInFlight = 0;
+	std::thread::id         parkWaker;
 
 	// The profiler shim's hooks. Atomic: the owner unhooks while the workers
 	// are still alive.
@@ -948,7 +962,14 @@ static void     SignalCounter(PoolState& P, CounterHandle h, int n);
 static void     FlushDeferredSignals(PoolState& P, WorkerCtx* ctx);
 static void     WakeForWork(PoolState& P, size_t n);
 static bool     TryHelpIn(PoolState& P);
-static void     ParkHere(PoolState& P, int index, const char* name);
+// Who is parking: a worker or a dedicated thread names its round field and
+// its stop flag (it leaves the park once that is set); a participant neither.
+struct ParkSelf
+{
+	uint64_t*                parkedRound = nullptr;
+	const std::atomic<bool>* stop = nullptr;
+};
+static void     ParkHere(PoolState& P, int index, const char* name, ParkSelf self = {});
 static void     WorkerLoop(PoolState& P, WorkerCtx& ctx);
 static void     DedicatedLoop(PoolState& P, DedicatedState& d);
 static PaddedStats* RegisterThreadStats(PoolState& P, int index, const char* name);
@@ -1258,6 +1279,19 @@ void Pool::Shutdown()
 	if (!P.running) return;
 	P.running = false; // HasActivePool and PumpMainThreadTasks report the pool as down from here
 
+	// A park still in effect (its UnparkAll skipped by an exception, say)
+	// would keep the parked threads from draining and from ever exiting.
+	{
+		std::lock_guard<std::mutex> lock(P.parkMutex);
+		if (P.parkRequested.load())
+		{
+			P.parkRequested = false;
+			P.parkReleases++;
+			P.parked.clear();
+			P.parkCV.notify_all();
+		}
+	}
+
 	// Drain first, with every thread still running: a task may still submit
 	// work (main-thread work too) and wait for it, and every wait completes.
 	DrainForShutdown(P);
@@ -1284,6 +1318,11 @@ void Pool::Shutdown()
 				Wake(*d->waiter, kWokeRecheck);
 				d->waiter = nullptr;
 			}
+		}
+		{
+			std::lock_guard<std::mutex> park(P.parkMutex);
+			P.parkCV.notify_all(); // a parked one leaves once its stop flag is set
+			P.parkDedicated.clear();
 		}
 		for (auto& d : P.dedicated)
 			if (d->thread.joinable()) d->thread.join();
@@ -3572,7 +3611,7 @@ static void WorkerLoop(PoolState& P, WorkerCtx& ctx)
 		{
 			stopSearching();
 			FlushDeferredSignals(P, &ctx);
-			ParkHere(P, index, stats ? stats->name : "loom-worker");
+			ParkHere(P, index, stats ? stats->name : "loom-worker", ParkSelf{ &ctx.parkedRound, &P.stop });
 			continue;
 		}
 
@@ -3722,7 +3761,7 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 	{
 		if (P.parkRequested.load(std::memory_order_acquire) && !d.stop.load(std::memory_order_acquire))
 		{
-			ParkHere(P, index, name);
+			ParkHere(P, index, name, ParkSelf{ &d.parkedRound, &d.stop });
 			continue;
 		}
 		uint32_t slot = PopFront(d.mutex, d.queue);
@@ -3792,6 +3831,10 @@ static DedicatedId RegisterDedicated(PoolState& P, const DedicatedConfig& config
 	d->stop = false;
 	d->lane = lane;
 	DedicatedId handle = id;
+	{
+		std::lock_guard<std::mutex> park(P.parkMutex);
+		P.parkDedicated.push_back(d.get());
+	}
 	d->thread = std::thread(DedicatedLoop, std::ref(P), std::ref(*d));
 	P.dedicated.push_back(std::move(d));
 	return handle;
@@ -3828,6 +3871,8 @@ void UnregisterDedicatedThread(DedicatedId id)
 			{
 				d = std::move(*it);
 				P.dedicated.erase(it);
+				std::lock_guard<std::mutex> park(P.parkMutex);
+				std::erase(P.parkDedicated, d.get());
 				break;
 			}
 		}
@@ -3856,6 +3901,11 @@ void UnregisterDedicatedThread(DedicatedId id)
 			Wake(*d->waiter, kWokeRecheck);
 			d->waiter = nullptr;
 		}
+	}
+	{
+		// A parked thread leaves the park once its stop flag is set.
+		std::lock_guard<std::mutex> park(P.parkMutex);
+		P.parkCV.notify_all();
 	}
 	if (d->thread.joinable()) d->thread.join();
 }
@@ -3908,7 +3958,7 @@ void CaptureReturnAddresses(std::vector<uintptr_t>& out, size_t max)
 // A pool thread's (or participant's) side of a park: record where it is,
 // check in, and block until the round it joined is released. The stack is
 // captured before taking the lock, so ParkAll's caller can read it at once.
-static void ParkHere(PoolState& P, int index, const char* name)
+static void ParkHere(PoolState& P, int index, const char* name, ParkSelf who)
 {
 	ParkedThread self;
 	self.index = index;
@@ -3918,10 +3968,30 @@ static void ParkHere(PoolState& P, int index, const char* name)
 	std::unique_lock<std::mutex> lock(P.parkMutex);
 	if (!P.parkRequested.load())
 		return; // released before this thread arrived
+	if (who.stop && who.stop->load(std::memory_order_acquire))
+		return; // stopping: it will not be back to be released
 	const uint64_t round = P.parkReleases;
 	P.parked.push_back(std::move(self));
+	if (who.parkedRound)
+		*who.parkedRound = round;
+	else
+		P.parkedOthers++;
 	P.parkedCV.notify_all();
-	P.parkCV.wait(lock, [&] { return P.parkReleases != round; });
+	P.parkCV.wait(lock, [&] {
+		return P.parkReleases != round || (who.stop && who.stop->load(std::memory_order_acquire));
+	});
+}
+
+// parkMutex held: every thread that must park this round has.
+static bool AllParked(PoolState& P, uint64_t round)
+{
+	for (WorkerCtx* c : P.deques)
+		if (!c->isMain && c->parkedRound != round)
+			return false;
+	for (DedicatedState* d : P.parkDedicated)
+		if (d->parkedRound != round)
+			return false;
+	return P.parkedOthers >= P.participants.size();
 }
 
 // Request, wake everyone who might be asleep, then wait for every thread to
@@ -3929,21 +3999,36 @@ static void ParkHere(PoolState& P, int index, const char* name)
 bool ParkAll(uint32_t timeoutMs)
 {
 	PoolState& P = ActivePool();
-	size_t expected = 0;
-	{
-		std::lock_guard<std::mutex> lock(P.dedicatedMutex);
-		expected = P.workers.size() + P.dedicated.size();
-	}
+	// A pool thread would wait for itself.
+	const bool poolThread = CurrentDedicated() || (CurrentCtx(P) && !CurrentCtx(P)->isMain);
+	assert(!poolThread && "ParkAll from a pool thread (it would wait for itself)");
+	if (poolThread)
+		return false;
 	std::vector<PoolState::ParkParticipant> participants;
+	uint64_t round = 0;
 	{
 		std::lock_guard<std::mutex> lock(P.parkMutex);
+		// One park at a time: a second would wait for threads already parked
+		// in the first, and its timeout would release them.
+		assert(!P.parkRequested.load() && "ParkAll while a park is in effect");
+		if (P.parkRequested.load())
+			return false;
 		P.parked.clear();
+		P.parkedOthers = 0;
 		P.parkRequested = true;
+		round = P.parkReleases;
 		participants = P.participants;
+		P.parkWakesInFlight++;
+		P.parkWaker = std::this_thread::get_id();
 	}
-	expected += participants.size();
 	for (auto& p : participants)
 		p.wake(p.user);
+	{
+		std::lock_guard<std::mutex> lock(P.parkMutex);
+		P.parkWakesInFlight--;
+		P.parkWaker = std::thread::id();
+		P.parkedCV.notify_all();
+	}
 	// Wake the sleepers under their lists' locks: each re-checks the request
 	// after registering, so it either sees it or is woken here.
 	WakeAllIdle(P);
@@ -3962,7 +4047,7 @@ bool ParkAll(uint32_t timeoutMs)
 	bool all = false;
 	{
 		std::unique_lock<std::mutex> lock(P.parkMutex);
-		all = P.parkedCV.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&] { return P.parked.size() >= expected; });
+		all = P.parkedCV.wait_for(lock, std::chrono::milliseconds(timeoutMs), [&] { return AllParked(P, round); });
 	}
 	if (!all)
 		UnparkAll();
@@ -3995,8 +4080,13 @@ void UnregisterParkParticipant(int id)
 	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
 	if (!pool || id == 0)
 		return;
-	std::lock_guard<std::mutex> lock(pool->parkMutex);
+	std::unique_lock<std::mutex> lock(pool->parkMutex);
 	std::erase_if(pool->participants, [id](const PoolState::ParkParticipant& p) { return p.id == id; });
+	// ParkAll may be calling this participant's wake right now, outside the
+	// lock: wait for it, so `user` can be freed once this returns (unless
+	// this is that call).
+	if (pool->parkWaker != std::this_thread::get_id())
+		pool->parkedCV.wait(lock, [&] { return pool->parkWakesInFlight == 0; });
 }
 
 bool IsParkRequested()

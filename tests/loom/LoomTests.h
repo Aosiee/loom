@@ -549,6 +549,87 @@ TEST_CASE("loom: lanes — exclusive reservation, lifecycle, shutdown wait")
 	pool.Shutdown(); // asserts no lanes still held
 }
 
+TEST_CASE("loom: park — a thread registered mid-park cannot stand in for a busy one")
+{
+	using namespace std::chrono_literals;
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+	std::atomic<bool> release{ false }, inTask{ false };
+	loom::ScopedCounter busy(1);
+	loom::Submit([&] {
+		inTask = true;
+		while (!release) std::this_thread::sleep_for(1ms);
+	}, loom::TaskDesc{ .signals = busy });
+	while (!inTask) std::this_thread::sleep_for(1ms);
+	std::atomic<int> result{ -1 };
+	std::thread requester([&] { result = loom::ParkAll(300) ? 1 : 0; });
+	std::this_thread::sleep_for(50ms);
+	const loom::DedicatedId late = loom::RegisterDedicatedThread({ .name = "late" }); // parks at once
+	requester.join();
+	CHECK(result.load() == 0); // the worker never parked: its task still runs
+	release = true;
+	loom::WaitFor(busy);
+	loom::UnregisterDedicatedThread(late);
+}
+
+TEST_CASE("loom: park — a parked dedicated thread can be unregistered, and Shutdown ends a park")
+{
+	using namespace std::chrono_literals;
+	{
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
+		const loom::DedicatedId d = loom::RegisterDedicatedThread({ .name = "parked" });
+		REQUIRE(loom::ParkAll(2000));
+		std::atomic<bool> gone{ false };
+		std::thread unregister([&] { loom::UnregisterDedicatedThread(d); gone = true; });
+		for (int i = 0; i < 200 && !gone; i++)
+			std::this_thread::sleep_for(10ms);
+		CHECK(gone.load()); // it left the park to exit, rather than wait for UnparkAll
+		loom::UnparkAll();
+		unregister.join();
+	}
+	{
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
+		const loom::DedicatedId d = loom::RegisterDedicatedThread({ .name = "parked" });
+		(void)d;
+		REQUIRE(loom::ParkAll(2000));
+		// No UnparkAll (an exception skipped it, say): ~Pool must not hang.
+	}
+}
+
+TEST_CASE("loom: park — unregistering a participant waits for a wake in flight")
+{
+	using namespace std::chrono_literals;
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+	struct Slow
+	{
+		std::atomic<bool> inWake{ false }, wakeDone{ false };
+	} slow;
+	const int id = loom::RegisterParkParticipant([](void* u) {
+		auto* p = static_cast<Slow*>(u);
+		p->inWake = true;
+		std::this_thread::sleep_for(100ms);
+		p->wakeDone = true;
+	}, &slow);
+	std::thread requester([] { (void)loom::ParkAll(200); }); // the participant never checks in: it times out
+	while (!slow.inWake) std::this_thread::sleep_for(1ms);
+	loom::UnregisterParkParticipant(id);
+	CHECK(slow.wakeDone.load()); // `slow` could be freed now
+	requester.join();
+	if (loom::IsParkRequested())
+		loom::UnparkAll();
+}
+
+#if defined(NDEBUG)
+TEST_CASE("loom: park — a second ParkAll while parked is refused and leaves the first in effect")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
+	REQUIRE(loom::ParkAll(2000));
+	CHECK_FALSE(loom::ParkAll(300)); // asserts in a debug build
+	CHECK(loom::IsParkRequested());
+	CHECK(loom::ParkedThreads().size() == 2);
+	loom::UnparkAll();
+}
+#endif
+
 // The park stops every pool thread (workers,
 // dedicated threads, lanes, participants) at its loop top; queued work waits.
 TEST_CASE("loom: park — every thread parks with its stack, queued work waits, unpark resumes")

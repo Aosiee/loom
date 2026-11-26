@@ -1952,9 +1952,14 @@ std::string DebugDump(TaskNameFn nameOf = nullptr); // both of the above
 // Stops every pool thread (the workers, the dedicated threads, the lanes) at
 // a known point: each finishes its current task, records its own stack and
 // blocks at its loop top until UnparkAll. Queued tasks stay queued; the
-// caller keeps running and must not be a pool thread. ParkAll returns false,
-// with every thread released again, when one did not park within
-// `timeoutMs` (a long task).
+// caller keeps running. ParkAll returns true once every worker and every
+// dedicated thread registered at that moment has parked, and each
+// participant has checked in. It returns false, with every thread released
+// again, when one did not within `timeoutMs` (a long task). One park at a
+// time, and not from a pool thread (it would wait for itself): either
+// asserts, and returns false without touching the park in effect.
+// A dedicated thread unregistered while parked leaves the park to exit, and
+// Shutdown ends a park still in effect.
 struct ParkedThread
 {
 	int index = 0;
@@ -1967,7 +1972,10 @@ void UnparkAll();
 // A thread outside the pool that runs engine code (the hot-reload listener,
 // the profiler writer) joins the park as a participant: ParkAll calls its
 // `wake` (from the requesting thread) so it reaches its known wait point,
-// where it calls ParkPoint. No-ops with no active pool.
+// where it calls ParkPoint. Only participants call ParkPoint: their
+// check-ins are counted, not told apart. Unregistering a participant waits
+// for a `wake` call in flight, so `user` may be freed once it returns.
+// No-ops with no active pool.
 using ParkWakeFn = void (*)(void* user);
 int  RegisterParkParticipant(ParkWakeFn wake, void* user);
 void UnregisterParkParticipant(int id);
