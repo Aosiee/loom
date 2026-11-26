@@ -5161,6 +5161,21 @@ TEST_CASE("loom: Isolated — a wait finds its region's task below many foreign 
 	loom::WaitFor(outer);
 }
 
+TEST_CASE("loom: Isolated — a pump inside a region runs only the region's main-thread tasks")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+	std::atomic<bool> outside{ false }, inside{ false };
+	loom::Submit([&] { outside = true; }, { .affinity = loom::Affinity::MainThread });
+	loom::Isolated([&] {
+		loom::Submit([&] { inside = true; }, { .affinity = loom::Affinity::MainThread });
+		loom::PumpMainThreadTasks();
+		CHECK(inside.load());
+		CHECK_FALSE(outside.load()); // not the region's: it may need what the region's waits will not run
+	});
+	loom::PumpMainThreadTasks();
+	CHECK(outside.load());
+}
+
 TEST_CASE("loom: Isolated — main-thread work of another region does not wake an isolated main-thread wait")
 {
 	// A worker outside the region streams main-thread tasks while the main

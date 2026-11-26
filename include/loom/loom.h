@@ -1829,6 +1829,8 @@ void   ReleaseLane(LaneId lane);
 // queued when it starts, not those they queue as they run (a task that
 // resubmits itself runs once per pump). WaitFor on the main thread runs them
 // too. On the main thread only: elsewhere it asserts and does nothing.
+// Inside an Isolated region it runs only that region's tasks, as a wait
+// there does.
 void PumpMainThreadTasks();
 
 // ---- Dedicated threads -----------------------------------------------------

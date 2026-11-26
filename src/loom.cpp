@@ -4030,9 +4030,12 @@ void PumpMainThreadTasks()
 		std::lock_guard<std::mutex> lock(P.mainMutex);
 		queued = P.mainQueue.size();
 	}
+	// Inside an isolated region, only the region's tasks, as a wait there
+	// runs: another's may need work the region's waits will not run.
+	const uint16_t region = ActiveIsolation(P);
 	for (size_t k = 0; k < queued; k++)
 	{
-		const uint32_t slot = PopFront(P.mainMutex, P.mainQueue);
+		const uint32_t slot = region != 0 ? PopFrontInRegion(P, P.mainMutex, P.mainQueue, region) : PopFront(P.mainMutex, P.mainQueue);
 		if (slot == kNoSlot)
 			break;
 		RunSlot(P, slot, ctx);
