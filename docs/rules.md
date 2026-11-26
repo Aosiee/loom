@@ -107,8 +107,9 @@ future is dropped and its task has finished. A task that waits on
 `future.Counter()` and reads `future.Get()` needs the future to outlive it:
 keep the future where both can reach it (a member, or the frame's state),
 and drop it only after that task's own counter has reached zero. Each
-pending future holds one counter, so thousands in flight at once need a
-larger `PoolConfig::maxCounters`.
+future holds one counter until it is dropped, whether its value is there
+yet or not, so thousands kept at once (in flight, or a cache of finished
+ones) need a larger `PoolConfig::maxCounters`.
 
 A continuation is the exception: `Then` holds its input itself, so a chain
 may be built from temporaries and only its last future kept.
@@ -132,11 +133,15 @@ is another thread's. Release locks before the `co_await`, and read
 after it.
 
 A coroutine's parameters are copied into its frame, but a reference
-parameter (a `const std::string&`, a lambda's captures by reference) stays
-a reference: what it names must outlive the coroutine, not just the call
-that started it. Pass what the coroutine reads after a suspension by
-value. A counter awaited with `After` must live until the coroutine has
-resumed.
+parameter (a `const std::string&`) stays a reference: what it names must
+outlive the coroutine, not just the call that started it. Pass what the
+coroutine reads after a suspension by value. A lambda that is a coroutine
+is the same case, for all its captures, by value too: they live in the
+lambda object, not in the frame, so calling a temporary lambda leaves them
+dangling after the first suspension. Keep the lambda alive until the
+coroutine ends, or make it a function with value parameters. A counter
+awaited with `After` must live until the coroutine has resumed, and so must
+the storage of a span of them.
 
 ## Merge per-thread storage only after the work is done
 

@@ -2797,8 +2797,35 @@ void ReleaseFuture(FutureStateBase* state) noexcept
 	// acq_rel: the last one sees everything the others wrote (the value).
 	if (state->refs.fetch_sub(1, std::memory_order_acq_rel) != 1)
 		return;
-	DestroyCounter(state->counter);
-	state->destroy(state);
+	// Destroying a state can release another (a coroutine's frame holds the
+	// futures it was given), which can release another: a chain of a hundred
+	// thousand coroutines, each awaiting the one before, would recurse that
+	// deep. A release inside a destroy only queues; the outermost one on this
+	// thread destroys them in turn.
+	static thread_local bool t_Destroying = false;
+	static thread_local std::vector<FutureStateBase*> t_ToDestroy;
+	if (t_Destroying)
+	{
+		t_ToDestroy.push_back(state);
+		return;
+	}
+	t_Destroying = true;
+	for (;;)
+	{
+		DestroyCounter(state->counter);
+		state->destroy(state);
+		if (t_ToDestroy.empty())
+			break;
+		state = t_ToDestroy.back();
+		t_ToDestroy.pop_back();
+	}
+	t_Destroying = false;
+}
+
+void HelpOnce()
+{
+	if (!TryHelpIn(ActivePool()))
+		std::this_thread::yield();
 }
 
 #if defined(LOOM_COROUTINES)

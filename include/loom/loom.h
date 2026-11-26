@@ -379,8 +379,12 @@ private:
 // allocation, freed once the future, its task or promise, and any
 // continuation reading it have all let go. Dropping a future before its
 // value is there is fine: the task still runs. A future's task always runs:
-// it ignores Cancel. Each pending future holds one counter
-// (PoolConfig::maxCounters), and like a counter it must not outlive the pool.
+// it ignores Cancel. Each future holds one counter (PoolConfig::maxCounters)
+// until it is dropped, ready or not, so a cache of finished futures holds
+// one each; like a counter, a future must not outlive the pool.
+//
+// A future's continuations all get its value as a T&, and may run at the
+// same time: one that changes the value should be its only reader.
 //
 // The TaskDesc of Async and Then gives the task's affinity, thread,
 // priority, limiter, waitsForAll and profiler fields; fn, userData and
@@ -408,6 +412,9 @@ namespace detail {
 	{
 		CounterHandle    counter = kInvalidCounter;
 		std::atomic<int> refs{ 2 }; // one per owner: the future, its task or promise, continuations
+		// Continuations that have yet to read the value: a co_await that moves
+		// the value out waits for them (see FutureAwaiter).
+		std::atomic<int> readers{ 0 };
 		void (*destroy)(FutureStateBase*) noexcept = nullptr;
 		bool             broken = false; // completed without a value (also `error`, with exceptions)
 #if defined(__cpp_exceptions)
@@ -434,6 +441,9 @@ namespace detail {
 	void SignalFuture(FutureStateBase* state) noexcept;
 	// Drops one reference; the last frees the counter and the state.
 	void ReleaseFuture(FutureStateBase* state) noexcept;
+	// Runs one task while waiting, or yields: for the short waits of the
+	// futures (a co_await that moves the value out, see FutureAwaiter).
+	void HelpOnce();
 	inline void RetainFuture(FutureStateBase* state) noexcept { state->refs.fetch_add(1, std::memory_order_relaxed); }
 
 	// A continuation's input failed: its own future fails the same way.
@@ -517,6 +527,7 @@ namespace detail {
 			else
 				RunInto(t, t.fn, *in.value);
 			t.fn.~F();
+			in.readers.fetch_sub(1, std::memory_order_release); // done with the value
 			ReleaseFuture(&in);
 			FinishFuture(&t);
 		}
@@ -592,6 +603,7 @@ public:
 		task->destroy = &Task::Destroy;
 		task->input = m_State;
 		detail::RetainFuture(m_State);
+		m_State->readers.fetch_add(1, std::memory_order_relaxed);
 		detail::StartFuture(task, &Task::Run, opts, m_State->counter);
 		return Future<U>(task);
 	}
@@ -599,8 +611,10 @@ public:
 	CounterHandle Counter() const { return m_State ? m_State->counter : kInvalidCounter; }
 #if defined(LOOM_COROUTINES)
 	// co_await future, in a coroutine: the value (a reference into the
-	// future, or moved out of a temporary one), or the error rethrown. See
-	// Coroutines below.
+	// future, or moved out of a temporary one), or the error rethrown. A
+	// move out of a future whose continuations are still reading it copies
+	// the value instead, or, for a type that cannot be copied, waits for them
+	// to finish. See Coroutines below.
 	detail::FutureAwaiter<T, false> operator co_await() &;
 	detail::FutureAwaiter<T, true> operator co_await() &&;
 	// A coroutine may return a Future: see Coroutines below.
@@ -676,7 +690,7 @@ public:
 	// The future it completes. Once per promise, before or after it is set.
 	[[nodiscard]] Future<T> GetFuture()
 	{
-		CheckUsable(!m_Taken);
+		CheckUsable(m_State != nullptr && !m_Taken);
 		m_Taken = true;
 		detail::RetainFuture(m_State);
 		return Future<T>(m_State);
@@ -686,7 +700,7 @@ public:
 		requires (std::is_void_v<T> ? sizeof...(A) == 0 : std::is_constructible_v<T, A&&...>)
 	void SetValue(A&&... args)
 	{
-		CheckUsable(!m_Set);
+		CheckUsable(m_State != nullptr && !m_Set);
 		if constexpr (!std::is_void_v<T>)
 			m_State->value.emplace(std::forward<A>(args)...);
 		Complete();
@@ -695,7 +709,7 @@ public:
 	// Completes the future with an error for Get to rethrow.
 	void SetException(std::exception_ptr error)
 	{
-		CheckUsable(!m_Set && error != nullptr);
+		CheckUsable(m_State != nullptr && !m_Set && error != nullptr);
 		m_State->error = std::move(error);
 		Complete();
 	}
@@ -756,7 +770,8 @@ private:
 // to its first wait that suspends; `co_await loom::ResumeOn()` first starts
 // it as a task instead. What it throws goes to its future, as a task's goes
 // to an Async future. Its frame, which holds its future's state, is one heap
-// allocation; the future holds a counter until the coroutine has finished.
+// allocation; the future holds a counter until it is dropped (as every
+// future does).
 // Its locals are destroyed as it ends, before its future is ready; its
 // parameters, copied into the frame, go with the frame, once the future
 // (and any continuation reading it) has let go too. A reference parameter
@@ -788,8 +803,15 @@ private:
 // until co_await returns, which a temporary does. A suspended coroutine is
 // a waiting task, so the pool's drain and debug dump see it; one that can
 // never resume is reported at Shutdown like any task that cannot run.
-// Coroutines work with any coroutine type, not only one returning a Future:
-// the awaitables need nothing from the coroutine's promise.
+// The awaitables need nothing from the coroutine's promise, so they work in
+// other coroutine types too, with one caveat for GCC (16 at least): its
+// coroutines keep a count in the frame that the code starting the coroutine
+// still touches after the first suspension. A coroutine type that frees its
+// frame as it ends (final_suspend returning suspend_never, a fire-and-forget
+// task) can be resumed on another thread, finish and free the frame while
+// that happens. A Future coroutine keeps its frame until the last reference
+// lets go, so it is safe; a type of your own should keep its frame suspended
+// at the end too, as most task types do.
 #if defined(LOOM_COROUTINES)
 namespace detail {
 	// Submits a task that resumes `coroutine` once `waitsFor` and every
@@ -829,7 +851,21 @@ namespace detail {
 			if constexpr (std::is_void_v<T>)
 				return;
 			else if constexpr (Move)
+			{
+				// Continuations of this future may still be reading the value
+				// (each gets it as a T&). Moving it out from under them is a
+				// race: copy it while they read, or, for a type that cannot be
+				// copied, let them finish first.
+				if (state->readers.load(std::memory_order_acquire) != 0)
+				{
+					if constexpr (std::is_copy_constructible_v<T>)
+						return T(static_cast<const T&>(*state->value));
+					else
+						while (state->readers.load(std::memory_order_acquire) != 0)
+							HelpOnce();
+				}
 				return T(std::move(*state->value));
+			}
 			else
 				return static_cast<T&>(*state->value);
 		}
@@ -976,8 +1012,9 @@ template <typename T>
 	return { counter, {}, true, opts };
 }
 
-// The counters are read when the coroutine suspends; a braced list lives
-// until then.
+// The span is read when the coroutine suspends and again as it resumes (for
+// a failed counter's error), so its storage must live until co_await
+// returns; a braced list in the co_await expression does.
 [[nodiscard]] inline detail::CounterAwaiter After(std::span<const CounterHandle> counters)
 {
 	return { kInvalidCounter, counters, false, {} };

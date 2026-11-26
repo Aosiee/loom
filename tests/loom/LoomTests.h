@@ -3041,6 +3041,30 @@ TEST_CASE("loom: DestroyLimiter — asserts while a task of it still waits for i
 }
 #endif
 
+#if defined(__linux__) && defined(__cpp_exceptions)
+TEST_CASE("loom: Promise — a moved-from promise ends the program rather than crash")
+{
+	REQUIRE(!loom::HasActivePool());
+	for (int which = 0; which < 3; which++)
+	{
+		static int s_which;
+		s_which = which;
+		std::string err;
+		CHECK(EndsInAbort([] {
+			loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+			loom::Promise<int> p;
+			loom::Promise<int> q(std::move(p));
+			if (s_which == 0)
+				p.SetValue(1);
+			else if (s_which == 1)
+				p.SetException(std::make_exception_ptr(std::runtime_error("x")));
+			else
+				(void)p.GetFuture();
+		}, err));
+	}
+}
+#endif
+
 namespace shutdown_drain {
 	std::atomic<long> mainSubmitted{ 0 }, mainRan{ 0 };
 	void MainFinal(void*) { mainRan++; }
@@ -4449,6 +4473,57 @@ TEST_CASE("loom: coroutines — thousands at once, chained on each other and on 
 		}
 		CHECK_MESSAGE(CountersReturnTo(baseline), "every coroutine's counter is freed");
 	}
+}
+
+namespace coroutine_moves {
+	loom::Future<size_t> TakeString(loom::CounterHandle gate)
+	{
+		loom::Future<std::string> f = loom::Async([] { return std::string(1000, 'x'); }, { .waitsFor = gate });
+		loom::Future<size_t> length = f.Then([](std::string& s) { return s.size(); });
+		std::string s = co_await std::move(f); // moves out of the future its continuation reads
+		co_return co_await length + s.size();
+	}
+	loom::Future<int> TakeUnique(loom::CounterHandle gate)
+	{
+		loom::Future<std::unique_ptr<int>> f = loom::Async([] { return std::make_unique<int>(7); }, { .waitsFor = gate });
+		loom::Future<int> read = f.Then([](std::unique_ptr<int>& p) { return p ? *p : -1; });
+		std::unique_ptr<int> p = co_await std::move(f); // cannot copy: waits for the continuation first
+		co_return co_await read + (p ? *p : -100);
+	}
+	loom::Future<int> Step(loom::Future<int> previous) { co_return co_await previous + 1; }
+}
+
+TEST_CASE("loom: coroutines — moving a value out of a future its continuations still read")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 3 });
+	int wrong = 0;
+	for (int i = 0; i < 300; i++)
+	{
+		loom::ScopedCounter gate(1), gate2(1);
+		loom::Future<size_t> a = coroutine_moves::TakeString(gate);
+		loom::Future<int> b = coroutine_moves::TakeUnique(gate2);
+		loom::Signal(gate);
+		loom::Signal(gate2);
+		wrong += a.Get() == 2000 ? 0 : 1; // the continuation saw all 1000, and so did the move
+		wrong += b.Get() == 14 ? 0 : 1;
+		a.Reset();
+		b.Reset();
+	}
+	CHECK(wrong == 0);
+}
+
+TEST_CASE("loom: coroutines — dropping a long chain of awaiting coroutines does not recurse")
+{
+	// Each frame keeps the future it was given until the frame goes, so the
+	// last future holds the whole chain: dropping it used to destroy the
+	// frames one inside the other, as deep as the chain.
+	constexpr int kChain = 200000;
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2, .maxCounters = kChain + 64 });
+	loom::Future<int> f = loom::Async([] { return 0; });
+	for (int i = 0; i < kChain; i++)
+		f = coroutine_moves::Step(std::move(f));
+	CHECK(f.Get() == kChain);
+	f.Reset(); // destroys every frame, without a stack as deep as the chain
 }
 #endif // LOOM_COROUTINES
 
