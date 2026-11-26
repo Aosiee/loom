@@ -1314,11 +1314,13 @@ void SortTask(SortJob<Comp>& job, It first, It last, int depth)
 			It a = first, b = first + (std::ptrdiff_t)(n / 2), c = last - 1;
 			if (comp(*b, *a)) std::swap(a, b);
 			if (comp(*c, *b)) { std::swap(b, c); if (comp(*b, *a)) std::swap(a, b); }
-			std::iter_swap(first, b);
+			if (b != first) // like std::sort, never an element with itself
+				std::iter_swap(first, b);
 			const auto& pivot = *first; // not moved: the partitions below start after it
 			const It lessEnd = std::partition(first + 1, last, [&](const auto& x) { return comp(x, pivot); });
 			const It equalEnd = std::partition(lessEnd, last, [&](const auto& x) { return !comp(pivot, x); });
-			std::iter_swap(first, lessEnd - 1); // the pivot joins the equal ones
+			if (lessEnd - 1 != first)
+				std::iter_swap(first, lessEnd - 1); // the pivot joins the equal ones
 			const It lessLast = lessEnd - 1;
 			// [first, lessLast) < pivot <= [lessLast, equalEnd) <= pivot < [equalEnd, last)
 			const bool lessLarger = (lessLast - first) >= (last - equalEnd);
@@ -1557,14 +1559,20 @@ public:
 			std::terminate(); // the source is the first stage, and there is one
 		return Add<true>(std::forward<F>(fn), true, opts);
 	}
+	// The stages after the source, in order. Each needs the source first:
+	// a pipeline started with one of these would never run out of items.
 	template <typename F> requires std::is_invocable_v<std::decay_t<F>&, T&>
 	Pipeline& Serial(F&& fn, const TaskDesc& opts = {})
 	{
+		if (m_Stages.empty())
+			std::terminate(); // the source comes first
 		return Add<false>(std::forward<F>(fn), true, opts);
 	}
 	template <typename F> requires std::is_invocable_v<std::decay_t<F>&, T&>
 	Pipeline& Parallel(F&& fn, const TaskDesc& opts = {})
 	{
+		if (m_Stages.empty())
+			std::terminate(); // the source comes first
 		return Add<false>(std::forward<F>(fn), false, opts);
 	}
 
@@ -1876,11 +1884,11 @@ enum class ThreadState : uint8_t { Idle, Running, Helping };
 struct ThreadStats
 {
 	int         index = 0;
-	const char* name = "";     // owned by the pool, valid until Shutdown
+	const char* name = "";     // owned by the pool; a thread that takes over the row's index renames it
 	std::atomic<ThreadState> state{ ThreadState::Idle };
 	std::atomic<uint64_t> tasksRun{ 0 };  // every task this thread ran
 	std::atomic<uint64_t> tasksHelped{ 0 }; // the ones it ran while waiting (state Helping)
-	int         queueDepth = 0; // snapshot of the owned queue (0 = shared pool)
+	int         queueDepth = 0; // a dedicated thread's own queue; 0 for a worker, whose work is in the shared queues (PoolSnapshot::queueDepth)
 };
 
 // Plain-value copies (ThreadStats itself holds atomics).

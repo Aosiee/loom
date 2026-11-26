@@ -3065,6 +3065,91 @@ TEST_CASE("loom: Promise — a moved-from promise ends the program rather than c
 }
 #endif
 
+#if defined(__linux__)
+TEST_CASE("loom: Pipeline — a stage before the source ends the program")
+{
+	REQUIRE(!loom::HasActivePool());
+	std::string err;
+	CHECK(EndsInAbort([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+		loom::Pipeline<int> p(4);
+		p.Serial([](int&) {}); // without a source first, Run would never end
+	}, err));
+}
+#endif
+
+namespace thread_start {
+	std::atomic<int> started{ 0 };
+	void OnStart() { started++; }
+}
+
+TEST_CASE("loom: Shutdown — dedicated threads still registered, with work queued on them")
+{
+	for (int round = 0; round < 30; round++)
+	{
+		std::atomic<int> ran{ 0 };
+		int queued = 0;
+		{
+			loom::Pool pool(loom::PoolConfig{ .workerCount = round % 3 });
+			const loom::DedicatedId sleepy = loom::RegisterDedicatedThread({ .name = "sleepy" });
+			const loom::DedicatedId stealer = loom::RegisterDedicatedThread({ .name = "stealer", .idle = loom::DedicatedConfig::Idle::StealFromPool });
+			for (int i = 0; i < 20; i++, queued += 3)
+			{
+				loom::Submit([&] { ran++; std::this_thread::yield(); }, { .affinity = loom::Affinity::Dedicated, .thread = sleepy });
+				loom::Submit([&] { ran++; }, { .affinity = loom::Affinity::Dedicated, .thread = stealer });
+				loom::Submit([&] { ran++; });
+			}
+			// No unregister: Shutdown drains them, then stops and joins them.
+		}
+		CHECK(ran.load() == queued);
+	}
+}
+
+TEST_CASE("loom: PoolConfig::onThreadStart runs first on every worker and dedicated thread")
+{
+	thread_start::started = 0;
+	{
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 3, .onThreadStart = &thread_start::OnStart });
+		const loom::DedicatedId d = loom::RegisterDedicatedThread({ .name = "d" });
+		loom::ScopedCounter done(1);
+		loom::Submit([] {}, { .affinity = loom::Affinity::Dedicated, .thread = d, .signals = done });
+		loom::WaitFor(done);
+		loom::UnregisterDedicatedThread(d);
+	}
+	CHECK(thread_start::started.load() == 4);
+}
+
+TEST_CASE("loom: debug dump — a dedicated thread's queue, and a long name in full")
+{
+	using namespace std::chrono_literals;
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+	const std::string longName(600, 'n');
+	const loom::DedicatedId d = loom::RegisterDedicatedThread({ .name = longName.c_str() });
+	loom::ScopedCounter gate(1), done(6);
+	std::atomic<bool> inside{ false };
+	loom::Submit([&] { inside = true; loom::WaitFor(gate, loom::Help::BlockOnly); }, { .affinity = loom::Affinity::Dedicated, .thread = d, .signals = done });
+	for (int i = 0; i < 5; i++)
+		loom::Submit([] {}, { .affinity = loom::Affinity::Dedicated, .thread = d, .signals = done });
+	while (!inside)
+		std::this_thread::sleep_for(1ms);
+	const loom::DebugState s = loom::CaptureDebugState();
+	int depth = -1;
+	for (const auto& t : s.threads)
+		if (t.name == longName)
+			depth = t.queueDepth;
+	CHECK(depth == 5);
+	const std::string text = loom::FormatDebugState(s);
+	CHECK(text.find("5 queued for it") != std::string::npos);
+	// The thread's line is not cut short at a fixed buffer's length.
+	const size_t at = text.find(longName);
+	REQUIRE(at != std::string::npos);
+	const size_t lineEnd = text.find('\n', at);
+	CHECK(text.substr(at, lineEnd - at).find("; ran ") != std::string::npos);
+	loom::Signal(gate);
+	loom::WaitFor(done);
+	loom::UnregisterDedicatedThread(d);
+}
+
 namespace shutdown_drain {
 	std::atomic<long> mainSubmitted{ 0 }, mainRan{ 0 };
 	void MainFinal(void*) { mainRan++; }
@@ -3387,6 +3472,45 @@ TEST_CASE("loom: ParallelFor inside ParallelFor — the nesting stays shallow, e
 		});
 		CHECK(inner.load() == 160000);
 		CHECK(deepest.load() <= 20);
+	}
+}
+
+namespace self_move {
+	std::atomic<int> selfMoves{ 0 };
+	struct Key
+	{
+		int v = 0;
+		Key() = default;
+		explicit Key(int x) : v(x) {}
+		Key(Key&&) noexcept = default;
+		Key& operator=(Key&& o) noexcept
+		{
+			if (this == &o)
+				selfMoves++;
+			v = o.v;
+			return *this;
+		}
+		bool operator<(const Key& o) const { return v < o.v; }
+	};
+}
+
+TEST_CASE("loom: ParallelSort — never moves an element onto itself, as std::sort does not")
+{
+	loom::Pool pool(loom::PoolConfig{});
+	for (int mod : { 3, 1000000 })
+	{
+		std::vector<self_move::Key> v;
+		v.reserve(400000);
+		uint32_t x = 2463534242u;
+		for (int i = 0; i < 400000; i++)
+		{
+			x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+			v.emplace_back((int)(x % (uint32_t)mod));
+		}
+		self_move::selfMoves = 0;
+		loom::ParallelSort(v.begin(), v.end());
+		CHECK(self_move::selfMoves.load() == 0);
+		CHECK(std::is_sorted(v.begin(), v.end()));
 	}
 }
 

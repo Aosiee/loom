@@ -4662,14 +4662,25 @@ namespace {
 struct TextOut
 {
 	std::string text;
+	// Any length: a long thread or task name is never cut short.
 	void Line(const char* fmt, ...)
 	{
 		char buf[512];
-		va_list args;
+		va_list args, again;
 		va_start(args, fmt);
-		std::vsnprintf(buf, sizeof buf, fmt, args);
+		va_copy(again, args);
+		const int n = std::vsnprintf(buf, sizeof buf, fmt, args);
 		va_end(args);
-		text += buf;
+		if (n >= (int)sizeof buf)
+		{
+			const size_t at = text.size();
+			text.resize(at + (size_t)n + 1);
+			std::vsnprintf(text.data() + at, (size_t)n + 1, fmt, again);
+			text.resize(at + (size_t)n);
+		}
+		else if (n > 0)
+			text += buf;
+		va_end(again);
 	}
 };
 
