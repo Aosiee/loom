@@ -7,7 +7,7 @@ callers need to change anything.
 
 ## Updating from an older version
 
-Three releases changed things for existing callers. Updating from 0.9.0 to
+Four releases changed things for existing callers. Updating from 0.9.0 to
 any later version, check these:
 
 - 0.10.0: `Shutdown` drains every live task first, and may block for up to
@@ -25,6 +25,61 @@ any later version, check these:
   `TaskDesc{ ... }` that gives 0 for `thread` gives `{}`. A Dedicated task
   with no `thread` now asserts instead of going to the first dedicated
   thread.
+- 0.20.2: some misuse that used to fail quietly in a release build now
+  ends the program, saying why (the list is in its entry below).
+  `UnregisterDedicatedThread` waits for every task submitted to the
+  thread, `ParkAll` refuses a second park and pool-thread callers, and
+  `PumpMainThreadTasks` runs only on the main thread.
+
+## 0.20.2 (2026-11-26): a bug hunt across the whole library
+
+Fixes only. The ones that could hang, crash or lose work:
+
+- Shutdown's drain could read the live-task count as zero while tasks
+  were still live, and abandon main-thread work they went on to submit.
+- A ParallelFor inside another's chunks nested without end through
+  helping waits, ran out of counters, and in a release build returned
+  before its chunks had run. loom's fork-joins now isolate themselves
+  once a thread is 16 waits deep (docs/rules.md has the general hazard).
+- A wake for pool work could go to a helper that never passed it on, so
+  a worker slept with a task queued. An isolated wait on the main or a
+  dedicated thread spun instead of sleeping, and in a pool with no
+  workers a dedicated thread hung in any fork-join it started.
+- UnregisterDedicatedThread could drop a task queued as it stopped, or
+  one still waiting for its counters or its limiter.
+- Parking: destroying a parked pool hung, ParkAll could return with a
+  worker still running, and UnregisterParkParticipant could return while
+  a wake still used the participant's `user`.
+- The Pool constructor published the pool before it was built, and
+  Shutdown from a thread other than the main one, or from inside a task,
+  went wrong.
+- Futures: `co_await std::move(f)` raced with a `Then` reading the same
+  value, and dropping a long chain of coroutines overflowed the stack.
+- Running out of counters, limiters or task slots failed quietly in a
+  release build, and a `maxTasks` above 4194304 wrote past an array.
+
+And smaller ones: TryWaitFor could return false with the count already
+at zero by its own work; a stale handle matched a new counter after
+4095 reuses of its entry; DestroyLimiter missed tasks still waiting for
+their counters; a limiter's unit indices were built up front (960 MB
+for a limit of 200 million); ReleaseLane took any dedicated thread;
+profiler zones could come unpaired; the sort move-assigned elements onto
+themselves; a pipeline with no Source never ended; and the debug dump
+cut long lines. Several docs said things that were not so.
+
+What existing callers may notice:
+
+- These now end the program in every build, with a message: running out
+  of counters, limiters or task slots; submitting to a dedicated thread
+  that is not registered; Shutdown from inside a task; a pipeline stage
+  added before its Source.
+- `UnregisterDedicatedThread` waits for every task submitted to the
+  thread, including ones still waiting for their counters.
+- `ParkAll` refuses a second park while one is in effect, and calls from
+  a pool thread (an assert in a debug build, `false` in a release one).
+- `PumpMainThreadTasks` runs main-thread tasks only on the main thread.
+- The profiler's state marks show a helped task from the moment it
+  starts.
 
 ## 0.20.1 (2026-11-25): thread indices are given back, and GitHub releases
 
