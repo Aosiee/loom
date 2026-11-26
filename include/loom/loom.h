@@ -1684,9 +1684,15 @@ struct DedicatedConfig
 };
 // Spawns the thread. Each id is handed out once per pool, so a stale id
 // (of an unregistered thread) never reaches a newer thread; ids are not small
-// indices. Submitting to an unregistered id is a bug (asserted).
+// indices. Submitting to an id that is not registered ends the program.
 DedicatedId RegisterDedicatedThread(const DedicatedConfig&);
-void         UnregisterDedicatedThread(DedicatedId);         // drains + joins
+// Runs every task submitted to the thread first, then joins it: the queued
+// ones, the ones still waiting for their counters or a limiter's unit, and
+// the ones its tasks submit meanwhile. The caller helps while it waits, so
+// signal what those tasks wait for before calling it, or from another
+// thread: a task whose counter nobody will signal keeps it waiting (it
+// reports that on stderr after PoolConfig::shutdownTimeoutMs).
+void         UnregisterDedicatedThread(DedicatedId);
 
 // ---- Thread identity -------------------------------------------------------
 // A stable small index for the CALLING thread: 0 = the initialising

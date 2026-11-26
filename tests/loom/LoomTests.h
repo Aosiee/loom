@@ -2771,6 +2771,70 @@ TEST_CASE("loom: Shutdown — the drain never sees zero while a task is live")
 	CHECK(shutdown_drain::mainSubmitted.load() == 1200);
 }
 
+TEST_CASE("loom: UnregisterDedicatedThread — every task submitted to the thread runs first")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 4 });
+	SUBCASE("a task queued just before it")
+	{
+		// The thread looks at its queue, then at the stop flag: a task queued
+		// between the two used to be left behind.
+		int lost = 0;
+		for (int i = 0; i < 1000; i++)
+		{
+			const loom::DedicatedId d = loom::RegisterDedicatedThread({ .name = "r", .idle = loom::DedicatedConfig::Idle::StealFromPool });
+			std::atomic<bool> started{ false }, ran{ false };
+			loom::Submit([&] { started = true; for (volatile int k = 0; k < 1000; k = k + 1) {} }, { .affinity = loom::Affinity::Dedicated, .thread = d });
+			while (!started) {}
+			for (volatile int k = 0; k < (i % 128) * 40; k = k + 1) {}
+			loom::Submit([&] { ran = true; }, { .affinity = loom::Affinity::Dedicated, .thread = d });
+			loom::UnregisterDedicatedThread(d);
+			lost += ran ? 0 : 1;
+		}
+		CHECK(lost == 0);
+	}
+	SUBCASE("a task still waiting for its counter, and one a task of the thread submits")
+	{
+		const loom::DedicatedId d = loom::RegisterDedicatedThread({ .name = "io" });
+		loom::ScopedCounter gate(1), done(3);
+		std::atomic<int> ran{ 0 };
+		loom::Submit([&] { ran++; }, { .affinity = loom::Affinity::Dedicated, .thread = d, .signals = done, .waitsFor = gate });
+		loom::Submit([&] {
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+			ran++;
+			loom::Submit([&] { ran++; }, { .affinity = loom::Affinity::Dedicated, .thread = d, .signals = done }); // a follow-up
+		}, { .affinity = loom::Affinity::Dedicated, .thread = d, .signals = done });
+		std::thread opener([&] {
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			loom::Signal(gate);
+		});
+		loom::UnregisterDedicatedThread(d); // returns once all three have run
+		CHECK(ran.load() == 3);
+		CHECK(loom::Count(done) == 0);
+		opener.join();
+	}
+}
+
+TEST_CASE("loom: ReleaseLane — only a lane, and only once")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+	const loom::LaneId lane = loom::AcquireLane("lane");
+	const loom::DedicatedId plain = loom::RegisterDedicatedThread({ .name = "plain" });
+#if defined(NDEBUG)
+	// Misuse asserts in a debug build; in a release one it changes nothing:
+	// the plain thread is still registered and still runs its tasks.
+	loom::ReleaseLane(plain);
+	loom::ScopedCounter done(1);
+	loom::Submit([] {}, { .affinity = loom::Affinity::Dedicated, .thread = plain, .signals = done });
+	CHECK(loom::TryWaitFor(done, 5000));
+#endif
+	loom::ReleaseLane(lane);
+#if defined(NDEBUG)
+	loom::ReleaseLane(lane);
+#endif
+	loom::UnregisterDedicatedThread(plain);
+	// ~Pool asserts no lane is still held, and that the count is not below zero.
+}
+
 namespace helper_wake {
 	loom::CounterHandle c1, c2, cX;
 }

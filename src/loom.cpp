@@ -59,6 +59,16 @@ static inline void CpuRelax()
 #endif
 }
 
+// What the caller cannot recover from, such as running out of a fixed table
+// (task slots, counters, limiters) when every caller relies on what it asked
+// for: it ends the program in every build, saying what went wrong.
+[[noreturn]] static void Fatal(const char* what)
+{
+	std::fprintf(stderr, "loom: %s\n", what);
+	std::fflush(stderr);
+	std::abort();
+}
+
 // ---- Task slots ---------------------------------------------------------------
 // One cache line pair per slot: adjacent slots are run by different threads.
 
@@ -437,6 +447,12 @@ struct DedicatedState
 	// Its CurrentThreadIndex, once the thread has started: the key of its
 	// stats row (names need not be unique).
 	std::atomic<int>       threadIndex{ -1 };
+	// Tasks submitted to it that have not finished: queued, still waiting
+	// for their counters or a limiter's unit, or running. Unregistering
+	// waits for none to be left. Raised under the registry lock.
+	std::atomic<int64_t>   addressed{ 0 };
+	bool                   lane = false;         // made by AcquireLane
+	bool                   laneReleased = false; // under the registry lock
 };
 
 // ---- Per-thread scheduler state (the main thread and each worker) ------------------
@@ -683,6 +699,21 @@ static bool DedicatedTakesPoolWork(const PoolState& P, const DedicatedState& d)
 	return d.idle == DedicatedConfig::Idle::StealFromPool || P.workerCount == 0;
 }
 
+// Counts a task submitted to dedicated thread `id` (see addressed). A thread
+// that is not registered can never run it: that ends the program, rather
+// than leave the task live with nothing to run it.
+static void AddressDedicated(PoolState& P, DedicatedId id)
+{
+	std::lock_guard<std::mutex> lock(P.dedicatedMutex);
+	for (auto& d : P.dedicated)
+		if (d->id == id)
+		{
+			d->addressed.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+	Fatal("a task was submitted to a dedicated thread that is not registered");
+}
+
 // The calling thread's debug record: a pool thread's own, the main
 // thread's, or none (a thread outside the pool shows up only as a sleeper
 // on the counters it waits for).
@@ -838,16 +869,6 @@ void SetTestHook(TestHookFn fn) { s_TestHook.store(fn, std::memory_order_release
 #else
 #define LOOM_TEST_POINT(point) do { (void)(point); } while (0)
 #endif
-// Running out of a fixed table (task slots, counters, limiters) cannot be
-// handled by the caller: every caller relies on what it asked for. So it
-// ends the program in every build, saying which setting to raise.
-[[noreturn]] static void Fatal(const char* what)
-{
-	std::fprintf(stderr, "loom: %s\n", what);
-	std::fflush(stderr);
-	std::abort();
-}
-
 // A limiter unit has just become free for anyone to take.
 static constexpr int kTestPointUnitFreed = 1;
 // A task's function has returned; its runner has given nothing back yet.
@@ -1644,9 +1665,8 @@ static bool EnqueueSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 		DedicatedState* d = nullptr;
 		for (auto& dd : P.dedicated)
 			if (dd->id == t.thread) { d = dd.get(); break; }
-		assert(d && "Dedicated task submitted to an unregistered thread");
-		if (!d)
-			return false;
+		if (!d) // it counts in `addressed`, which keeps the thread registered
+			Fatal("a dedicated thread was unregistered with a task still to run on it");
 		std::lock_guard<std::mutex> lock(d->mutex);
 		if (t.priority == Priority::High)
 			d->queue.push_front(slot);
@@ -1741,6 +1761,8 @@ static uint32_t PrepareSlot(PoolState& P, const TaskDesc& desc, WorkerCtx* ctx)
 	t.nameId = desc.nameId;
 	t.profilerTag = desc.profilerTag;
 	t.limiter = LimiterTag(P, desc.limiter);
+	if (desc.affinity == Affinity::Dedicated)
+		AddressDedicated(P, desc.thread);
 	AddSubmitted(P, ctx, 1);
 	return slot;
 }
@@ -2217,6 +2239,8 @@ static size_t QueueGraphSet(PoolState& P, GraphState& g, uint32_t set, WorkerCtx
 		t.userData = &g.refs[i];
 		t.affinity = n.affinity;
 		t.thread = n.thread;
+		if (n.affinity == Affinity::Dedicated)
+			AddressDedicated(P, n.thread);
 		t.signals = nodesLeft;
 		t.priority = n.priority;
 		t.owned = false;
@@ -2435,33 +2459,30 @@ void Run(TaskGraph& graph, Help help)
 // A lane is a sleeping (never stealing) dedicated thread plus a held count,
 // so Shutdown can tell a forgotten lane from an ordinary dedicated thread.
 
+static DedicatedId RegisterDedicated(PoolState& P, const DedicatedConfig& config, bool lane);
+
 LaneId AcquireLane(const char* name)
 {
-	ActivePool().lanesHeld.fetch_add(1, std::memory_order_relaxed);
-	return RegisterDedicatedThread(DedicatedConfig{ .name = name, .idle = DedicatedConfig::Idle::Sleep });
+	PoolState& P = ActivePool();
+	P.lanesHeld.fetch_add(1, std::memory_order_relaxed);
+	return RegisterDedicated(P, DedicatedConfig{ .name = name, .idle = DedicatedConfig::Idle::Sleep }, true);
 }
 
 void ReleaseLane(LaneId lane)
 {
 	PoolState& P = ActivePool();
-	// Only decrement when the lane actually existed - a double release or
-	// an invalid id must not corrupt the shutdown-held-lanes counter.
+	// Only a lane, and only once: the held count is what tells Shutdown a
+	// lane was forgotten. Marked released under the registry lock, so two
+	// releases at once cannot both count.
 	{
 		std::lock_guard<std::mutex> lock(P.dedicatedMutex);
-		bool found = false;
-		for (const auto& d : P.dedicated)
+		auto it = std::find_if(P.dedicated.begin(), P.dedicated.end(), [lane](const auto& d) { return d->id == lane; });
+		if (it == P.dedicated.end() || !(*it)->lane || (*it)->laneReleased)
 		{
-			if (d->id == lane)
-			{
-				found = true;
-				break;
-			}
-		}
-		if (!found)
-		{
-			assert(false && "releasing an invalid/already-released lane");
+			assert(false && "releasing an invalid/already-released lane (or a dedicated thread that is not a lane)");
 			return;
 		}
+		(*it)->laneReleased = true;
 	}
 	UnregisterDedicatedThread(lane);
 	P.lanesHeld.fetch_sub(1, std::memory_order_relaxed);
@@ -3325,6 +3346,7 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	const CounterHandle signals = t.signals;
 	const uint32_t nameId = t.nameId;
 	const uint8_t profilerTag = t.profilerTag;
+	const bool dedicated = t.affinity == Affinity::Dedicated; // so it runs on its thread
 	uint16_t limiter = t.limiter; // cleared if the task gives its unit back early
 	TaskFn destroy = nullptr;
 	if (t.owned)
@@ -3401,6 +3423,8 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	// this counter returns, the task no longer counts as live.
 	AddFinished(P, ctx);
 	ReleaseSlot(P, slot, ctx);
+	if (dedicated)
+		CurrentDedicated()->addressed.fetch_sub(1, std::memory_order_release);
 	if (signals == kInvalidCounter)
 		return;
 	if (!ctx)
@@ -3712,7 +3736,14 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 			continue;
 		}
 		if (d.stop.load(std::memory_order_acquire))
-			break; // its own queue is drained
+		{
+			// A task may have been queued after the pop above: look again
+			// under the queue's lock before leaving.
+			std::lock_guard<std::mutex> lock(d.mutex);
+			if (d.queue.empty())
+				break;
+			continue;
+		}
 
 		// Sleep until its own queue (or, when it steals, the pool) has work.
 		w.isWorker = false;
@@ -3749,9 +3780,8 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 	t_ThreadStats = nullptr;
 }
 
-DedicatedId RegisterDedicatedThread(const DedicatedConfig& config)
+static DedicatedId RegisterDedicated(PoolState& P, const DedicatedConfig& config, bool lane)
 {
-	PoolState& P = ActivePool();
 	std::lock_guard<std::mutex> lock(P.dedicatedMutex);
 	const DedicatedId id{ P.nextDedicatedId++ };
 	assert(id != kInvalidDedicated && "dedicated thread ids exhausted");
@@ -3760,30 +3790,62 @@ DedicatedId RegisterDedicatedThread(const DedicatedConfig& config)
 	d->name = config.name ? config.name : "";
 	d->idle = config.idle;
 	d->stop = false;
+	d->lane = lane;
 	DedicatedId handle = id;
 	d->thread = std::thread(DedicatedLoop, std::ref(P), std::ref(*d));
 	P.dedicated.push_back(std::move(d));
 	return handle;
 }
 
+DedicatedId RegisterDedicatedThread(const DedicatedConfig& config)
+{
+	return RegisterDedicated(ActivePool(), config, false);
+}
+
 void UnregisterDedicatedThread(DedicatedId id)
 {
 	PoolState& P = ActivePool();
 	assert((!CurrentDedicated() || CurrentDedicated()->id != id) && "a dedicated thread cannot unregister itself (it would join itself)");
+	// Every task submitted to the thread runs first: the queued ones, the
+	// ones still waiting for their counters or a limiter's unit, and the ones
+	// its own tasks submit meanwhile. It stays registered until none is left,
+	// and leaves the registry under the lock that counts new ones, so none
+	// can slip in after. This thread helps while it waits.
 	std::unique_ptr<DedicatedState> d;
+	int64_t last = -1;
+	auto lastProgress = std::chrono::steady_clock::now();
+	bool reported = false;
+	for (;;)
 	{
-		std::lock_guard<std::mutex> lock(P.dedicatedMutex);
-		for (auto it = P.dedicated.begin(); it != P.dedicated.end(); ++it)
+		int64_t left = 0;
 		{
-			if ((*it)->id == id)
+			std::lock_guard<std::mutex> lock(P.dedicatedMutex);
+			auto it = std::find_if(P.dedicated.begin(), P.dedicated.end(), [id](const auto& dd) { return dd->id == id; });
+			if (it == P.dedicated.end())
+				return;
+			left = (*it)->addressed.load(std::memory_order_acquire);
+			if (left == 0)
 			{
 				d = std::move(*it);
 				P.dedicated.erase(it);
 				break;
 			}
 		}
+		const auto now = std::chrono::steady_clock::now();
+		if (left != last)
+		{
+			last = left;
+			lastProgress = now;
+		}
+		else if (!reported && now - lastProgress > std::chrono::milliseconds(P.shutdownTimeoutMs))
+		{
+			std::fprintf(stderr, "loom: UnregisterDedicatedThread: %lld task(s) for it have not finished within %u ms "
+				"(waiting on a counter nobody signals?)\n", (long long)left, P.shutdownTimeoutMs);
+			reported = true;
+		}
+		if (!TryHelpIn(P))
+			std::this_thread::sleep_for(std::chrono::microseconds(100));
 	}
-	if (!d) return;
 	// The stop flag and the wake under the waiter's own lock (a bare
 	// flag-set-then-notify loses the wakeup).
 	{
