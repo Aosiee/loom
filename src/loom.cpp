@@ -791,11 +791,15 @@ static void MarkProfilerState(PoolState& P, int threadIndex, uint8_t state)
 		fn(threadIndex, state);
 }
 
-static uint64_t MarkProfilerZone(PoolState& P, int threadIndex, uint32_t nameId, uint8_t profilerTag, const char* name, bool begin, uint64_t handle)
+// The waits on this thread that are running a task while they wait: a wait
+// that ends inside one hands the thread back to helping (1), not to idle (2).
+static thread_local int t_HelpingWaits = 0;
+
+// The hook a task's zone begins with: its end goes to the same one, so a
+// hook installed or removed while the task runs never sees half a pair.
+static ProfilerZoneFn ZoneHook(PoolState& P)
 {
-	if (ProfilerZoneFn fn = P.profilerZoneHook.load(std::memory_order_acquire))
-		return fn(threadIndex, nameId, profilerTag, name, begin, handle);
-	return 0;
+	return P.profilerZoneHook.load(std::memory_order_acquire);
 }
 
 // Counter handle packing: a 20-bit table index (up to ~1M counters) and a
@@ -964,7 +968,7 @@ static void     ReleaseRunningUnit(PoolState& P, WorkerCtx* ctx);
 static void     SignalCounter(PoolState& P, CounterHandle h, int n);
 static void     FlushDeferredSignals(PoolState& P, WorkerCtx* ctx);
 static void     WakeForWork(PoolState& P, size_t n);
-static bool     TryHelpIn(PoolState& P);
+static bool     TryHelpIn(PoolState& P, bool markHelping = false);
 // Who is parking: a worker or a dedicated thread names its round field and
 // its stop flag (it leaves the park once that is set); a participant neither.
 struct ParkSelf
@@ -3124,11 +3128,8 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 			reached = false;
 			break;
 		}
-		if (help == Help::WhileWaiting && TryHelpIn(P))
-		{
-			MarkProfilerState(P, threadIndex, 1); // helping
+		if (help == Help::WhileWaiting && TryHelpIn(P, true))
 			continue;
-		}
 		// Nothing to run: apply what helping deferred, then re-check before
 		// sleeping (it may have been the last of this counter's signals).
 		if (ctx && ctx->deferredCount > 0)
@@ -3146,7 +3147,7 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 	// as a worker that finds work does, or that work waits for the next wake.
 	if (wokenForWork && HasPoolWork(P))
 		WakeForWork(P, 1);
-	MarkProfilerState(P, threadIndex, 2); // wait over
+	MarkProfilerState(P, threadIndex, t_HelpingWaits > 0 ? 1 : 2); // wait over: back to the helped task it is inside, or done
 	if (debug)
 	{
 		debug->waitingOn.store(outerWait, std::memory_order_relaxed);
@@ -3241,7 +3242,9 @@ static uint32_t PopOwnInRegion(PoolState& P, WorkerCtx& ctx, uint16_t region)
 // One task for a waiting (or explicitly helping) thread. Sources in order:
 // the thread's own pinned queue (main or dedicated), its own deques, then a
 // steal. An isolated wait narrows all of that to its region, and never steals.
-static bool TryHelpIn(PoolState& P)
+// markHelping: a WaitFor's help, which the profiler sees as helping (1)
+// while the task runs and waiting (0) again after it.
+static bool TryHelpIn(PoolState& P, bool markHelping)
 {
 	if (P.stop.load(std::memory_order_relaxed)) return false; // the workers are going
 
@@ -3284,7 +3287,18 @@ static bool TryHelpIn(PoolState& P)
 	const ThreadState before = stats ? stats->state.load(std::memory_order_relaxed) : ThreadState::Idle;
 	if (stats)
 		stats->state.store(ThreadState::Helping, std::memory_order_relaxed);
+	const int threadIndex = markHelping ? CurrentThreadIndex() : 0;
+	if (markHelping)
+	{
+		MarkProfilerState(P, threadIndex, 1); // helping
+		t_HelpingWaits++;
+	}
 	RunEntry(P, slot, ctx);
+	if (markHelping)
+	{
+		t_HelpingWaits--;
+		MarkProfilerState(P, threadIndex, 0); // waiting again
+	}
 	if (stats)
 	{
 		stats->tasksRun.fetch_add(1, std::memory_order_relaxed);
@@ -3416,7 +3430,8 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	// A per-task profiler zone (null hook = free no-op). The begin hook
 	// returns the handle the end mark pairs with.
 	const int threadIndex = CurrentThreadIndex();
-	const uint64_t zone = MarkProfilerZone(P, threadIndex, nameId, profilerTag, "Task", true, 0);
+	const ProfilerZoneFn zoneHook = ZoneHook(P);
+	const uint64_t zone = zoneHook ? zoneHook(threadIndex, nameId, profilerTag, "Task", true, 0) : 0;
 	// A task of a cancelled counter is skipped, though it still signals it.
 	const CounterState* counter = signals != kInvalidCounter ? ResolveCounter(P, signals) : nullptr;
 	const bool cancelled = counter && counter->cancelled.load(std::memory_order_acquire);
@@ -3462,7 +3477,8 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	// the slot it may live in is released.
 	if (destroy)
 		destroy(userData);
-	MarkProfilerZone(P, threadIndex, nameId, profilerTag, "Task", false, zone);
+	if (zoneHook)
+		zoneHook(threadIndex, nameId, profilerTag, "Task", false, zone);
 	LOOM_TEST_POINT(kTestPointTaskReturned);
 	// The unit goes back (or on to the next waiting task) before the signal:
 	// once a WaitFor on the task's counter returns, it holds none.

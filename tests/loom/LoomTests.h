@@ -2883,6 +2883,90 @@ TEST_CASE("loom: Shutdown from inside a task ends the program, saying why")
 }
 #endif
 
+namespace profiler_marks {
+	std::atomic<int> begins{ 0 }, ends{ 0 }, unpaired{ 0 };
+	uint64_t Zone(int, uint32_t, uint8_t, const char*, bool begin, uint64_t handle)
+	{
+		if (begin)
+		{
+			begins++;
+			return 0x5EED;
+		}
+		if (handle != 0x5EED)
+			unpaired++; // an end whose begin this hook never saw
+		ends++;
+		return 0;
+	}
+	std::mutex m;
+	std::vector<int> states;
+	std::atomic<int> mainIndex{ -1 };
+	void State(int threadIndex, uint8_t state)
+	{
+		if (threadIndex != mainIndex.load())
+			return; // the main thread's marks only
+		std::lock_guard<std::mutex> lock(m);
+		states.push_back(state);
+	}
+}
+
+TEST_CASE("loom: profiler hooks — a zone ends on the hook it began on, and helping is marked as it starts")
+{
+	using namespace std::chrono_literals;
+	using namespace profiler_marks;
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+	// Installed while a task runs: that task's end must not reach it.
+	{
+		begins = ends = unpaired = 0;
+		std::atomic<bool> inside{ false }, go{ false };
+		loom::ScopedCounter done(1);
+		loom::Submit([&] { inside = true; while (!go) std::this_thread::sleep_for(1ms); }, { .signals = done });
+		while (!inside) std::this_thread::sleep_for(1ms);
+		loom::SetProfilerZoneHook(&Zone);
+		go = true;
+		loom::WaitFor(done, loom::Help::BlockOnly);
+		CHECK(unpaired.load() == 0);
+		CHECK(ends.load() == begins.load());
+	}
+	// Removed while a task runs: the begin it saw still gets its end.
+	{
+		begins = ends = unpaired = 0;
+		std::atomic<bool> inside{ false }, go{ false };
+		loom::ScopedCounter done(1);
+		loom::Submit([&] { inside = true; while (!go) std::this_thread::sleep_for(1ms); }, { .signals = done });
+		while (!inside) std::this_thread::sleep_for(1ms);
+		loom::SetProfilerZoneHook(nullptr);
+		go = true;
+		loom::WaitFor(done, loom::Help::BlockOnly);
+		CHECK(begins.load() == 1);
+		CHECK(ends.load() == 1);
+	}
+	// A wait on the main thread that runs one task, then sleeps: 0 as it
+	// enters, 1 as the task starts, 0 once it is done, 2 at the end.
+	{
+		{
+			std::lock_guard<std::mutex> lock(m);
+			states.clear();
+		}
+		mainIndex = loom::CurrentThreadIndex();
+		loom::ScopedCounter gate(1), helped(1);
+		std::atomic<bool> blocker{ false };
+		loom::Submit([&] { blocker = true; loom::WaitFor(gate, loom::Help::BlockOnly); }); // keeps the worker busy
+		while (!blocker) std::this_thread::sleep_for(1ms);
+		loom::Submit([] { std::this_thread::sleep_for(20ms); }, { .signals = helped });
+		std::thread opener([&] { std::this_thread::sleep_for(150ms); loom::Signal(gate); });
+		loom::SetProfilerStateHook(&State);
+		loom::WaitFor(gate);
+		loom::SetProfilerStateHook(nullptr);
+		opener.join();
+		std::vector<int> seen;
+		{
+			std::lock_guard<std::mutex> lock(m);
+			seen = states;
+		}
+		CHECK(seen == std::vector<int>{ 0, 1, 0, 2 });
+	}
+}
+
 namespace shutdown_drain {
 	std::atomic<long> mainSubmitted{ 0 }, mainRan{ 0 };
 	void MainFinal(void*) { mainRan++; }

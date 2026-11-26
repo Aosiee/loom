@@ -17,8 +17,11 @@
 
 namespace loom {
 
-	// 0 = the thread entered a wait, 1 = the thread is helping (running
-	// stolen work while waiting), 2 = the wait/helping ended.
+	// A thread's state through a wait, as transitions: 0 = waiting (it
+	// entered a wait, or a task it ran while waiting has finished), 1 =
+	// helping (it is running a task while it waits, from that task's start),
+	// 2 = the wait ended. A wait inside a helped task ends with 1: the thread
+	// is back in that task.
 	using ProfilerStateFn = void (*)(int threadIndex, uint8_t state);
 
 	void SetProfilerStateHook(ProfilerStateFn fn);
@@ -28,7 +31,9 @@ namespace loom {
 	// call returns a handle, and loom passes it back with the matching end.
 	// The task's name id (0 = unnamed; the hook falls back to `name`) and its
 	// TaskDesc::profilerTag come along, so the host can tell apart named tasks
-	// with different tags (the engine's windows) in the timeline.
+	// with different tags (the engine's windows) in the timeline. A zone's
+	// end goes to the hook its begin went to: one installed or removed while
+	// a task runs sees no half pairs.
 	using ProfilerZoneFn = uint64_t (*)(int threadIndex, uint32_t nameId, uint8_t profilerTag, const char* name, bool begin, uint64_t handle);
 
 	void SetProfilerZoneHook(ProfilerZoneFn fn);
