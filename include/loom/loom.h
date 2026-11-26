@@ -117,7 +117,12 @@ struct TaskDesc
 struct PoolConfig
 {
 	int      workerCount = -1;   // default max(1, hw_concurrency - 1)
-	uint32_t maxTasks    = 4096; // task-slot pool size, rounded up to 4096s (grows with a warning)
+	// The task-slot pool's starting size, rounded up to 4096s. It grows (with
+	// a warning) when more tasks are live at once, up to 4194304; past that
+	// the program ends.
+	uint32_t maxTasks    = 4096;
+	// Counters and limiters live at once. These tables are fixed: creating
+	// one more ends the program, with a message naming the setting.
 	uint32_t maxCounters = 2048;
 	uint32_t maxLimiters = 64;
 	// Runs first on every worker and dedicated thread (the engine's crash
@@ -219,7 +224,7 @@ void Submit(F&& fn, const TaskDesc& opts = {})
 }
 
 // ---- Counters (the only synchronization primitive) -------------------------
-CounterHandle CreateCounter(int initial);
+CounterHandle CreateCounter(int initial); // PoolConfig::maxCounters at once
 void           DestroyCounter(CounterHandle);  // asserts count == 0, no waiters
 void           Signal(CounterHandle, int n = 1);
 // Raises a count that has not reached zero yet by n, for work that finds

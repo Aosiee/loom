@@ -27,6 +27,41 @@
 
 #if defined(__linux__)
 #include <pthread.h>
+#include <csignal>
+#include <fcntl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+// Runs fn in a child process: true when it ended by abort(), with what it
+// wrote to stderr in `err`. Call it with no pool active: the child starts
+// from this thread alone.
+static bool EndsInAbort(void (*fn)(), std::string& err)
+{
+	int fds[2];
+	if (pipe(fds) != 0)
+		return false;
+	const pid_t pid = fork();
+	if (pid == 0)
+	{
+		// The test runner's crash handler would report the abort as its own.
+		std::signal(SIGABRT, SIG_DFL);
+		dup2(fds[1], 2);
+		const int devNull = open("/dev/null", O_WRONLY);
+		dup2(devNull, 1);
+		close(fds[0]);
+		fn();
+		_exit(0);
+	}
+	close(fds[1]);
+	char buf[512];
+	ssize_t n;
+	while ((n = read(fds[0], buf, sizeof(buf))) > 0)
+		err.append(buf, (size_t)n);
+	close(fds[0]);
+	int status = 0;
+	waitpid(pid, &status, 0);
+	return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+}
 #endif
 
 #if defined(LOOM_TEST_HOOKS)
@@ -2676,6 +2711,27 @@ TEST_CASE("loom: per-thread storage — move-only, over-aligned, threads outside
 		CHECK(Tracked::live.load() == 0); // destroyed with the PerThread
 	}
 }
+
+#if defined(__linux__)
+TEST_CASE("loom: running out of counters or limiters ends the program, saying which setting to raise")
+{
+	REQUIRE(!loom::HasActivePool());
+	std::string err;
+	CHECK(EndsInAbort([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 1, .maxCounters = 4 });
+		for (int i = 0; i < 5; i++)
+			(void)loom::CreateCounter(1);
+	}, err));
+	CHECK(err.find("PoolConfig::maxCounters") != std::string::npos);
+	err.clear();
+	CHECK(EndsInAbort([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 1, .maxLimiters = 2 });
+		for (int i = 0; i < 3; i++)
+			(void)loom::CreateLimiter(1);
+	}, err));
+	CHECK(err.find("PoolConfig::maxLimiters") != std::string::npos);
+}
+#endif
 
 namespace shutdown_drain {
 	std::atomic<long> mainSubmitted{ 0 }, mainRan{ 0 };

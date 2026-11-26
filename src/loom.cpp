@@ -831,6 +831,16 @@ void SetTestHook(TestHookFn fn) { s_TestHook.store(fn, std::memory_order_release
 #else
 #define LOOM_TEST_POINT(point) do { (void)(point); } while (0)
 #endif
+// Running out of a fixed table (task slots, counters, limiters) cannot be
+// handled by the caller: every caller relies on what it asked for. So it
+// ends the program in every build, saying which setting to raise.
+[[noreturn]] static void Fatal(const char* what)
+{
+	std::fprintf(stderr, "loom: %s\n", what);
+	std::fflush(stderr);
+	std::abort();
+}
+
 // A limiter unit has just become free for anyone to take.
 static constexpr int kTestPointUnitFreed = 1;
 // A task's function has returned; its runner has given nothing back yet.
@@ -1012,7 +1022,8 @@ static void AddSlotChunkLocked(PoolState& P)
 {
 	const uint32_t base = P.slotCapacity.load(std::memory_order_relaxed);
 	const uint32_t chunk = base >> kSlotChunkBits;
-	assert(chunk < kMaxSlotChunks && "loom: task slot pool exhausted");
+	if (chunk >= kMaxSlotChunks)
+		Fatal("the task slot pool is exhausted: more than 4194304 tasks are live at once");
 	auto slots = std::make_unique<TaskSlot[]>(kSlotChunkSize);
 	uint32_t members[kSlotBatchListed];
 	uint32_t lastHead = base;
@@ -1124,7 +1135,7 @@ Pool::Pool(const PoolConfig& config)
 
 	{
 		std::lock_guard<std::mutex> lock(P.growMutex);
-		const uint32_t want = std::max(1u, config.maxTasks);
+		const uint32_t want = std::min(std::max(1u, config.maxTasks), kMaxSlotChunks * kSlotChunkSize);
 		while (P.slotCapacity.load(std::memory_order_relaxed) < want)
 			AddSlotChunkLocked(P);
 	}
@@ -2453,10 +2464,7 @@ CounterHandle CreateCounter(int initial)
 	assert(initial >= 0 && initial < INT_MAX && "counter initial value out of range");
 	std::lock_guard<std::mutex> lock(P.counterMutex);
 	if (P.freeCounters.empty())
-	{
-		assert(false && "counter pool exhausted");
-		return kInvalidCounter;
-	}
+		Fatal("the counter pool is exhausted: raise PoolConfig::maxCounters (every pending future and every waiting ParallelFor, sort, scan, pipeline and graph run holds one)");
 	const uint32_t i = P.freeCounters.back();
 	P.freeCounters.pop_back();
 	CounterState& c = P.counters[i];
@@ -2725,10 +2733,7 @@ LimiterHandle CreateLimiter(uint32_t limit)
 	assert(limit >= 1 && limit < (uint32_t)INT_MAX && "limiter limit out of range");
 	std::lock_guard<std::mutex> lock(P.limiterMutex);
 	if (P.freeLimiters.empty())
-	{
-		assert(false && "limiter pool exhausted (PoolConfig::maxLimiters)");
-		return kInvalidLimiter;
-	}
+		Fatal("the limiter pool is exhausted: raise PoolConfig::maxLimiters");
 	const uint32_t i = P.freeLimiters.back();
 	P.freeLimiters.pop_back();
 	LimiterState& l = P.limiters[i];
