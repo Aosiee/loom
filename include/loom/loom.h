@@ -132,8 +132,9 @@ struct PoolConfig
 	// handler gives each its alternate signal stack here). Optional.
 	void (*onThreadStart)() = nullptr;
 	// Shutdown first drains: it runs every task (helping on the calling
-	// thread) until none is live. When no task finishes for this long, what
-	// is left can never run; Shutdown reports it and its asserts fire.
+	// thread) until none is live, however long they take. When for this long
+	// no task has finished and none is running (outside a wait), what is
+	// left can never run; Shutdown reports it and its asserts fire.
 	uint32_t shutdownTimeoutMs = 5000;
 };
 
@@ -164,6 +165,19 @@ public:
 	// could never run, held lanes and live tasks assert (see
 	// PoolConfig::shutdownTimeoutMs). Called from inside a task (the drain
 	// would wait for that task), it ends the program.
+	// From another thread, nothing but PumpMainThreadTasks may still be
+	// calling into loom once the drain is over: the main thread's frame loop
+	// should only pump from the moment Shutdown starts (a ParallelFor or a
+	// WaitFor still under way when the pool goes is a use after free), and
+	// stop calling loom once it is gone (HasActivePool). Shutdown returns
+	// only once no pump is still reading the pool, so the Pool may then be
+	// destroyed.
+	// A pool thread's thread-local destructors run as the thread exits,
+	// after the drain: a Submit, or a WaitFor on a counter that is not zero,
+	// from one ends the program.
+	// A child process forked from one with a live pool has none of its
+	// threads: it must end with _exit or exec, not by destroying the Pool
+	// (which would join threads that are not there).
 	void Shutdown();
 
 private:

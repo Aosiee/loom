@@ -517,6 +517,9 @@ struct alignas(64) ThreadDebug
 	std::atomic<uint16_t>      runningLimiter{ 0 }; // the limiter's index + 1, as in the slot
 	std::atomic<CounterHandle> waitingOn{ kInvalidCounter };
 	std::atomic<int64_t>       waitingSince{ 0 };   // steady_clock ticks
+	// Whether the thread's innermost activity is running a task (not a wait
+	// inside one): Shutdown's drain counts a running task as progress.
+	std::atomic<bool>          inTask{ false };
 };
 
 struct alignas(64) PaddedStats
@@ -668,6 +671,10 @@ struct PoolState
 //   per-pool counter restarting at 0 would hand a fresh worker the main
 //   thread's 0 after a re-init).
 static std::atomic<PoolState*> s_ActivePool{ nullptr };
+// Threads inside PumpMainThreadTasks. A Shutdown on another thread waits for
+// them to leave before it returns, so the Pool can be freed under a frame
+// loop that is still pumping (see PumpMainThreadTasks).
+static std::atomic<int> s_Pumping{ 0 };
 
 // The indices of threads that have exited, for new threads to take (the
 // lowest first), and the next index never handed out. Made once and never
@@ -1171,6 +1178,10 @@ static uint32_t PopBatchOrGrow(PoolState& P)
 // with slots cached) is a plain array pop: no atomics at all.
 static uint32_t AllocateSlot(PoolState& P, WorkerCtx* ctx)
 {
+	// Once Shutdown has stopped the threads (a thread-local destructor on a
+	// pool thread submits as it exits), nothing would run the task.
+	if (P.stop.load(std::memory_order_relaxed))
+		Fatal("a task was submitted after Shutdown stopped the pool's threads (from a thread-local destructor on a pool thread?)");
 	if (ctx)
 	{
 		if (ctx->slotCacheCount == 0)
@@ -1304,17 +1315,40 @@ static void WakeAllIdle(PoolState& P)
 // report, when no task finishes for shutdownTimeoutMs: what is left can never
 // run (tasks waiting on counters nobody will signal), and the drain-or-assert
 // checks that follow name it.
+// Whether the pool's threads are getting anywhere: a task has finished since
+// the last look, or one is running now (not waiting). A long task is not a
+// stuck one: the main-thread work it submits as it ends must still run.
+static bool DrainProgress(PoolState& P, uint64_t& lastRun)
+{
+	uint64_t run = P.mainDebug.tasksRun.load(std::memory_order_relaxed);
+	bool busy = P.mainDebug.inTask.load(std::memory_order_relaxed);
+	{
+		std::lock_guard<std::mutex> lock(P.statsMutex);
+		for (const auto& t : P.threadStats)
+		{
+			run += t->debug.tasksRun.load(std::memory_order_relaxed);
+			busy = busy || t->debug.inTask.load(std::memory_order_relaxed);
+		}
+	}
+	const bool progress = busy || run != lastRun;
+	lastRun = run;
+	return progress;
+}
+
 static void DrainForShutdown(PoolState& P)
 {
 	WorkerCtx* ctx = CurrentCtx(P);
 	int64_t last = LiveTasksIn(P);
+	uint64_t lastRun = 0;
+	DrainProgress(P, lastRun);
 	auto lastProgress = std::chrono::steady_clock::now();
 	for (;;)
 	{
 		const int64_t live = LiveTasksIn(P);
 		if (live <= 0)
 			return;
-		if (live != last)
+		const bool progress = DrainProgress(P, lastRun);
+		if (live != last || progress)
 		{
 			last = live;
 			lastProgress = std::chrono::steady_clock::now();
@@ -1324,7 +1358,7 @@ static void DrainForShutdown(PoolState& P)
 		FlushDeferredSignals(P, ctx);
 		if (std::chrono::steady_clock::now() - lastProgress > std::chrono::milliseconds(P.shutdownTimeoutMs))
 		{
-			std::fprintf(stderr, "loom: Shutdown: %lld task(s) did not finish within %u ms of the last one that did "
+			std::fprintf(stderr, "loom: Shutdown: %lld task(s) left, and for %u ms no task has run or finished "
 				"(waiting on a counter nobody signals?)\n", (long long)live, P.shutdownTimeoutMs);
 			return;
 		}
@@ -1428,7 +1462,11 @@ void Pool::Shutdown()
 	// resolves this pool, not none. The slots and counters live until the
 	// Pool is destroyed.
 	PoolState* expected = &P;
-	s_ActivePool.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
+	s_ActivePool.compare_exchange_strong(expected, nullptr, std::memory_order_seq_cst);
+	// A pump that loaded this pool before it was uninstalled may still be
+	// reading it: the Pool is freed once Shutdown returns.
+	while (s_Pumping.load(std::memory_order_seq_cst) > 0)
+		std::this_thread::yield();
 }
 
 bool HasActivePool()
@@ -3360,8 +3398,11 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 	ThreadDebug* const debug = DebugRow(P, ctx);
 	CounterHandle outerWait = kInvalidCounter;
 	int64_t outerSince = 0;
+	bool outerInTask = false;
 	if (debug)
 	{
+		outerInTask = debug->inTask.load(std::memory_order_relaxed);
+		debug->inTask.store(false, std::memory_order_relaxed);
 		outerWait = debug->waitingOn.load(std::memory_order_relaxed);
 		outerSince = debug->waitingSince.load(std::memory_order_relaxed);
 		debug->waitingSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
@@ -3393,6 +3434,10 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 			FlushDeferredSignals(P, ctx);
 			continue;
 		}
+		// After Shutdown has stopped the threads (a thread-local destructor
+		// on a pool thread), nothing is left to bring the count down.
+		if (P.stop.load(std::memory_order_relaxed))
+			Fatal("WaitFor after Shutdown stopped the pool's threads, on a counter that is not zero (from a thread-local destructor on a pool thread?)");
 		if (SleepOnCounter(P, *c, h, help == Help::WhileWaiting, deadline))
 			wokenForWork = true;
 	}
@@ -3408,6 +3453,7 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 	{
 		debug->waitingOn.store(outerWait, std::memory_order_relaxed);
 		debug->waitingSince.store(outerSince, std::memory_order_relaxed);
+		debug->inTask.store(outerInTask, std::memory_order_relaxed);
 	}
 #if defined(__cpp_exceptions)
 	if (reached && c->failed.load(std::memory_order_acquire) && StillCounter(*c, h))
@@ -3727,12 +3773,16 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 		debug->runningLimiter.store(limiter, std::memory_order_relaxed);
 		debug->running.store(debug->running.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 	}
+	const bool outerInTask = debug ? debug->inTask.load(std::memory_order_relaxed) : false;
+	if (debug)
+		debug->inTask.store(true, std::memory_order_relaxed);
 	t_TaskDepth++;
 	if (fn && !cancelled)
 		RunTaskFn(P, fn, userData, signals); // an inline callable's userData is the slot: release after
 	t_TaskDepth--;
 	if (debug)
 	{
+		debug->inTask.store(outerInTask, std::memory_order_relaxed);
 		debug->running.store(debug->running.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
 		debug->runningName.store(outerName, std::memory_order_relaxed);
 		debug->runningSignals.store(outerSignals, std::memory_order_relaxed);
@@ -3800,12 +3850,21 @@ void PumpMainThreadTasks()
 {
 	// It pumps through Shutdown's drain too: a Shutdown called from another
 	// thread relies on the main thread's frame loop for main-thread work.
-	PoolState* pool = s_ActivePool.load(std::memory_order_acquire);
-	if (!pool || pool->stop.load(std::memory_order_acquire)) return;
+	// Marked inside before it loads the pool, and the pool loaded after,
+	// both seq_cst: a Shutdown that uninstalls the pool and then sees the
+	// mark clear knows no pump can still be reading it.
+	struct Inside
+	{
+		Inside() { s_Pumping.fetch_add(1, std::memory_order_seq_cst); }
+		~Inside() { s_Pumping.fetch_sub(1, std::memory_order_seq_cst); }
+	} inside;
+	PoolState* pool = s_ActivePool.load(std::memory_order_seq_cst);
+	if (!pool)
+		return;
 	PoolState& P = *pool;
 	// Main-thread tasks run on the main thread only.
 	assert(std::this_thread::get_id() == P.mainThreadId && "PumpMainThreadTasks off the main thread");
-	if (std::this_thread::get_id() != P.mainThreadId)
+	if (std::this_thread::get_id() != P.mainThreadId || P.stop.load(std::memory_order_acquire))
 		return;
 	WorkerCtx* ctx = CurrentCtx(P);
 	// Bounded: a main-thread task that resubmits itself must not trap the

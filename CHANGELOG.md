@@ -10,11 +10,12 @@ callers need to change anything.
 Four releases changed things for existing callers. Updating from 0.9.0 to
 any later version, check these:
 
-- 0.10.0: `Shutdown` drains every live task first, and may block for up to
-  `LoomConfig::shutdownTimeoutMs`. `DedicatedId`s are handed out once per pool
-  and are no longer small, dense indices. `ThreadStats::tasksRun` includes
-  tasks run while helping. `LiveTaskCount` and `Load` can lag briefly behind
-  finished tasks.
+- 0.10.0: `Shutdown` drains every live task first, so it blocks until they
+  have run (it gives up on what can never run, after
+  `PoolConfig::shutdownTimeoutMs`). `DedicatedId`s are handed out once per
+  pool and are no longer small, dense indices. `ThreadStats::tasksRun`
+  includes tasks run while helping. `LiveTaskCount` and `PendingTaskCount` can
+  lag briefly behind finished tasks.
 - 0.11.0: `ParallelFor` with `chunkSize` 0 now chunks automatically (it did
   nothing). A task's exception now cancels its counter: that counter's tasks
   that have not started are skipped.

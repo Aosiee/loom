@@ -39,10 +39,17 @@ a fixed order afterwards, which is what `ParallelReduce` does.
 ## Shutdown is drain-or-assert
 
 `Shutdown()` first runs everything that was submitted, including work those
-tasks submit while it drains, and every wait completes. So every submitted
-task must be able to run: a task waiting on a counter nobody will signal
-stops the drain (after `PoolConfig::shutdownTimeoutMs`), and what is left,
-along with lanes still held, asserts.
+tasks submit while it drains, and every wait completes, however long that
+takes. So every submitted task must be able to run: a task waiting on a
+counter nobody will signal stops the drain (once nothing has run or finished
+for `PoolConfig::shutdownTimeoutMs`), and what is left, along with lanes
+still held, asserts.
+
+Work that must happen as a thread ends belongs in a task before Shutdown,
+not in a pool thread's thread-local destructors: those run after the drain,
+and a Submit or a wait from one ends the program. A Shutdown on another
+thread needs the main thread to do nothing but pump from then on (see
+`Pool::Shutdown`).
 
 ## An exception needs a counter to go to
 

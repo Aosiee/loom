@@ -5302,6 +5302,89 @@ TEST_CASE("loom: limiters — lowering a huge limit is one step, and the lower l
 	loom::DestroyLimiter(l);
 }
 
+// ---- Shutdown at the edges --------------------------------------------------------------
+
+TEST_CASE("loom: Shutdown — a long task is not a stuck one: the main-thread work it submits as it ends runs")
+{
+	REQUIRE(!loom::HasActivePool());
+	CHECK(EndsWithin([] {
+		static std::atomic<bool> ran{ false };
+		{
+			loom::Pool pool(loom::PoolConfig{ .workerCount = 2, .shutdownTimeoutMs = 100 });
+			loom::Submit([] {
+				std::this_thread::sleep_for(std::chrono::milliseconds(400));
+				loom::Submit([] { ran = true; }, { .affinity = loom::Affinity::MainThread });
+			});
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		if (!ran)
+			_exit(3);
+	}, 5000));
+}
+
+TEST_CASE("loom: Shutdown — a Pool destroyed on another thread while the main thread pumps")
+{
+	// The documented off-thread shutdown: the main thread's frame loop only
+	// pumps, and the Pool must not be freed while a pump still reads it.
+	for (int trial = 0; trial < 200; trial++)
+	{
+		auto pool = std::make_unique<loom::Pool>(loom::PoolConfig{ .workerCount = 2 });
+		std::atomic<bool> done{ false };
+		std::atomic<int> ran{ 0 };
+		std::thread quitter([&] {
+			{
+				loom::ScopedCounter c(4);
+				for (int i = 0; i < 4; i++)
+					loom::Submit([&] { ran++; }, { .affinity = loom::Affinity::MainThread, .signals = c });
+				loom::WaitFor(c, loom::Help::BlockOnly);
+			}
+			loom::Submit([&] { ran++; }, { .affinity = loom::Affinity::MainThread });
+			pool.reset();
+			done = true;
+		});
+		while (!done)
+			loom::PumpMainThreadTasks();
+		quitter.join();
+		REQUIRE(ran.load() == 5);
+	}
+}
+
+struct SubmitsOnExit
+{
+	bool used = false;
+	~SubmitsOnExit()
+	{
+		if (used)
+			loom::Submit([] {});
+	}
+};
+
+TEST_CASE("loom: Shutdown — a pool thread's thread-local destructor that submits ends the program, saying why")
+{
+	// Its destructor runs as the worker exits, after the drain: the task
+	// would never run.
+	REQUIRE(!loom::HasActivePool());
+	std::string err;
+	CHECK(EndsInAbort([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
+		// One task on each worker: each waits until both have started, and the
+		// main thread does not help, so on any number of CPUs both workers
+		// make the thread-local.
+		static std::atomic<int> s_started{ 0 };
+		loom::ScopedCounter done(2);
+		for (int i = 0; i < 2; i++)
+			loom::Submit([] {
+				static thread_local SubmitsOnExit t_flush;
+				t_flush.used = true;
+				s_started++;
+				while (s_started.load() < 2)
+					std::this_thread::yield();
+			}, { .signals = done });
+		loom::WaitFor(done, loom::Help::BlockOnly);
+	}, err));
+	CHECK(err.find("submitted after Shutdown stopped") != std::string::npos);
+}
+
 } // namespace
 
 }} // namespace loom::tests
