@@ -83,6 +83,18 @@ if(LOOM_BUILD_TESTS)
         set_tests_properties(loom_faults PROPERTIES ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp")
     endif()
 
+    # Random programs checked against a model of loom's contract
+    # (tests/fuzz/fuzz.cpp); tests/fuzz/fuzz.py runs many seeds and shrinks a
+    # failure.
+    add_executable(loom_fuzz tests/fuzz/fuzz.cpp)
+    target_link_libraries(loom_fuzz PRIVATE loom)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME loom_fuzz COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz/fuzz.py run
+            $<TARGET_FILE:loom_fuzz> --seeds 1-100 --grow --out ${CMAKE_CURRENT_BINARY_DIR}/fuzz-out)
+        set_tests_properties(loom_fuzz PROPERTIES ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp")
+    endif()
+
     add_executable(loom_stress tests/stress.cpp)
     target_link_libraries(loom_stress PRIVATE loom)
     add_test(NAME loom_stress COMMAND loom_stress --seconds 10 --quiet)

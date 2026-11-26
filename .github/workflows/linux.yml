@@ -1,7 +1,8 @@
-# Builds loom and runs its suite, its allocation-failure sweeps and a minute
-# of the stress test in each configuration it is checked in before a release: GCC and Clang, Debug and Release, the portable sleep
-# instead of the futex, and the address, undefined-behaviour and thread
-# sanitizers. Two more jobs build loom as an engine embeds it, without
+# Builds loom and runs its suite, its allocation-failure sweeps, a minute
+# of the stress test and a batch of fuzzer programs in each configuration it
+# is checked in before a release: GCC and Clang, Debug and Release, the
+# portable sleep instead of the futex, and the address, undefined-behaviour
+# and thread sanitizers. Two more jobs build loom as an engine embeds it, without
 # exceptions and without the suite, and as a package: installed and found
 # with find_package, and added with add_subdirectory.
 name: Linux
@@ -29,14 +30,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: gcc release,          cxx: g++,     type: Release }
-          - { name: gcc debug,            cxx: g++,     type: Debug }
-          - { name: gcc release no-futex, cxx: g++,     type: Release,        flags: -DLOOM_NO_FUTEX=ON }
-          - { name: clang release,        cxx: clang++, type: Release }
-          - { name: address sanitizer,    cxx: g++,     type: RelWithDebInfo, flags: -DLOOM_SANITIZE=address }
-          - { name: ub sanitizer,         cxx: g++,     type: RelWithDebInfo, flags: -DLOOM_SANITIZE=undefined }
-          - { name: thread sanitizer,     cxx: g++,     type: RelWithDebInfo, flags: -DLOOM_SANITIZE=thread }
-          - { name: thread sanitizer no-futex, cxx: g++, type: RelWithDebInfo, flags: -DLOOM_SANITIZE=thread -DLOOM_NO_FUTEX=ON }
+          - { name: gcc release,          cxx: g++,     type: Release,        fuzz: 1000 }
+          - { name: gcc debug,            cxx: g++,     type: Debug,          fuzz: 600 }
+          - { name: gcc release no-futex, cxx: g++,     type: Release,        fuzz: 1000, flags: -DLOOM_NO_FUTEX=ON }
+          - { name: clang release,        cxx: clang++, type: Release,        fuzz: 1000 }
+          - { name: address sanitizer,    cxx: g++,     type: RelWithDebInfo, fuzz: 500,  flags: -DLOOM_SANITIZE=address }
+          - { name: ub sanitizer,         cxx: g++,     type: RelWithDebInfo, fuzz: 500,  flags: -DLOOM_SANITIZE=undefined }
+          - { name: thread sanitizer,     cxx: g++,     type: RelWithDebInfo, fuzz: 200,  flags: -DLOOM_SANITIZE=thread }
+          - { name: thread sanitizer no-futex, cxx: g++, type: RelWithDebInfo, fuzz: 200, flags: -DLOOM_SANITIZE=thread -DLOOM_NO_FUTEX=ON }
     steps:
       - uses: actions/checkout@v5
 
@@ -71,6 +72,22 @@ jobs:
           TSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/tsan.supp
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: timeout 10m build/loom_stress --seconds 60 --quiet
+
+      # A different batch of seeds on each run, so that pushes add up to a
+      # long campaign; a failing seed is printed and reproduces locally with
+      # `loom_fuzz --seed S --size N` in the same configuration.
+      - name: Fuzz
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          first=$(( ${{ github.run_number }} * ${{ matrix.fuzz }} + 1 ))
+          last=$(( first + ${{ matrix.fuzz }} - 1 ))
+          timeout 15m python3 tests/fuzz/fuzz.py run build/loom_fuzz --seeds "$first-$last" --grow \
+            --jobs "$(nproc)" --timeout 300 --out build/fuzz-out
+
+      - name: Fuzz failures
+        if: failure()
+        run: for f in build/fuzz-out/fail-*.log; do [ -f "$f" ] && head -c 100000 "$f"; done; true
 
   embedded:
     name: embedded, no exceptions

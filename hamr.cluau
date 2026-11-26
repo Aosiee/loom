@@ -2,7 +2,8 @@
 //
 // The configurations the CI checks, each built in its own build-hamr-<name>
 // directory: the suite (every test case's time from doctest's JUnit
-// report) and a stress run. The fast tier is the release and debug builds
+// report), the allocation-failure sweeps, a batch of fuzzer programs and a
+// stress run. The fast tier is the release and debug builds
 // with GCC and a Clang release; the nightly tier adds the portable sleep,
 // the three sanitizers, the no-exceptions embedding and the installed
 // package.
@@ -10,6 +11,7 @@
 //     hamr run                      the fast tier
 //     hamr run --tier nightly       every configuration
 //     hamr run --set stress=60      a longer stress run
+//     hamr run --set fuzzfrom=5000  the fuzzer's programs from another seed
 
 const hamr = require("@hamr")
 type Context = hamr.Context
@@ -18,18 +20,20 @@ const suite = hamr.suite("loom", { budgets = { fast = 180, nightly = 900 } })
 const gcc = suite:var("gcc", "g++")
 const clang = suite:var("clang", "clang++")
 const stress = suite:var("stress", "10")
+const fuzzFrom = tonumber(suite:var("fuzzfrom", "1")) or 1
 
-type Config = { name: string, cxx: string, type: string, flags: { string }, tier: string, sanitizer: string? }
+// fuzz: how many of the fuzzer's programs a run checks.
+type Config = { name: string, cxx: string, type: string, flags: { string }, tier: string, fuzz: number, sanitizer: string? }
 
 const configs: { Config } = {
-	{ name = "gcc-release", cxx = gcc, type = "Release", flags = {}, tier = "fast" },
-	{ name = "gcc-debug", cxx = gcc, type = "Debug", flags = {}, tier = "fast" },
-	{ name = "clang-release", cxx = clang, type = "Release", flags = {}, tier = "fast" },
-	{ name = "gcc-release-no-futex", cxx = gcc, type = "Release", flags = { "-DLOOM_NO_FUTEX=ON" }, tier = "nightly" },
-	{ name = "asan", cxx = gcc, type = "RelWithDebInfo", flags = { "-DLOOM_SANITIZE=address" }, tier = "nightly", sanitizer = "address" },
-	{ name = "ubsan", cxx = gcc, type = "RelWithDebInfo", flags = { "-DLOOM_SANITIZE=undefined" }, tier = "nightly", sanitizer = "undefined" },
-	{ name = "tsan", cxx = gcc, type = "RelWithDebInfo", flags = { "-DLOOM_SANITIZE=thread" }, tier = "nightly", sanitizer = "thread" },
-	{ name = "tsan-no-futex", cxx = gcc, type = "RelWithDebInfo", flags = { "-DLOOM_SANITIZE=thread", "-DLOOM_NO_FUTEX=ON" }, tier = "nightly", sanitizer = "thread" },
+	{ name = "gcc-release", cxx = gcc, type = "Release", flags = {}, fuzz = 1000, tier = "fast" },
+	{ name = "gcc-debug", cxx = gcc, type = "Debug", flags = {}, fuzz = 600, tier = "fast" },
+	{ name = "clang-release", cxx = clang, type = "Release", flags = {}, fuzz = 1000, tier = "fast" },
+	{ name = "gcc-release-no-futex", cxx = gcc, type = "Release", flags = { "-DLOOM_NO_FUTEX=ON" }, fuzz = 1000, tier = "nightly" },
+	{ name = "asan", cxx = gcc, type = "RelWithDebInfo", flags = { "-DLOOM_SANITIZE=address" }, fuzz = 500, tier = "nightly", sanitizer = "address" },
+	{ name = "ubsan", cxx = gcc, type = "RelWithDebInfo", flags = { "-DLOOM_SANITIZE=undefined" }, fuzz = 500, tier = "nightly", sanitizer = "undefined" },
+	{ name = "tsan", cxx = gcc, type = "RelWithDebInfo", flags = { "-DLOOM_SANITIZE=thread" }, fuzz = 200, tier = "nightly", sanitizer = "thread" },
+	{ name = "tsan-no-futex", cxx = gcc, type = "RelWithDebInfo", flags = { "-DLOOM_SANITIZE=thread", "-DLOOM_NO_FUTEX=ON" }, fuzz = 200, tier = "nightly", sanitizer = "thread" },
 }
 
 const kPaths = { "include/**", "src/**", "tests/**", "CMakeLists.txt", "cmake/**" }
@@ -79,6 +83,18 @@ for (_, c in configs) {
 		resources = { cpu = 4, tags = { c.name } },
 		timeout = 900,
 		budget = if (c.sanitizer != nil) 120 else 20,
+		paths = kPaths,
+	})
+	suite:step(`fuzz:{c.name}`, {
+		tier = c.tier,
+		needs = { `build:{c.name}` },
+		doc = "Random programs checked against loom's contract (tests/fuzz), from the seed --set fuzzfrom names.",
+		run = { "python3", "tests/fuzz/fuzz.py", "run", `{dir}/loom_fuzz`, "--seeds", `{fuzzFrom}-{fuzzFrom + c.fuzz - 1}`, "--grow",
+			"--jobs", "8", "--timeout", "300", "--out", `{dir}/fuzz-out` },
+		env = env,
+		resources = { cpu = 8, tags = { c.name } },
+		timeout = 1800,
+		budget = if (c.sanitizer != nil) 300 else 60,
 		paths = kPaths,
 	})
 	suite:step(`stress:{c.name}`, {

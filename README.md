@@ -220,7 +220,23 @@ cmake -S . -B build && cmake --build build
 ./build/loom_faults                # every allocation of loom's calls failed in turn
 ./build/loom_stress --seconds 60   # random mixes of every feature on random pools
 ./build/loom_bench [tasks] [runs]  # per-task cost and contention by worker count
+python3 tests/fuzz/fuzz.py run build/loom_fuzz --seeds 1-1000 --grow   # random programs
 ```
+
+`loom_fuzz` turns a seed into a random program (pools, dedicated threads,
+lanes, limiters, and the main thread starting dependency graphs, futures,
+coroutines, algorithms, pipelines, graph runs and parking) and checks what
+loom's contract says must happen: every task runs once or is skipped only
+when cancelled, it starts only after what it waits for, limits hold, tasks
+run on the threads they name, results match the sequential ones, and
+nothing is left live at the end. `fuzz.py run` runs many seeds in parallel
+and keeps the log of each that fails, headed with its seed and size
+(`loom_fuzz --seed S --size N` runs it again); `fuzz.py shrink` cuts a
+failing program down to the operations that still fail. The generated programs keep to
+[`docs/rules.md`](docs/rules.md), so a hang is loom's: `--block-only`
+(`--extra=--block-only` through `fuzz.py`) adds BlockOnly waits, which the
+rules allow only when another thread is free, and can hang without loom
+being wrong.
 
 `-DLOOM_SANITIZE=thread|address|undefined` builds everything with a
 sanitizer; under TSAN run the suite with
