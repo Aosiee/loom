@@ -325,8 +325,9 @@ private:
 // it becomes runnable (at Submit, or once its counters reach zero) and gives
 // it back when it finishes. While none is free it waits in the limiter, not
 // in a queue, and the task that finishes hands its unit to the next one:
-// High tasks first, otherwise in the order they became runnable. A limit of 1
-// makes a serial queue.
+// High tasks first, otherwise in the order they became runnable (two that
+// become runnable at the same moment, on different threads, go in either
+// order). A limit of 1 makes a serial queue.
 //
 // A unit is held from queuing to the end of the run, so at most `limit` of
 // the tasks are queued or running, never more running. Low priority decides

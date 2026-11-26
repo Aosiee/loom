@@ -100,6 +100,11 @@ void Misuse(const char* what) noexcept { Fatal(what); }
 #define LOOM_HOOK(what, ...) do { __VA_ARGS__; } while (0)
 #endif
 
+// The library's own types have internal linkage (an unnamed namespace), so
+// they can never meet a host's types of the same names. PoolState and
+// detail::GraphState are named in the header and keep external linkage.
+namespace {
+
 // ---- Task slots ---------------------------------------------------------------
 // One cache line pair per slot: adjacent slots are run by different threads.
 
@@ -122,9 +127,11 @@ struct alignas(64) TaskSlot
 	uint16_t      isolation = 0;                      // 30: the Isolated region it belongs to (0 none)
 	uint32_t      nameId   = 0;                       // 32
 	// The next task of a group (a queue entry with kGroupBit), written by the
-	// submitter before the push and read by whoever takes the group. While a
-	// task waits on counters, its count of unmet ones (see PendingDeps).
-	uint32_t      groupNext = kNoSlot;                // 36
+	// submitter before the push and read by whoever takes the group (relaxed:
+	// the push orders it). While a task waits on counters, its count of unmet
+	// ones (see PendingDeps). Atomic for the second use, which other threads
+	// update while the slot is not yet runnable.
+	std::atomic<uint32_t> groupNext{ kNoSlot };        // 36
 	// Free-list fields, on a free batch's head slot: how many slots the batch
 	// holds (the head, plus the rest listed in the bytes a free slot does not
 	// use, see SetBatch), and the next batch on the shared stack. nextBatch is
@@ -566,6 +573,8 @@ struct alignas(64) PaddedStats
 	ThreadDebug debug;
 };
 
+} // namespace
+
 // ---- The pool state --------------------------------------------------------------
 // Everything a pool owns. The workers receive theirs at spawn; the public
 // free functions resolve the active pool.
@@ -715,12 +724,14 @@ static std::atomic<int> s_Pumping{ 0 };
 // The indices of threads that have exited, for new threads to take (the
 // lowest first), and the next index never handed out. Made once and never
 // destroyed: a thread may exit after main has returned.
+namespace {
 struct ThreadIndices
 {
 	std::mutex       mutex;
 	std::vector<int> free; // a min-heap
 	int              next = 0;
 };
+} // namespace
 static ThreadIndices& TheThreadIndices()
 {
 	static ThreadIndices* indices = new ThreadIndices();
@@ -1064,11 +1075,13 @@ static void     WakeForWork(PoolState& P, size_t n);
 static bool     TryHelpIn(PoolState& P, bool markHelping = false, bool* poolWake = nullptr);
 // Who is parking: a worker or a dedicated thread names its round field and
 // its stop flag (it leaves the park once that is set); a participant neither.
+namespace {
 struct ParkSelf
 {
 	uint64_t*                parkedRound = nullptr;
 	const std::atomic<bool>* stop = nullptr;
 };
+} // namespace
 static void     ParkHere(PoolState& P, int index, const char* name, ParkSelf self = {});
 static void     WorkerLoop(PoolState& P, WorkerCtx& ctx);
 static void     DedicatedLoop(PoolState& P, DedicatedState& d);
@@ -2049,9 +2062,9 @@ static bool ReadySlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 
 // A waiting task's count of unmet dependencies. It lives in groupNext, which
 // only a runnable task uses (a task with dependencies is never grouped).
-static std::atomic_ref<uint32_t> PendingDeps(PoolState& P, uint32_t slot)
+static std::atomic<uint32_t>& PendingDeps(PoolState& P, uint32_t slot)
 {
-	return std::atomic_ref<uint32_t>(Slot(P, slot).groupNext);
+	return Slot(P, slot).groupNext;
 }
 
 static bool HasDependencies(const TaskDesc& desc)
@@ -2068,7 +2081,7 @@ static bool DispatchSlot(PoolState& P, uint32_t slot, const TaskDesc& desc, Work
 
 	// One hold of our own while registering, so the task cannot be released
 	// (by a counter reaching zero meanwhile) before every counter has it.
-	auto deps = PendingDeps(P, slot);
+	std::atomic<uint32_t>& deps = PendingDeps(P, slot);
 	deps.store(1, std::memory_order_relaxed);
 	auto waitOn = [&](CounterHandle h) {
 		if (h == kInvalidCounter)
@@ -2163,7 +2176,7 @@ void Submit(std::span<const TaskDesc> descs)
 	auto pushGroup = [&] {
 		if (length == 0)
 			return;
-		Slot(P, tail).groupNext = kNoSlot;
+		Slot(P, tail).groupNext.store(kNoSlot, std::memory_order_relaxed);
 		PushPool(P, length > 1 ? (head | kGroupBit) : head, ctx);
 		entries++;
 		length = 0;
@@ -2178,7 +2191,7 @@ void Submit(std::span<const TaskDesc> descs)
 			if (length == 0)
 				head = slot;
 			else
-				Slot(P, tail).groupNext = slot;
+				Slot(P, tail).groupNext.store(slot, std::memory_order_relaxed);
 			tail = slot;
 			if (++length == groupSize)
 				pushGroup();
@@ -2600,7 +2613,7 @@ static size_t QueueGraphSet(PoolState& P, GraphState& g, uint32_t set, WorkerCtx
 	auto pushGroup = [&] {
 		if (length == 0)
 			return;
-		Slot(P, tail).groupNext = kNoSlot;
+		Slot(P, tail).groupNext.store(kNoSlot, std::memory_order_relaxed);
 		PushPool(P, length > 1 ? (head | kGroupBit) : head, ctx);
 		entries++;
 		length = 0;
@@ -2638,7 +2651,7 @@ static size_t QueueGraphSet(PoolState& P, GraphState& g, uint32_t set, WorkerCtx
 			if (length == 0)
 				head = slot;
 			else
-				Slot(P, tail).groupNext = slot;
+				Slot(P, tail).groupNext.store(slot, std::memory_order_relaxed);
 			tail = slot;
 			if (++length == groupSize)
 				pushGroup();
@@ -3801,7 +3814,7 @@ static void RunEntry(PoolState& P, uint32_t entry, WorkerCtx* ctx)
 	const uint32_t first = entry & ~kGroupBit;
 	if (entry & kGroupBit)
 	{
-		const uint32_t rest = Slot(P, first).groupNext;
+		const uint32_t rest = Slot(P, first).groupNext.load(std::memory_order_relaxed);
 		if (rest != kNoSlot)
 		{
 			size_t pushed = 0;
@@ -3811,7 +3824,7 @@ static void RunEntry(PoolState& P, uint32_t entry, WorkerCtx* ctx)
 				// may run and free it, and its slot be reused.
 				for (uint32_t s = rest; s != kNoSlot;)
 				{
-					const uint32_t next = Slot(P, s).groupNext;
+					const uint32_t next = Slot(P, s).groupNext.load(std::memory_order_relaxed);
 					ctx->deque.Push(s);
 					pushed++;
 					s = next;
@@ -3819,7 +3832,7 @@ static void RunEntry(PoolState& P, uint32_t entry, WorkerCtx* ctx)
 			}
 			else
 			{
-				PushPool(P, Slot(P, rest).groupNext != kNoSlot ? (rest | kGroupBit) : rest, nullptr);
+				PushPool(P, Slot(P, rest).groupNext.load(std::memory_order_relaxed) != kNoSlot ? (rest | kGroupBit) : rest, nullptr);
 				pushed = 1;
 			}
 			WakeForWork(P, pushed);
