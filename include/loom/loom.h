@@ -415,6 +415,9 @@ namespace detail {
 		// Continuations that have yet to read the value: a co_await that moves
 		// the value out waits for them (see FutureAwaiter).
 		std::atomic<int> readers{ 0 };
+		// Such a co_await while it waits for them (a MoveWaiter), resumed by
+		// the last one to finish reading.
+		std::atomic<void*> mover{ nullptr };
 		void (*destroy)(FutureStateBase*) noexcept = nullptr;
 		bool             broken = false; // completed without a value (also `error`, with exceptions)
 #if defined(__cpp_exceptions)
@@ -441,9 +444,9 @@ namespace detail {
 	void SignalFuture(FutureStateBase* state) noexcept;
 	// Drops one reference; the last frees the counter and the state.
 	void ReleaseFuture(FutureStateBase* state) noexcept;
-	// Runs one task while waiting, or yields: for the short waits of the
-	// futures (a co_await that moves the value out, see FutureAwaiter).
-	void HelpOnce();
+	// A continuation is done with its input's value: drops `readers`, and the
+	// last one resumes a co_await waiting to move the value out.
+	void DoneReading(FutureStateBase* state);
 	inline void RetainFuture(FutureStateBase* state) noexcept { state->refs.fetch_add(1, std::memory_order_relaxed); }
 
 	// A continuation's input failed: its own future fails the same way.
@@ -527,7 +530,7 @@ namespace detail {
 			else
 				RunInto(t, t.fn, *in.value);
 			t.fn.~F();
-			in.readers.fetch_sub(1, std::memory_order_release); // done with the value
+			DoneReading(&in);
 			ReleaseFuture(&in);
 			FinishFuture(&t);
 		}
@@ -612,9 +615,10 @@ public:
 #if defined(LOOM_COROUTINES)
 	// co_await future, in a coroutine: the value (a reference into the
 	// future, or moved out of a temporary one), or the error rethrown. A
-	// move out of a future whose continuations are still reading it copies
-	// the value instead, or, for a type that cannot be copied, waits for them
-	// to finish. See Coroutines below.
+	// move out of a future whose continuations are still to read it copies
+	// the value instead, or, for a type that cannot be copied, suspends until
+	// the last of them has read it (one gated on a counter keeps it suspended
+	// until that counter is zero). See Coroutines below.
 	detail::FutureAwaiter<T, false> operator co_await() &;
 	detail::FutureAwaiter<T, true> operator co_await() &&;
 	// A coroutine may return a Future: see Coroutines below.
@@ -823,6 +827,17 @@ namespace detail {
 	// drops the coroutine's reference.
 	void FinishCoroutine(FutureStateBase* state, void* coroutine) noexcept;
 
+	// A co_await moving a value that cannot be copied out of a future whose
+	// continuations may still read it: it resumes once the future is ready
+	// and no continuation is left to read it.
+	struct MoveWaiter
+	{
+		FutureStateBase* state = nullptr;
+		void*            coroutine = nullptr;
+		TaskDesc         opts = {};
+	};
+	void SubmitResumeAfterReaders(MoveWaiter* waiter);
+
 	inline void RethrowFailure(const FutureStateBase& state)
 	{
 #if defined(__cpp_exceptions)
@@ -841,29 +856,44 @@ namespace detail {
 		bool always = false; // After(future, opts): suspend even when ready
 		TaskDesc opts = {};
 
+		// Continuations of this future may still be reading the value (each
+		// gets it as a T&), and moving it out from under them is a race. A
+		// moving co_await copies it while they read, or, for a type that
+		// cannot be copied, suspends until they have finished.
+		static constexpr bool kWaitsForReaders = Move && !std::is_void_v<T> && !std::is_copy_constructible_v<T>;
+		mutable MoveWaiter waiter = {};
+
 		static FutureAwaiter Of(Future<T>& future, bool always, const TaskDesc& opts) { return { future.m_State, always, opts }; }
 
-		bool await_ready() const { return !always && Count(state->counter) == 0; }
-		void await_suspend(std::coroutine_handle<> h) const { SubmitResume(h, opts, state->counter, {}); }
+		bool await_ready() const
+		{
+			if (always || Count(state->counter) != 0)
+				return false;
+			if constexpr (kWaitsForReaders)
+				return state->readers.load(std::memory_order_acquire) == 0;
+			return true;
+		}
+		void await_suspend(std::coroutine_handle<> h) const
+		{
+			if constexpr (kWaitsForReaders)
+			{
+				waiter = { state, h.address(), opts };
+				SubmitResumeAfterReaders(&waiter);
+			}
+			else
+				SubmitResume(h, opts, state->counter, {});
+		}
 		decltype(auto) await_resume() const
 		{
 			RethrowFailure(*state);
 			if constexpr (std::is_void_v<T>)
 				return;
+			else if constexpr (kWaitsForReaders)
+				return T(std::move(*state->value)); // no continuation is left reading it
 			else if constexpr (Move)
 			{
-				// Continuations of this future may still be reading the value
-				// (each gets it as a T&). Moving it out from under them is a
-				// race: copy it while they read, or, for a type that cannot be
-				// copied, let them finish first.
 				if (state->readers.load(std::memory_order_acquire) != 0)
-				{
-					if constexpr (std::is_copy_constructible_v<T>)
-						return T(static_cast<const T&>(*state->value));
-					else
-						while (state->readers.load(std::memory_order_acquire) != 0)
-							HelpOnce();
-				}
+					return T(static_cast<const T&>(*state->value));
 				return T(std::move(*state->value));
 			}
 			else

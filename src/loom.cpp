@@ -2822,10 +2822,26 @@ void ReleaseFuture(FutureStateBase* state) noexcept
 	t_Destroying = false;
 }
 
-void HelpOnce()
+#if defined(LOOM_COROUTINES)
+static void ResumeCoroutine(void* address);
+#endif
+
+// The last reader to finish and a moving co_await that waits for readers
+// meet as a store and a load each, seq_cst: the co_await publishes itself in
+// `mover` and then reads `readers`; a reader drops `readers` and then takes
+// `mover`. In the single total order one of them sees the other, and the
+// exchange and the compare-exchange on `mover` let only one of them resume.
+void DoneReading(FutureStateBase* state)
 {
-	if (!TryHelpIn(ActivePool()))
-		std::this_thread::yield();
+	if (state->readers.fetch_sub(1, std::memory_order_seq_cst) != 1)
+		return;
+#if defined(LOOM_COROUTINES)
+	if (void* m = state->mover.exchange(nullptr, std::memory_order_seq_cst))
+	{
+		MoveWaiter& w = *static_cast<MoveWaiter*>(m);
+		SubmitResume(std::coroutine_handle<>::from_address(w.coroutine), w.opts, kInvalidCounter, {});
+	}
+#endif
 }
 
 #if defined(LOOM_COROUTINES)
@@ -2867,6 +2883,40 @@ void SubmitResume(std::coroutine_handle<> coroutine, const TaskDesc& opts, Count
 	// thread first.
 	PoolState& P = ActivePool();
 	if (coroutine.address() == t_ResumedCoroutine)
+		ReleaseRunningUnit(P, CurrentCtx(P));
+	Submit(desc);
+}
+
+// The resume of a moving co_await, once the future is ready: it resumes the
+// coroutine now if no continuation is left reading the value, or leaves that
+// to the last reader (DoneReading).
+static void ResumeOnceRead(void* p)
+{
+	MoveWaiter& w = *static_cast<MoveWaiter*>(p);
+	FutureStateBase* const state = w.state;
+	void* const coroutine = w.coroutine;
+	// Once it is published, the last reader may resume the coroutine on
+	// another thread, which may finish and drop the future (and the frame
+	// that holds `w`) before this reads `readers`: a reference of its own
+	// keeps the state, and `w` is read again only by whoever takes it back.
+	RetainFuture(state);
+	state->mover.store(p, std::memory_order_seq_cst);
+	void* expected = p;
+	const bool mine = state->readers.load(std::memory_order_seq_cst) == 0
+		&& state->mover.compare_exchange_strong(expected, nullptr, std::memory_order_seq_cst);
+	ReleaseFuture(state);
+	if (mine)
+		ResumeCoroutine(coroutine);
+}
+
+void SubmitResumeAfterReaders(MoveWaiter* waiter)
+{
+	TaskDesc desc = waiter->opts;
+	desc.fn = &ResumeOnceRead;
+	desc.userData = waiter;
+	desc.waitsFor = waiter->state->counter;
+	PoolState& P = ActivePool();
+	if (waiter->coroutine == t_ResumedCoroutine)
 		ReleaseRunningUnit(P, CurrentCtx(P));
 	Submit(desc);
 }
@@ -3968,6 +4018,11 @@ void UnregisterDedicatedThread(DedicatedId id)
 	bool reported = false;
 	for (;;)
 	{
+		// The tasks this thread ran while helping hold their signals back
+		// (RunSlot defers them on a pool thread): one of them may be what a
+		// task for the dedicated thread waits for. Never sleep, or return,
+		// holding them.
+		FlushDeferredSignals(P, CurrentCtx(P));
 		int64_t left = 0;
 		{
 			std::lock_guard<std::mutex> lock(P.dedicatedMutex);

@@ -63,6 +63,34 @@ static bool EndsInAbort(void (*fn)(), std::string& err)
 	waitpid(pid, &status, 0);
 	return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
 }
+
+// Runs fn in a child process: true when it returned within `ms` (a hang is
+// killed and counts as false). Call it with no pool active.
+static bool EndsWithin(void (*fn)(), int ms)
+{
+	const pid_t pid = fork();
+	if (pid == 0)
+	{
+		std::signal(SIGABRT, SIG_DFL);
+		const int devNull = open("/dev/null", O_WRONLY);
+		dup2(devNull, 1);
+		fn();
+		_exit(0);
+	}
+	const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+	int status = 0;
+	while (waitpid(pid, &status, WNOHANG) != pid)
+	{
+		if (std::chrono::steady_clock::now() > until)
+		{
+			kill(pid, SIGKILL);
+			waitpid(pid, &status, 0);
+			return false;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(2));
+	}
+	return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
 #endif
 
 #if defined(LOOM_TEST_HOOKS)
@@ -4920,6 +4948,79 @@ TEST_CASE("loom: profiler zone hook — begin/end pairs carry the executing thre
 		CHECK(begins >= 8); // 200 / 25 = 8 chunks
 	}
 }
+
+// ---- Helping loops apply what they hold back ---------------------------------------
+
+TEST_CASE("loom: dedicated threads — unregistering applies the signals of the tasks it ran while helping")
+{
+	// The unregister helps while it waits: the task it runs defers its
+	// signal, and the dedicated thread's task waits for that signal.
+	REQUIRE(!loom::HasActivePool());
+	CHECK(EndsWithin([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 0, .shutdownTimeoutMs = 500 });
+		const loom::DedicatedId d = loom::RegisterDedicatedThread({ .name = "io" });
+		loom::ScopedCounter gate(1);
+		loom::Submit([] {}, { .affinity = loom::Affinity::Dedicated, .thread = d, .waitsFor = gate });
+		loom::Submit([] {}, { .signals = gate }); // on this thread's deque: the unregister runs it
+		loom::UnregisterDedicatedThread(d);
+	}, 5000));
+}
+
+#if defined(LOOM_COROUTINES)
+static loom::Future<int> TakeMoveOnly(loom::Future<std::unique_ptr<int>> f)
+{
+	std::unique_ptr<int> v = co_await std::move(f); // waits for the continuation reading it
+	co_return *v;
+}
+
+TEST_CASE("loom: coroutines — a moving co_await of a move-only value waits for a gated continuation")
+{
+	// The continuation waits for a gate whose signaller the co_await's own
+	// thread runs: the wait must apply that signal, not hold it back.
+	REQUIRE(!loom::HasActivePool());
+	CHECK(EndsWithin([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 0, .shutdownTimeoutMs = 500 });
+		loom::Promise<std::unique_ptr<int>> p;
+		loom::Future<std::unique_ptr<int>> f = p.GetFuture();
+		p.SetValue(std::make_unique<int>(7));
+		loom::ScopedCounter gate(1);
+		const loom::CounterHandle gates[1] = { gate };
+		loom::Future<int> g = f.Then([](std::unique_ptr<int>& v) { return *v; }, { .waitsForAll = gates });
+		loom::Submit([] {}, { .signals = gate });
+		loom::Future<int> t = TakeMoveOnly(std::move(f));
+		if (t.Get() != 7 || g.Get() != 7)
+			_exit(3);
+	}, 5000));
+}
+
+TEST_CASE("loom: coroutines — a moving co_await suspends while continuations have yet to read, without spinning")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 2 });
+	loom::Promise<std::unique_ptr<int>> p;
+	loom::Future<std::unique_ptr<int>> f = p.GetFuture();
+	loom::ScopedCounter gate(1);
+	const loom::CounterHandle gates[1] = { gate };
+	std::atomic<int> read{ 0 };
+	loom::Future<int> g = f.Then([&](std::unique_ptr<int>& v) { read++; return *v; }, { .waitsForAll = gates });
+	p.SetValue(std::make_unique<int>(5));
+	loom::Future<int> t = TakeMoveOnly(std::move(f)); // returns at its suspension
+	const auto processCpuMs = [] {
+		timespec ts{};
+		clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+		return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+	};
+	const double c0 = processCpuMs();
+	std::this_thread::sleep_for(std::chrono::milliseconds(200));
+	const double spent = processCpuMs() - c0;
+	CHECK(!t.IsReady()); // suspended until the continuation has read the value
+	CHECK(read.load() == 0);
+	CHECK(spent < 50.0); // nobody spins while it waits
+	loom::Signal(gate);
+	CHECK(t.Get() == 5);
+	CHECK(g.Get() == 5);
+	CHECK(read.load() == 1);
+}
+#endif
 
 } // namespace
 
