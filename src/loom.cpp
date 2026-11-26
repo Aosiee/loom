@@ -983,6 +983,8 @@ void SetTestHook(TestHookFn fn) { s_TestHook.store(fn, std::memory_order_release
 static constexpr int kTestPointUnitFreed = 1;
 // A task's function has returned; its runner has given nothing back yet.
 static constexpr int kTestPointTaskReturned = 2;
+// PumpMainThreadTasks has loaded the active pool.
+static constexpr int kTestPointPumpLoaded = 3;
 
 // A unit given back while the count was below zero: someone is owed it, a
 // lowered limit's debt or a waiting task. Returns the task it went to (which
@@ -4049,6 +4051,7 @@ void PumpMainThreadTasks()
 	PoolState* pool = s_ActivePool.load(std::memory_order_seq_cst);
 	if (!pool)
 		return;
+	LOOM_TEST_POINT(kTestPointPumpLoaded);
 	PoolState& P = *pool;
 	// Main-thread tasks run on the main thread only.
 	assert(std::this_thread::get_id() == P.mainThreadId && "PumpMainThreadTasks off the main thread");

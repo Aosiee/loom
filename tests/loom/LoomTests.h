@@ -5405,6 +5405,43 @@ TEST_CASE("loom: Shutdown — a Pool destroyed on another thread while the main 
 	}
 }
 
+// Holds the first pump that has loaded the pool, while another thread
+// destroys it: the Pool must not be freed until that pump is done with it.
+struct PumpHeld
+{
+	static inline std::atomic<bool> armed{ false }, held{ false }, released{ false };
+	static void Hook(int point)
+	{
+		if (point != 3 || !armed.exchange(false)) // 3: the pump has loaded the pool
+			return;
+		held = true;
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		released = true;
+	}
+};
+
+TEST_CASE("loom: Shutdown — on another thread, returns only once a pump that loaded the pool is done with it")
+{
+	auto pool = std::make_unique<loom::Pool>(loom::PoolConfig{ .workerCount = 2 });
+	PumpHeld::held = false;
+	PumpHeld::released = false;
+	PumpHeld::armed = true;
+	loom::detail::SetTestHook(&PumpHeld::Hook);
+	std::atomic<bool> done{ false }, early{ false };
+	std::thread quitter([&] {
+		while (!PumpHeld::held)
+			std::this_thread::yield();
+		pool.reset();
+		early = !PumpHeld::released.load();
+		done = true;
+	});
+	while (!done)
+		loom::PumpMainThreadTasks();
+	quitter.join();
+	loom::detail::SetTestHook(nullptr);
+	CHECK_FALSE(early.load());
+}
+
 struct SubmitsOnExit
 {
 	bool used = false;

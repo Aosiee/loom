@@ -28,6 +28,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -223,6 +224,29 @@ loom::PoolConfig Config()
 
 // ---- Scenarios ------------------------------------------------------------------------
 
+TEST_CASE("faults: a Pool whose threads cannot all start")
+{
+	Sweep([](int n) {
+		Arm(n);
+		bool threw = false;
+		std::optional<loom::Pool> pool;
+		try
+		{
+			pool.emplace(loom::PoolConfig{ .workerCount = 4, .shutdownTimeoutMs = 300 });
+		}
+		catch (const std::bad_alloc&) { threw = true; }
+		const bool failed = Disarm() || threw;
+		// A constructor that threw installed nothing, and stopped what it started.
+		if (threw)
+		{
+			if (loom::HasActivePool())
+				_exit(kBroken);
+			pool.emplace(Config());
+		}
+		Finish(failed);
+	});
+}
+
 TEST_CASE("faults: ParallelFor with more chunks than a deque holds")
 {
 	Sweep([](int n) {
@@ -349,26 +373,51 @@ TEST_CASE("faults: SetLimit, a dedicated thread, ParkAll and the debug dump")
 {
 	Sweep([](int n) {
 		loom::Pool pool(Config());
-		loom::LimiterHandle l = loom::CreateLimiter(4);
+		// Indices 0 and 1 held while the limit drops to 1: index 1 is not
+		// kept when it comes back, so a raise must make room for it again.
+		loom::LimiterHandle l = loom::CreateLimiter(2);
 		{
-			loom::ScopedCounter done(8);
-			for (int i = 0; i < 8; i++)
-				loom::Submit([] {}, { .signals = done, .limiter = l });
+			std::atomic<int> have{ 0 };
+			std::atomic<bool> lowered{ false };
+			loom::ScopedCounter done(2);
+			for (int i = 0; i < 2; i++)
+				loom::Submit([&] {
+					(void)loom::CurrentLimiterUnit();
+					have++;
+					while (!lowered)
+						std::this_thread::yield();
+				}, { .signals = done, .limiter = l });
+			while (have.load() < 2)
+				std::this_thread::yield();
+			loom::SetLimit(l, 1);
+			lowered = true;
 			loom::WaitFor(done);
 		}
-		loom::SetLimit(l, 1);
 		Arm(n);
 		bool threw = false;
+		// Past every limit used before, the raise needs room for the new
+		// units' indices: if it cannot make it, the limit stays as it was.
+		bool raised = true;
 		try
 		{
-			loom::SetLimit(l, 4);
-			const loom::DedicatedId d = loom::RegisterDedicatedThread({ .name = "io" });
-			loom::UnregisterDedicatedThread(d);
-			if (loom::ParkAll(2000))
-				loom::UnparkAll();
-			(void)loom::DebugDump();
+			loom::SetLimit(l, 64);
 		}
-		catch (const std::bad_alloc&) { threw = true; }
+		catch (const std::bad_alloc&) { threw = true; raised = false; }
+		if (loom::Limit(l) != (raised ? 64u : 1u))
+			_exit(kBroken);
+		if (raised)
+		{
+			try
+			{
+				loom::SetLimit(l, 4);
+				const loom::DedicatedId d = loom::RegisterDedicatedThread({ .name = "io" });
+				loom::UnregisterDedicatedThread(d);
+				if (loom::ParkAll(2000))
+					loom::UnparkAll();
+				(void)loom::DebugDump();
+			}
+			catch (const std::bad_alloc&) { threw = true; }
+		}
 		const bool failed = Disarm() || threw;
 		// The limit is whatever the call left, and it holds: 4 at once if
 		// the raise went through, 1 if it threw.
