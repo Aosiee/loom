@@ -5529,6 +5529,32 @@ TEST_CASE("loom: counters — a signal past zero ends the program, saying so")
 	CHECK(err.find("signalled more times than its count") != std::string::npos);
 }
 
+// ---- Threads that take pool work ------------------------------------
+
+static std::atomic<bool> s_StolenStarted{ false };
+
+TEST_CASE("loom: dedicated threads — unregistering one that took pool work helps until it is out")
+{
+	// The stealing thread runs a pool task that needs a main-thread step;
+	// nothing was submitted to the thread itself.
+	REQUIRE(!loom::HasActivePool());
+	CHECK(EndsWithin([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 0 });
+		const loom::DedicatedId d = loom::RegisterDedicatedThread({ .name = "stealer", .idle = loom::DedicatedConfig::Idle::StealFromPool });
+		loom::ScopedCounter done(1);
+		loom::Submit([] {
+			s_StolenStarted = true;
+			loom::ScopedCounter step(1);
+			loom::Submit([] {}, { .affinity = loom::Affinity::MainThread, .signals = step });
+			loom::WaitFor(step);
+		}, { .signals = done });
+		while (!s_StolenStarted)
+			std::this_thread::yield();
+		loom::UnregisterDedicatedThread(d);
+		loom::WaitFor(done);
+	}, 5000));
+}
+
 } // namespace
 
 }} // namespace loom::tests

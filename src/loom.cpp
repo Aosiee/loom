@@ -488,6 +488,7 @@ struct DedicatedState
 	Waiter*                waiter = nullptr; // set while the thread sleeps
 	uint16_t               waiterRegion = 0; // the isolated region it waits in (0: none)
 	std::atomic<bool>      stop{ false };
+	std::atomic<bool>      exited{ false }; // out of its loop: only the join is left
 	DedicatedId            id = {};
 	// Its CurrentThreadIndex, once the thread has started: the key of its
 	// stats row (names need not be unique).
@@ -4277,7 +4278,9 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 		if (slot != kNoSlot && poolWake && HasPoolWork(P))
 			WakeForWork(P, 1);
 		poolWake = false;
-		if (slot == kNoSlot && steals)
+		// A thread being unregistered takes no more pool work: it only
+		// finishes what was submitted to it.
+		if (slot == kNoSlot && steals && !d.stop.load(std::memory_order_acquire))
 			slot = StealOnce(P, nullptr);
 		if (slot != kNoSlot)
 		{
@@ -4334,6 +4337,7 @@ static void DedicatedLoop(PoolState& P, DedicatedState& d)
 	}
 	t_CurrentDedicated = nullptr;
 	t_ThreadStats = nullptr;
+	d.exited.store(true, std::memory_order_release);
 }
 
 static DedicatedId RegisterDedicated(PoolState& P, const DedicatedConfig& config, bool lane)
@@ -4435,6 +4439,15 @@ void UnregisterDedicatedThread(DedicatedId id)
 		// A parked thread leaves the park once its stop flag is set.
 		std::lock_guard<std::mutex> park(P.parkMutex);
 		P.parkCV.notify_all();
+	}
+	// A thread that takes pool work may be inside a task it took from the
+	// pool, which nothing above waited for: it may need this thread (a
+	// main-thread step, say). Help, as above, until it is out of its loop.
+	while (!d->exited.load(std::memory_order_acquire))
+	{
+		FlushDeferredSignals(P, CurrentCtx(P));
+		if (!TryHelpIn(P))
+			std::this_thread::sleep_for(std::chrono::microseconds(100));
 	}
 	if (d->thread.joinable()) d->thread.join();
 }

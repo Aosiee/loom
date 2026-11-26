@@ -1833,7 +1833,9 @@ DedicatedId RegisterDedicatedThread(const DedicatedConfig&);
 // the ones its tasks submit meanwhile. The caller helps while it waits, so
 // signal what those tasks wait for before calling it, or from another
 // thread: a task whose counter nobody will signal keeps it waiting (it
-// reports that on stderr after PoolConfig::shutdownTimeoutMs).
+// reports that on stderr after PoolConfig::shutdownTimeoutMs). A thread
+// that takes pool work stops taking more, and finishes the pool task it is
+// in, if any, before the join, with the caller still helping.
 void         UnregisterDedicatedThread(DedicatedId);
 
 // ---- Thread identity -------------------------------------------------------
