@@ -5457,6 +5457,58 @@ TEST_CASE("loom: hooks — a profiler zone hook or a park wake that throws ends 
 	CHECK(wakeErr.find("a park participant's wake threw") != std::string::npos);
 }
 
+// ---- The frame loop's share -------------------------------------------------------------
+
+static std::atomic<int> s_Polls{ 0 };
+static std::atomic<bool> s_PollStop{ false };
+
+static void PollTask(void*)
+{
+	s_Polls++;
+	if (!s_PollStop)
+		loom::Submit(loom::TaskDesc{ .fn = &PollTask, .affinity = loom::Affinity::MainThread });
+}
+
+TEST_CASE("loom: PumpMainThreadTasks — a task that resubmits itself runs once per pump")
+{
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+	s_Polls = 0;
+	s_PollStop = false;
+	loom::Submit(loom::TaskDesc{ .fn = &PollTask, .affinity = loom::Affinity::MainThread });
+	for (int frame = 0; frame < 5; frame++)
+		loom::PumpMainThreadTasks();
+	CHECK(s_Polls.load() == 5); // a million per pump before
+	s_PollStop = true;
+	loom::PumpMainThreadTasks();
+}
+
+TEST_CASE("loom: Pipeline — a main-thread serial stage takes one item per task, not the whole stream")
+{
+	struct Item { int v = 0; };
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 4 });
+	std::atomic<int> produced{ 0 }, uploaded{ 0 };
+	auto run = loom::Async([&] {
+		loom::Pipeline<Item> p(8);
+		p.Source([&](Item& it) { if (produced >= 200) return false; it.v = produced++; return true; })
+			.Parallel([](Item& it) { it.v *= 2; })
+			.Serial([&](Item&) { std::this_thread::sleep_for(std::chrono::microseconds(500)); uploaded++; },
+				loom::TaskDesc{ .affinity = loom::Affinity::MainThread });
+		p.Run();
+		return 0;
+	});
+	double worstMs = 0;
+	while (!run.IsReady())
+	{
+		const auto a = std::chrono::steady_clock::now();
+		loom::PumpMainThreadTasks();
+		worstMs = std::max(worstMs, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count());
+		std::this_thread::sleep_for(std::chrono::microseconds(500));
+	}
+	run.Get();
+	CHECK(uploaded.load() == 200);
+	CHECK(worstMs < 50.0); // the whole stream, 100 ms and more, in one pump before
+}
+
 } // namespace
 
 }} // namespace loom::tests

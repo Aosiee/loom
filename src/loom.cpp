@@ -3989,9 +3989,14 @@ void PumpMainThreadTasks()
 	if (std::this_thread::get_id() != P.mainThreadId || P.stop.load(std::memory_order_acquire))
 		return;
 	WorkerCtx* ctx = CurrentCtx(P);
-	// Bounded: a main-thread task that resubmits itself must not trap the
-	// frame loop here forever.
-	for (int guard = 0; guard < 1000000; guard++)
+	// Bounded by what was queued when it started: a main-thread task that
+	// resubmits itself (a poll) runs once per pump, not until a cap.
+	size_t queued = 0;
+	{
+		std::lock_guard<std::mutex> lock(P.mainMutex);
+		queued = P.mainQueue.size();
+	}
+	for (size_t k = 0; k < queued; k++)
 	{
 		const uint32_t slot = PopFront(P.mainMutex, P.mainQueue);
 		if (slot == kNoSlot)
@@ -4762,6 +4767,14 @@ void RunSource(PipelineRun& run, uint32_t item)
 				Signal(done); // the run may be gone after this
 			return;
 		}
+		// A source pinned to the main thread or a dedicated thread hands the
+		// next item to a task of its own rather than keep the thread: inline
+		// it would run the whole stream inside one pump of the frame loop.
+		if (next != kNoSlot && run.stages[0].opts.affinity != Affinity::AnyWorker)
+		{
+			SubmitStage(run, next, 0); // still the source's: sourceBusy stays set
+			next = kNoSlot;
+		}
 		if (next == kNoSlot)
 			ReleaseStageUnit();
 		PipelineAdvance(run, item, 1); // with no `next` held, the run may be gone after this
@@ -4793,6 +4806,14 @@ void RunStage(PipelineRun& run, uint32_t item, size_t stage)
 			}
 			else
 				st.busy = false;
+		}
+		// Pinned to the main thread or a dedicated thread, the next item
+		// gets a task of its own, as the source's does (busy stays set, so
+		// the order holds).
+		if (next != kNoSlot && run.stages[stage].opts.affinity != Affinity::AnyWorker)
+		{
+			SubmitStage(run, next, stage);
+			next = kNoSlot;
 		}
 		if (next == kNoSlot)
 			ReleaseStageUnit();

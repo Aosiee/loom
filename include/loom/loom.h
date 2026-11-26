@@ -1612,7 +1612,10 @@ void ParallelSort(It first, It last, Comp comp = {})
 // has left the last stage. If a stage throws, the source stops, the items in
 // flight skip their remaining stages, and Run rethrows the first exception.
 // Run may be called again; the stages and items stay. A MainThread stage
-// needs the main thread to wait or pump while the pipeline runs.
+// needs the main thread to wait or pump while the pipeline runs. A stage on
+// the pool takes the next item in line itself when it is waiting; one on the
+// main thread or a dedicated thread queues a task for it instead, so a pump
+// runs one item of it, not the rest of the stream.
 namespace detail {
 struct PipelineStage
 {
@@ -1800,9 +1803,10 @@ LaneId AcquireLane(const char* name);
 void   ReleaseLane(LaneId lane);
 
 // ---- Main thread -----------------------------------------------------------
-// Call once per frame from the engine loop: a bounded drain of the
-// main-affinity queue (WaitFor on the main thread pumps it too). On the main
-// thread only: elsewhere it asserts and does nothing.
+// Call once per frame from the engine loop: runs the main-affinity tasks
+// queued when it starts, not those they queue as they run (a task that
+// resubmits itself runs once per pump). WaitFor on the main thread runs them
+// too. On the main thread only: elsewhere it asserts and does nothing.
 void PumpMainThreadTasks();
 
 // ---- Dedicated threads -----------------------------------------------------
