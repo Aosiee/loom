@@ -7,7 +7,7 @@ callers need to change anything.
 
 ## Updating from an older version
 
-Five releases changed things for existing callers. Updating from 0.9.0 to
+Six releases changed things for existing callers. Updating from 0.9.0 to
 any later version, check these:
 
 - 0.10.0: `Shutdown` drains every live task first, so it blocks until they
@@ -36,6 +36,53 @@ any later version, check these:
   below). A Shutdown from another thread needs the main thread to only
   pump from then on, and the default worker count follows the CPUs the
   process may use.
+- 0.20.4: pipelines and graph runs no longer isolate themselves deep in
+  waits (0.20.3 did from 64 deep), and a pump inside Isolated runs only
+  that region's main-thread tasks.
+
+## 0.20.4 (2026-11-26): a fuzzer, and what it found in 0.20.3
+
+Fixes only. The ones that could hang:
+
+- 0.20.3 made graph runs and pipelines isolate themselves from 64 waits
+  deep. A limiter's unit is held from the moment its task is queued, so a
+  task queued outside the graph could hold the unit a step needed, and
+  the isolated wait never ran it: a hang in a program that keeps to the
+  rules. They no longer isolate. ParallelFor, the reductions, the scans
+  and the sort still run on the calling thread from 16 waits deep.
+- PumpMainThreadTasks inside an isolated region ran every main-thread
+  task, though the region's waits and TryHelp run only its own. An
+  outside task it ran could wait on work that a thread isolated in the
+  same region would never run. Inside a region the pump now runs only the
+  region's tasks.
+- Two Shutdowns at once (on two threads, or a thread and the destructor)
+  both drained and joined the same threads. The second now waits for the
+  first, pumping meanwhile on the main thread.
+
+And smaller ones: a sort piece or ParallelFor chunk that threw signalled
+its counter from inside its handler, which ThreadSanitizer reported as a
+race on the exception; a waiting task's dependency count was reached
+through an atomic_ref that could outlive the slot; loom.cpp's own types
+had external linkage, so a host's types of the same names could collide
+with them; and the unused LOOM_TSAN define is gone. The header says that
+two tasks becoming runnable at the same moment on different threads take
+a limiter's units in either order.
+
+tests/fuzz is new: loom_fuzz turns a seed into a random program of pools,
+dedicated threads, lanes, limiters, dependency graphs, futures,
+coroutines, algorithms, pipelines, graph runs and parking, and checks
+each against what loom promises (README, Building). CI runs a fresh batch
+of seeds in every configuration on each push. Three fixes of 0.20.3 that
+had no test now have one that fails on 0.20.2: a Pool whose threads
+cannot all start, a SetLimit raise that cannot allocate, and a pump the
+Pool must outlive.
+
+What existing callers may notice:
+
+- Pipelines and graph runs nested through helping are not bounded, as
+  before 0.20.2: each level holds a counter and a stack frame.
+- A PumpMainThreadTasks call inside Isolated leaves other regions'
+  main-thread tasks for a later pump.
 
 ## 0.20.3 (2026-11-26): a second bug hunt, and running out of memory
 
