@@ -1119,23 +1119,11 @@ namespace detail {
 	// (and what is built on it) and the sort run on the calling thread
 	// instead, with no wait of their own (the sort splits its pieces there as
 	// it would into tasks, so its result is the same).
+	// Pipelines and graph runs, whose steps may be pinned to other threads,
+	// cannot run on the calling thread, and are not bounded: isolating their
+	// wait would leave it unable to run outside work their steps need (a
+	// task holding a limiter unit, a main-thread step).
 	bool     DeepInWaits();
-	// Pipelines and graph runs cannot run on the calling thread (their steps
-	// may be pinned to other threads). Far deeper still (64 waits), they open
-	// an isolated region, so their wait runs only their own tasks and the
-	// pile stops, unless the thread is in a region already (whose waits are
-	// bounded the same way). Not sooner: an isolated wait helps nobody else,
-	// and work elsewhere (a BlockOnly waiter's, say) may need it to.
-	bool     IsolateNow();
-	struct IsolateWhenDeep
-	{
-		bool     active = IsolateNow();
-		uint16_t outer = active ? BeginIsolation() : 0;
-		~IsolateWhenDeep() { if (active) EndIsolation(outer); }
-		IsolateWhenDeep() = default;
-		IsolateWhenDeep(const IsolateWhenDeep&) = delete;
-		IsolateWhenDeep& operator=(const IsolateWhenDeep&) = delete;
-	};
 }
 
 template <typename F> requires std::is_invocable_v<F&&>

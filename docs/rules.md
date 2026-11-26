@@ -129,10 +129,11 @@ inside `Isolated`, where a wait helps only with its own region's tasks.
 loom's own fork-joins keep that pile shallow once a thread is 16 waits
 deep: a ParallelFor (and the reductions and scans built on it) and the sort
 then run on the calling thread with no wait of their own. Pipelines and
-graph runs, whose steps may be pinned to other threads, open an isolated
-region once a thread is 64 waits deep (unless it is in one already). A hand-written fork-join that may nest inside itself
-many times over (a recursive Submit and WaitFor) should use `Isolated` for
-the same reason.
+graph runs, whose steps may be pinned to other threads, are not bounded,
+and neither is a hand-written fork-join (a recursive Submit and WaitFor):
+each level nested through helping holds a counter and a stack frame. One
+that may nest inside itself many times over can use `Isolated`, if what it
+waits for needs nothing outside its region.
 
 ## Keep a future alive while anything reads it
 

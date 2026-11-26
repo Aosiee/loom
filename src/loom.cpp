@@ -2809,7 +2809,6 @@ void Submit(TaskGraph& graph, CounterHandle signals, CounterHandle waitsFor)
 
 void Run(TaskGraph& graph, Help help)
 {
-	const detail::IsolateWhenDeep isolate;
 	const CounterHandle done = CreateCounter(1);
 	// Destroyed on the way out even when WaitFor rethrows (the count is zero).
 	struct DestroyOnExit
@@ -3021,15 +3020,6 @@ static constexpr int kInlineAtWaitDepth = 16;
 bool DeepInWaits()
 {
 	return t_WaitDepth >= kInlineAtWaitDepth;
-}
-
-// Pipelines and graph runs, which cannot run on the calling thread: see
-// IsolateNow in the header.
-static constexpr int kIsolateGraphsAtWaitDepth = 64;
-
-bool IsolateNow()
-{
-	return t_WaitDepth >= kIsolateGraphsAtWaitDepth && t_Isolation == 0;
 }
 
 } // namespace detail
@@ -4934,7 +4924,6 @@ void PipelineAdvance(PipelineRun& run, uint32_t item, size_t stage)
 void RunPipeline(const PipelineStage* stages, size_t stageCount, void* const* items, size_t itemCount)
 {
 	assert(stageCount >= 1 && itemCount >= 1);
-	const detail::IsolateWhenDeep isolate;
 	for (size_t i = 0; i < stageCount; i++)
 		assert(stages[i].opts.fn == nullptr && stages[i].opts.signals == kInvalidCounter && stages[i].opts.waitsFor == kInvalidCounter
 			&& stages[i].opts.waitsForAll.empty() && "a pipeline stage's TaskDesc gives no fn, signals or waits");

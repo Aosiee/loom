@@ -408,16 +408,17 @@ up still help as usual. The threads further down have plenty to do. The
 sort does the same, splitting its pieces on the calling thread exactly as
 it would have split them into tasks, so equal elements come out in the
 same order however deep it was called. Pipelines and graph runs cannot run
-that way (their steps may be pinned to other threads); from 64 waits on
-they open an isolated region instead, whose wait runs only their own tasks,
-unless the thread is in a region already.
+that way (their steps may be pinned to other threads), and are not bounded.
 
-Isolating sooner, or the data-parallel fork-joins at all, had a cost. An
+Isolating deep fork-joins instead had a cost each time it was tried. An
 isolated wait helps nobody else: a main thread waiting BlockOnly for work
-that only the helping of a deep worker would have run waited for good, and
-a fresh region for every deep fork-join made a main-thread step that a
+that only the helping of a deep worker would have run waited for good; a
+fresh region for every deep fork-join made a main-thread step that a
 deeper region's work needed not the outer region's, so the main thread,
-waiting isolated in it, never ran it.
+waiting isolated in it, never ran it; and a graph run isolated 64 waits
+deep could not run the task outside it that held the limiter unit its
+step needed (a unit is held from queuing). Isolation is for the caller to
+choose, knowing what its work needs.
 
 ## Parallel loops
 

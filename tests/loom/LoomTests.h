@@ -5633,6 +5633,46 @@ TEST_CASE("loom: nesting — a sort deep in waits runs on the calling thread, in
 	CHECK(std::is_sorted(deep.begin(), deep.end(), byKey));
 }
 
+#if defined(__linux__)
+// 70 waits deep on the main thread (the one worker held), a graph run whose
+// node needs a limiter's only unit, which a task queued outside the graph
+// holds. The graph run's wait must run that task: isolating it there (as
+// 0.20.3 did from 64 deep) left the unit held for good.
+static void DeepGraphNeedsAUnitHeldOutside()
+{
+	using namespace std::chrono_literals;
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 1, .shutdownTimeoutMs = 2000 });
+	std::atomic<bool> started{ false }, release{ false };
+	loom::ScopedCounter busy(1);
+	loom::Submit([&] {
+		started = true;
+		while (!release)
+			std::this_thread::sleep_for(1ms);
+	}, { .signals = busy });
+	while (!started)
+		std::this_thread::yield();
+	const loom::LimiterHandle lim = loom::CreateLimiter(1);
+	bool ran = false;
+	auto inner = [&] {
+		loom::Submit([] {}, { .limiter = lim }); // queued, holding the only unit
+		loom::TaskGraph graph;
+		graph.Add([&] { ran = true; }, { .limiter = lim });
+		loom::Run(graph);
+	};
+	WaitsDeep(70, loom::TaskDesc{}, inner);
+	release = true;
+	loom::WaitFor(busy);
+	loom::DestroyLimiter(lim);
+	if (!ran)
+		_exit(1);
+}
+
+TEST_CASE("loom: nesting — a graph run deep in waits runs the outside work its steps need")
+{
+	CHECK(EndsWithin(DeepGraphNeedsAUnitHeldOutside, 20000));
+}
+#endif
+
 } // namespace
 
 }} // namespace loom::tests
