@@ -1977,6 +1977,7 @@ void ParallelFor(size_t begin, size_t end, size_t chunkSize, ParallelForFn fn, v
 	PoolState& P = ActivePool(); // the no-pool assert even for an empty range
 	if (begin >= end || fn == nullptr)
 		return;
+	const detail::IsolateWhenDeep isolate;
 	if (chunkSize == 0)
 		ParallelForAuto(P, begin, end, fn, userData);
 	else
@@ -2409,6 +2410,7 @@ void Submit(TaskGraph& graph, CounterHandle signals, CounterHandle waitsFor)
 
 void Run(TaskGraph& graph, Help help)
 {
+	const detail::IsolateWhenDeep isolate;
 	const CounterHandle done = CreateCounter(1);
 	// Destroyed on the way out even when WaitFor rethrows (the count is zero).
 	struct DestroyOnExit
@@ -2592,6 +2594,19 @@ uint16_t BeginIsolation()
 void EndIsolation(uint16_t outer)
 {
 	t_Isolation = outer;
+}
+
+// The waits the calling thread is inside, innermost included (WaitUntil
+// counts them).
+static thread_local int t_WaitDepth = 0;
+
+// Deep enough that each further level costs a counter and a stack frame for
+// little gain: the threads below have plenty to do.
+static constexpr int kIsolateAtWaitDepth = 16;
+
+bool DeepInWaits()
+{
+	return t_WaitDepth >= kIsolateAtWaitDepth;
 }
 
 } // namespace detail
@@ -2981,6 +2996,11 @@ static bool WaitUntil(CounterHandle h, Help help, Deadline deadline)
 
 	const int threadIndex = CurrentThreadIndex();
 	WorkerCtx* ctx = CurrentCtx(P);
+	struct Depth
+	{
+		Depth() { detail::t_WaitDepth++; }
+		~Depth() { detail::t_WaitDepth--; }
+	} depth;
 	FlushDeferredSignals(P, ctx); // this thread's own finished tasks may be what we wait for
 	MarkProfilerState(P, threadIndex, 0); // waiting
 	ThreadDebug* const debug = DebugRow(P, ctx);
@@ -4136,6 +4156,7 @@ void PipelineAdvance(PipelineRun& run, uint32_t item, size_t stage)
 void RunPipeline(const PipelineStage* stages, size_t stageCount, void* const* items, size_t itemCount)
 {
 	assert(stageCount >= 1 && itemCount >= 1);
+	const detail::IsolateWhenDeep isolate;
 	for (size_t i = 0; i < stageCount; i++)
 		assert(stages[i].opts.fn == nullptr && stages[i].opts.signals == kInvalidCounter && stages[i].opts.waitsFor == kInvalidCounter
 			&& stages[i].opts.waitsForAll.empty() && "a pipeline stage's TaskDesc gives no fn, signals or waits");

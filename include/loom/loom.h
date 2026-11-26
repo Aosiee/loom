@@ -1013,6 +1013,24 @@ template <typename T>
 namespace detail {
 	uint16_t BeginIsolation();   // returns the region the thread was in
 	void     EndIsolation(uint16_t outer);
+	// True when the calling thread is inside so many waits (each one running
+	// tasks while it waits, the next wait inside one of those) that a new
+	// fork-join should not add another level to the pile.
+	bool     DeepInWaits();
+	// loom's own fork-joins (ParallelFor and what is built on it, the sort,
+	// pipelines, graph runs) open one of these: deep in waits, the scope is
+	// an isolated region, so its wait runs only its own tasks and the pile
+	// stops growing. Without it, a ParallelFor in every chunk of another one
+	// could nest a thousand deep on one thread, a counter each.
+	struct IsolateWhenDeep
+	{
+		bool     active = DeepInWaits();
+		uint16_t outer = active ? BeginIsolation() : 0;
+		~IsolateWhenDeep() { if (active) EndIsolation(outer); }
+		IsolateWhenDeep() = default;
+		IsolateWhenDeep(const IsolateWhenDeep&) = delete;
+		IsolateWhenDeep& operator=(const IsolateWhenDeep&) = delete;
+	};
 }
 
 template <typename F> requires std::is_invocable_v<F&&>
@@ -1300,6 +1318,7 @@ void SortPieces(It first, const size_t* bounds, size_t pieces, Comp& comp, int d
 	const size_t n = bounds[pieces] - bounds[0];
 	if (n == 0)
 		return;
+	const IsolateWhenDeep isolate;
 	SortJob<Comp> job;
 	job.comp = &comp;
 	job.leaf = leaf;

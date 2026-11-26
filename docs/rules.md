@@ -83,8 +83,22 @@ A task holds its limiter's unit while it runs, so a task that waits for
 another task of the same limiter can wait forever: with every unit held,
 that other task never becomes runnable, and helping cannot run it (it waits
 in the limiter, not in a queue). Split the work into tasks that hand on
-through counters (`waitsFor`) instead of one that waits in the middle. A
-limited task may wait for anything else.
+through counters (`waitsFor`) instead of one that waits in the middle.
+
+## A helping wait must not need the task it is inside to finish first
+
+A wait that helps runs other tasks on its own stack, on top of the task
+that waits. If one of those tasks needs the waiting task to finish first,
+the thread hangs: the waiting task's limiter unit (a task of that limiter
+waits for it, and the helped task waits for that one), a lock it holds (see
+above), or a result only it will produce. Wait with `Help::BlockOnly`, or
+inside `Isolated`, where a wait helps only with its own region's tasks.
+
+loom's own fork-joins (ParallelFor, the sort, scans, pipelines, graph runs)
+isolate themselves once a thread is 16 waits deep, so nesting them in each
+other stays shallow. A hand-written fork-join that may nest inside itself
+many times over (a recursive Submit and WaitFor) should use `Isolated` for
+the same reason.
 
 ## Keep a future alive while anything reads it
 

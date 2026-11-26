@@ -2881,6 +2881,32 @@ TEST_CASE("loom: thread indices — stay small however many pools come and go")
 	CHECK(partial.Size() <= (size_t)highest + 1);
 }
 
+TEST_CASE("loom: ParallelFor inside ParallelFor — the nesting stays shallow, every body runs")
+{
+	// Each wait runs other chunks while it waits, and each of those starts
+	// another inner ParallelFor: unchecked, one thread nests a thousand deep,
+	// a counter each, and runs out of them.
+	for (size_t chunk : { size_t(1), size_t(0) })
+	{
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 7, .maxCounters = 256 });
+		std::atomic<long> inner{ 0 };
+		std::atomic<int> deepest{ 0 };
+		static thread_local int t_depth = 0;
+		loom::ParallelFor(0, 20000, chunk, [&](size_t b, size_t e) {
+			for (size_t i = b; i < e; i++)
+			{
+				const int d = ++t_depth;
+				int seen = deepest.load();
+				while (d > seen && !deepest.compare_exchange_weak(seen, d)) {}
+				loom::ParallelFor(0, 8, size_t(1), [&](size_t, size_t) { inner++; });
+				t_depth--;
+			}
+		});
+		CHECK(inner.load() == 160000);
+		CHECK(deepest.load() <= 20);
+	}
+}
+
 TEST_CASE("loom: ParallelInclusiveScan / ParallelExclusiveScan — match std, in place, reproducible")
 {
 	for (int workers : { 0, 1, -1 })

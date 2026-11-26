@@ -369,6 +369,18 @@ dedicated queue) but not as a helper for pool work, since none would be its
 own. Without workers a region does not isolate: no other thread could run
 the work it would set aside.
 
+### Bounded nesting
+
+A task run while waiting may itself wait, and run another task in that
+wait, so waits pile up on one thread's stack. For a ParallelFor inside the
+chunks of another one that pile has no natural end: each inner wait picks
+up another outer chunk, which starts another inner ParallelFor. One thread
+could reach a thousand levels, each holding a counter and a stack frame.
+Each thread counts the waits it is inside, and from 16 on, loom's own
+fork-joins (ParallelFor and what is built on it, the sort, pipelines, graph
+runs) open an isolated region: their wait runs only their own tasks, so
+the pile stops growing there. The threads further down have plenty to do.
+
 ## Parallel loops
 
 `ParallelFor` with a chunk size cuts the range into fixed chunks, one task
