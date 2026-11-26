@@ -2281,6 +2281,7 @@ namespace {
 			}
 			const size_t step = std::min(r.grain, left);
 #if defined(__cpp_exceptions)
+			bool threw = false;
 			try
 			{
 				r.fn(r.begin, r.begin + step, r.userData);
@@ -2288,6 +2289,12 @@ namespace {
 			catch (...)
 			{
 				RecordTaskException(P, r.items, std::current_exception()); // and cancels the rest
+				threw = true;
+			}
+			// Out of the handler first: the waiter may take the exception and
+			// drop it as soon as this signal lets it go.
+			if (threw)
+			{
 				Signal(r.items, (int)left);
 				return;
 			}

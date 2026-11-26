@@ -1419,9 +1419,11 @@ void SortTask(SortJob<Comp>& job, It first, It last, int depth)
 		if (!job.errorTaken.exchange(true, std::memory_order_acq_rel))
 			job.error = std::current_exception();
 		job.failed.store(true, std::memory_order_relaxed);
-		if (last - first > 0)
-			Signal(job.done, (int)(last - first)); // this piece's elements, never to be placed now
 	}
+	// Out of the handler first: the waiter may take the exception and drop
+	// it as soon as this signal lets it go.
+	if (last - first > 0)
+		Signal(job.done, (int)(last - first)); // this piece's elements, never to be placed now
 #endif
 }
 
