@@ -7,8 +7,10 @@ loom keeps three kinds of branch.
   only moves forward to a `dev` commit that CI has passed, so CI does not
   run on `main` again.
 - **`dev`** is where work gathers between releases. Every push to it runs
-  the Linux workflow: each compiler, build type and sanitizer, a minute of
-  the stress test, the no-exceptions build and the installed package.
+  the Linux workflow: GCC in Debug and Release, with the portable sleep and
+  under each sanitizer, Clang in Release, the allocation-failure sweeps, a
+  minute of the stress test, the no-exceptions build and the installed
+  package.
 - **Streams**, `stream/<name>`, are where a feature or a fix is built. Each
   one branches from `dev` and holds one piece of work. CI does not run on a
   push to a stream; to check one on GitHub before it lands, start the Linux

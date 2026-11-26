@@ -211,12 +211,14 @@ void SubmitInlineRaw(const void* data, size_t size, void (*trampoline)(void*), c
 // `destroy` ends it (freeing a heap one), after the run or the skip.
 void SubmitOwnedRaw(void* src, void (*relocate)(void* dst, void* src), void (*run)(void*), void (*destroy)(void*), const TaskDesc& opts);
 inline constexpr size_t kOwnedInlineSize = 40; // the slot's 48, less the destroy pointer
+// std::launder: the callable in a slot's storage was made there (a memcpy or
+// a placement new), and the pointer the task carries is to the storage.
 template <typename G>
-void InlineTrampoline(void* p) { (*static_cast<G*>(p))(); }
+void InlineTrampoline(void* p) { (*std::launder(static_cast<G*>(p)))(); }
 template <typename G>
 void OwnedRelocate(void* dst, void* src) noexcept { ::new (dst) G(std::move(*static_cast<G*>(src))); }
 template <typename G>
-void OwnedDestroyInPlace(void* p) noexcept { static_cast<G*>(p)->~G(); }
+void OwnedDestroyInPlace(void* p) noexcept { std::launder(static_cast<G*>(p))->~G(); }
 template <typename G>
 void OwnedDestroyHeap(void* p) noexcept { delete static_cast<G*>(p); }
 } // namespace detail
@@ -444,17 +446,11 @@ namespace detail {
 		std::atomic<void*> mover{ nullptr };
 		void (*destroy)(FutureStateBase*) noexcept = nullptr;
 		bool             broken = false; // completed without a value (also `error`, with exceptions)
-#if defined(__cpp_exceptions)
+		// There in every build, so the layout does not depend on whether
+		// exceptions are on: a program may mix code built either way, and a
+		// future made in one part is read in another. Set only with them.
 		std::exception_ptr error;
-#endif
-		bool Failed() const
-		{
-#if defined(__cpp_exceptions)
-			return broken || error != nullptr;
-#else
-			return broken;
-#endif
-		}
+		bool Failed() const { return broken || error != nullptr; }
 	};
 	// Creates the state's counter (count 1: its value).
 	void CreateFutureCounter(FutureStateBase* state);
@@ -477,9 +473,7 @@ namespace detail {
 	inline void CopyFailure(FutureStateBase& to, const FutureStateBase& from)
 	{
 		to.broken = from.broken;
-#if defined(__cpp_exceptions)
 		to.error = from.error;
-#endif
 	}
 
 	struct NoValue {};
@@ -611,7 +605,7 @@ public:
 		if (m_State->error)
 			std::rethrow_exception(m_State->error);
 #else
-		if (m_State->broken)
+		if (m_State->Failed())
 			std::terminate();
 #endif
 		if constexpr (!std::is_void_v<T>)
@@ -868,7 +862,7 @@ namespace detail {
 		if (state.error)
 			std::rethrow_exception(state.error);
 #else
-		if (state.broken)
+		if (state.Failed())
 			std::terminate();
 #endif
 	}
@@ -1338,10 +1332,9 @@ struct SortJob
 	CounterHandle     done = kInvalidCounter; // elements not yet in their final place
 	size_t            leaf = 0;
 	std::atomic<bool> failed{ false };
-#if defined(__cpp_exceptions)
+	// In every build, for the same layout either way (see FutureStateBase).
 	std::atomic<bool>  errorTaken{ false }; // the first failing piece stores `error`
 	std::exception_ptr error;               // read once `done` is zero
-#endif
 };
 
 template <typename It, typename Comp>

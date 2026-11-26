@@ -10,5 +10,10 @@ race:g_strsplit
 race:g_dbus
 race:fc_
 race:Fc
-race:malloc
-race:free
+# An exception_ptr's count lives in libstdc++, which is not instrumented, so
+# TSAN does not see that the last release, and the exception's destructor and
+# free that follow it, come after the other holders' reads of the exception.
+race:std::__exception_ptr::exception_ptr::_M_release
+race:__cxa_free_exception
+race:std::runtime_error::~runtime_error
+race:std::logic_error::~logic_error

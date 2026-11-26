@@ -237,6 +237,15 @@ the first two:
   rules;
 - or compiling `src/loom.cpp` with `include/` on the include path.
 
+loom builds as a static library only (`BUILD_SHARED_LIBS` does not change
+that). To link it into a shared library of your own, build it with
+`-DCMAKE_POSITION_INDEPENDENT_CODE=ON`; give each program one copy of
+loom. The library and the code that calls it may be built with or without
+exceptions in any mix, but a library built without them cannot carry a
+task's exception to `WaitFor`: the program ends where the task threw. Code
+built with `-D_GLIBCXX_DEBUG` changes the layout of the standard containers
+in loom's introspection types, so it needs a library built the same way.
+
 `LOOM_VERSION` (from `loom/loom_version.h`, which `loom/loom.h` includes)
 lets code build against more than one release:
 `#if LOOM_VERSION >= LOOM_MAKE_VERSION(0, 20, 0)`.
@@ -249,9 +258,9 @@ the no-exceptions embedding and the installed package. Each build lives in
 its own `build-hamr-<name>` directory, and the report times every test
 case. `hamr list` shows each step's budget and recent times.
 
-Linux is supported, and every push to `dev` is built and tested there with
-GCC and Clang, in Debug and Release and under each sanitizer (the Linux
-badge above). A release on `main` is a commit that passed there first. Windows and macOS are not supported yet: the thread naming, the OS
+Linux is supported, and every push to `dev` is built and tested there (the
+Linux badge above): GCC in Debug and Release, with the portable sleep and
+under each sanitizer, and Clang in Release. A release on `main` is a commit that passed there first. Windows and macOS are not supported yet: the thread naming, the OS
 thread id and the stack walk used by parking are Linux and POSIX calls
 today.
 

@@ -3937,8 +3937,10 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	// this counter returns, the task no longer counts as live.
 	AddFinished(P, ctx);
 	ReleaseSlot(P, slot, ctx);
-	if (dedicated)
-		CurrentDedicated()->addressed.fetch_sub(1, std::memory_order_release);
+	// A Dedicated task runs only on its own thread, so there is one; the
+	// check also keeps GCC's LTO from warning about a null it cannot rule out.
+	if (DedicatedState* d = dedicated ? CurrentDedicated() : nullptr)
+		d->addressed.fetch_sub(1, std::memory_order_release);
 	if (signals == kInvalidCounter)
 		return;
 	if (!ctx)
