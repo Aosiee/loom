@@ -51,6 +51,25 @@ and a Submit or a wait from one ends the program. A Shutdown on another
 thread needs the main thread to do nothing but pump from then on (see
 `Pool::Shutdown`).
 
+## Out of memory
+
+What loom allocates for your own objects (a callable too big for a task
+slot, a future's state, a coroutine frame, a graph's nodes, a sort's
+buffer, a PerThread value) throws `std::bad_alloc` from the call that asked
+for it, before anything is queued: nothing of the call is left behind. What
+it allocates for its own bookkeeping once it has started on something (a
+queue growing, a counter's or a limiter's waiting list, a wait registering
+itself, a thread starting) cannot be undone halfway without losing tasks or
+wake-ups, so running out there ends the program, with a message that says
+where. `tests/faults.cpp` fails each allocation of loom's calls in turn and
+checks one or the other happens.
+
+## Hooks must not throw
+
+Profiler hooks, `PoolConfig::onThreadStart` and park participants' `wake`
+run inside loom's own work, where nothing can take an exception: one that
+throws ends the program, saying which hook it was.
+
 ## An exception needs a counter to go to
 
 A task's exception is kept on the counter it signals and rethrown by

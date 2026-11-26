@@ -15,6 +15,7 @@
 #include <exception>
 #include <map>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
@@ -71,6 +72,29 @@ static inline void CpuRelax()
 	std::fflush(stderr);
 	std::abort();
 }
+
+// Allocation failure where loom cannot back out: in the middle of making a
+// task runnable, releasing a counter's waiting tasks, or registering a wait
+// or a thread. Half done there would lose tasks or wake-ups, or leave a
+// task live that never runs, so it ends the program instead. (What loom
+// allocates for the caller's own objects, before it commits to anything,
+// throws std::bad_alloc as usual.)
+#if defined(__cpp_exceptions)
+#define LOOM_OR_FATAL(what, ...) \
+	do { try { __VA_ARGS__; } catch (const std::bad_alloc&) { Fatal("out of memory " what); } } while (0)
+#else
+#define LOOM_OR_FATAL(what, ...) do { __VA_ARGS__; } while (0)
+#endif
+
+// A hook of the caller's (a profiler hook, onThreadStart, a park wake) runs
+// in the middle of loom's own work, where nothing can take an exception: one
+// that throws ends the program, saying which hook it was.
+#if defined(__cpp_exceptions)
+#define LOOM_HOOK(what, ...) \
+	do { try { __VA_ARGS__; } catch (...) { Fatal(what " threw (hooks must not throw)"); } } while (0)
+#else
+#define LOOM_HOOK(what, ...) do { __VA_ARGS__; } while (0)
+#endif
 
 // ---- Task slots ---------------------------------------------------------------
 // One cache line pair per slot: adjacent slots are run by different threads.
@@ -277,7 +301,10 @@ public:
 		if (b - m_CachedTop >= a->capacity)
 		{
 			const int64_t t = m_CachedTop;
-			auto bigger = std::make_unique<Buffer>(a->capacity * 2);
+			std::unique_ptr<Buffer> bigger;
+			LOOM_OR_FATAL("growing a work deque",
+				bigger = std::make_unique<Buffer>(a->capacity * 2);
+				m_Buffers.reserve(m_Buffers.size() + 1));
 			for (int64_t i = t; i < b; i++)
 				bigger->Put(i, a->Get(i));
 			a = bigger.get();
@@ -823,7 +850,7 @@ static int64_t LiveTasksIn(PoolState& P)
 static void MarkProfilerState(PoolState& P, int threadIndex, uint8_t state)
 {
 	if (ProfilerStateFn fn = P.profilerStateHook.load(std::memory_order_acquire))
-		fn(threadIndex, state);
+		LOOM_HOOK("the profiler state hook", fn(threadIndex, state));
 }
 
 // The waits on this thread that are running a task while they wait: a wait
@@ -914,9 +941,9 @@ static bool AcquireUnit(LimiterState& l, uint32_t slot, Priority priority)
 		return true;
 	}
 	if (priority == Priority::High)
-		l.waiting.push_front(slot);
+		LOOM_OR_FATAL("queueing a task on its limiter", l.waiting.push_front(slot));
 	else
-		l.waiting.push_back(slot);
+		LOOM_OR_FATAL("queueing a task on its limiter", l.waiting.push_back(slot));
 	return false;
 }
 
@@ -1000,7 +1027,7 @@ static uint32_t TakeUnitIndex(LimiterState& l)
 			l.nextUnit = index + 1;
 	}
 	if (index >= l.unitInUse.size())
-		l.unitInUse.resize((size_t)index + 1, 0);
+		LOOM_OR_FATAL("growing a limiter's unit table", l.unitInUse.resize((size_t)index + 1, 0));
 	l.unitInUse[index] = 1;
 	return index;
 }
@@ -1010,7 +1037,7 @@ static void ReturnUnitIndex(LimiterState& l, uint32_t index)
 	std::lock_guard<std::mutex> lock(l.mutex);
 	l.unitInUse[index] = 0;
 	if (index < l.limit.load(std::memory_order_relaxed))
-		l.freeUnits.push_back(index);
+		LOOM_OR_FATAL("giving a limiter's unit back", l.freeUnits.push_back(index));
 }
 
 // ---- Forward decls --------------------------------------------------------------
@@ -1172,7 +1199,9 @@ static uint32_t PopBatchOrGrow(PoolState& P)
 		std::lock_guard<std::mutex> lock(P.growMutex);
 		if ((uint32_t)P.freeHead.load(std::memory_order_acquire) == kNoSlot)
 		{
-			AddSlotChunkLocked(P);
+			// A fork-join has queued tasks before this one: a throw here
+			// would unwind it under them.
+			LOOM_OR_FATAL("growing the task slots", AddSlotChunkLocked(P));
 			std::fprintf(stderr, "loom: task pool grown to %u slots\n", P.slotCapacity.load(std::memory_order_relaxed));
 		}
 	}
@@ -1599,7 +1628,12 @@ int CurrentThreadIndex()
 			indices.free.pop_back();
 		}
 		else
+		{
+			// Room for it to come back: the exit that returns it, in a key
+			// destructor, has no way to report a failure.
+			LOOM_OR_FATAL("taking a thread index", indices.free.reserve((size_t)indices.next + 1));
 			index = indices.next++;
+		}
 	}
 	t_ThreadIndex = index;
 	pthread_setspecific(ThreadIndexKey(), reinterpret_cast<void*>((intptr_t)index + 1));
@@ -1812,7 +1846,7 @@ static uint32_t StealOnce(PoolState& P, WorkerCtx* self)
 static void RegisterIdle(PoolState& P, Waiter& w)
 {
 	std::lock_guard<std::mutex> lock(P.idleMutex);
-	P.idle.push_back(&w);
+	LOOM_OR_FATAL("registering a sleeping thread", P.idle.push_back(&w));
 	P.numIdle.fetch_add(1, std::memory_order_seq_cst);
 }
 
@@ -1909,7 +1943,7 @@ static void PushPool(PoolState& P, uint32_t entry, WorkerCtx* ctx)
 		return;
 	}
 	std::lock_guard<std::mutex> lock(P.injectMutex);
-	P.injectQueue[(int)priority].push_back(entry);
+	LOOM_OR_FATAL("queueing a task", P.injectQueue[(int)priority].push_back(entry));
 	P.injectSize.fetch_add(1, std::memory_order_seq_cst);
 	if (region != 0)
 	{
@@ -1940,9 +1974,9 @@ static bool EnqueueSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	{
 		std::lock_guard<std::mutex> lock(P.mainMutex);
 		if (t.priority == Priority::High)
-			P.mainQueue.push_front(slot);
+			LOOM_OR_FATAL("queueing a main-thread task", P.mainQueue.push_front(slot));
 		else
-			P.mainQueue.push_back(slot);
+			LOOM_OR_FATAL("queueing a main-thread task", P.mainQueue.push_back(slot));
 		// A wait isolated to a region wakes only for that region's work: any
 		// other entry is not its to run.
 		if (P.mainWaiter && (P.mainWaiterRegion == 0 || P.mainWaiterRegion == t.isolation))
@@ -1964,9 +1998,9 @@ static bool EnqueueSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 			Fatal("a dedicated thread was unregistered with a task still to run on it");
 		std::lock_guard<std::mutex> lock(d->mutex);
 		if (t.priority == Priority::High)
-			d->queue.push_front(slot);
+			LOOM_OR_FATAL("queueing a dedicated thread's task", d->queue.push_front(slot));
 		else
-			d->queue.push_back(slot);
+			LOOM_OR_FATAL("queueing a dedicated thread's task", d->queue.push_back(slot));
 		if (d->waiter && (d->waiterRegion == 0 || d->waiterRegion == t.isolation))
 		{
 			Wake(*d->waiter, kWokeRecheck);
@@ -2025,7 +2059,7 @@ static bool DispatchSlot(PoolState& P, uint32_t slot, const TaskDesc& desc, Work
 		if (c->count.load(std::memory_order_acquire) != 0)
 		{
 			deps.fetch_add(1, std::memory_order_relaxed);
-			c->pending.push_back(slot);
+			LOOM_OR_FATAL("queueing a task on its counter", c->pending.push_back(slot));
 		}
 	};
 	waitOn(desc.waitsFor);
@@ -2280,6 +2314,9 @@ static void ParallelForAuto(PoolState& P, size_t begin, size_t end, ParallelForF
 	// piece per index.
 	const size_t grain = std::max<size_t>(1, n / (threads * 64));
 	const size_t pieces = std::min(threads, (n - 1) / grain + 1);
+	// Allocated before the counter: a throw here leaves nothing behind.
+	std::vector<AutoRange> roots(pieces);
+	std::vector<TaskDesc> descs(pieces);
 	const CounterHandle items = CreateCounter((int)n);
 	struct DestroyOnExit
 	{
@@ -2287,8 +2324,6 @@ static void ParallelForAuto(PoolState& P, size_t begin, size_t end, ParallelForF
 		~DestroyOnExit() { DestroyCounter(h); }
 	} destroy{ items };
 
-	std::vector<AutoRange> roots(pieces);
-	std::vector<TaskDesc> descs(pieces);
 	size_t cursor = begin;
 	for (size_t i = 0; i < pieces; i++)
 	{
@@ -2752,7 +2787,19 @@ void Run(TaskGraph& graph, Help help)
 		CounterHandle h;
 		~DestroyOnExit() { DestroyCounter(h); }
 	} destroy{ done };
+#if defined(__cpp_exceptions)
+	try
+	{
+		Submit(graph, done); // compiles it first, which may throw: nothing is queued then
+	}
+	catch (...)
+	{
+		Signal(done);
+		throw;
+	}
+#else
 	Submit(graph, done);
+#endif
 	WaitFor(done, help);
 }
 
@@ -3024,7 +3071,7 @@ void ReleaseFuture(FutureStateBase* state) noexcept
 	static thread_local std::vector<FutureStateBase*> t_ToDestroy;
 	if (t_Destroying)
 	{
-		t_ToDestroy.push_back(state);
+		LOOM_OR_FATAL("deferring a future's destruction", t_ToDestroy.push_back(state));
 		return;
 	}
 	t_Destroying = true;
@@ -3355,7 +3402,7 @@ static bool SleepOnCounter(PoolState& P, CounterState& c, CounterHandle h, bool 
 		if (c.count.load(std::memory_order_acquire) == 0 || !StillCounter(c, h))
 			return false;
 		w.threadIndex = CurrentThreadIndex();
-		c.waiters.push_back(&w);
+		LOOM_OR_FATAL("registering a wait", c.waiters.push_back(&w));
 	}
 
 	// Register everywhere that could make this thread useful, re-checking each
@@ -3404,7 +3451,7 @@ static bool SleepOnCounter(PoolState& P, CounterState& c, CounterHandle h, bool 
 			ready = true;
 		else
 		{
-			P.isolatedSleepers.emplace_back(&w, region);
+			LOOM_OR_FATAL("registering a wait", P.isolatedSleepers.emplace_back(&w, region));
 			inIsolated = true;
 		}
 	}
@@ -3819,7 +3866,9 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	// returns the handle the end mark pairs with.
 	const int threadIndex = CurrentThreadIndex();
 	const ProfilerZoneFn zoneHook = ZoneHook(P);
-	const uint64_t zone = zoneHook ? zoneHook(threadIndex, nameId, profilerTag, "Task", true, 0) : 0;
+	uint64_t zone = 0;
+	if (zoneHook)
+		LOOM_HOOK("the profiler zone hook", zone = zoneHook(threadIndex, nameId, profilerTag, "Task", true, 0));
 	// A task of a cancelled counter is skipped, though it still signals it.
 	const CounterState* counter = signals != kInvalidCounter ? ResolveCounter(P, signals) : nullptr;
 	const bool cancelled = counter && counter->cancelled.load(std::memory_order_acquire);
@@ -3870,7 +3919,7 @@ static void RunSlot(PoolState& P, uint32_t slot, WorkerCtx* ctx)
 	if (destroy)
 		destroy(userData);
 	if (zoneHook)
-		zoneHook(threadIndex, nameId, profilerTag, "Task", false, zone);
+		LOOM_HOOK("the profiler zone hook", zoneHook(threadIndex, nameId, profilerTag, "Task", false, zone));
 	LOOM_TEST_POINT(kTestPointTaskReturned);
 	// The unit goes back (or on to the next waiting task) before the signal:
 	// once a WaitFor on the task's counter returns, it holds none.
@@ -4013,7 +4062,7 @@ static uint32_t Search(PoolState& P, WorkerCtx& ctx)
 static void WorkerLoop(PoolState& P, WorkerCtx& ctx)
 {
 	if (P.onThreadStart)
-		P.onThreadStart();
+		LOOM_HOOK("PoolConfig::onThreadStart", P.onThreadStart());
 	t_WorkerPool = &P;
 	t_WorkerCtx = &ctx;
 	const int index = CurrentThreadIndex(); // reserve this worker's index
@@ -4116,12 +4165,14 @@ static PaddedStats* RegisterThreadStats(PoolState& P, int index, const char* nam
 			t->s.name = t->name.c_str();
 			return t.get();
 		}
-	auto stats = std::make_unique<PaddedStats>();
-	stats->s.index = index;
-	stats->name = name ? name : "";
-	stats->s.name = stats->name.c_str();
-	PaddedStats* raw = stats.get();
-	P.threadStats.push_back(std::move(stats));
+	PaddedStats* raw = nullptr;
+	LOOM_OR_FATAL("starting a pool thread",
+		auto stats = std::make_unique<PaddedStats>();
+		stats->s.index = index;
+		stats->name = name ? name : "";
+		stats->s.name = stats->name.c_str();
+		raw = stats.get();
+		P.threadStats.push_back(std::move(stats)));
 	return raw;
 }
 
@@ -4186,7 +4237,7 @@ PoolSnapshot SnapshotPool()
 static void DedicatedLoop(PoolState& P, DedicatedState& d)
 {
 	if (P.onThreadStart)
-		P.onThreadStart();
+		LOOM_HOOK("PoolConfig::onThreadStart", P.onThreadStart());
 	t_CurrentDedicated = &d;
 	const int index = CurrentThreadIndex(); // reserve this thread's index
 	d.threadIndex.store(index, std::memory_order_relaxed);
@@ -4426,16 +4477,17 @@ static void ParkHere(PoolState& P, int index, const char* name, ParkSelf who)
 {
 	ParkedThread self;
 	self.index = index;
-	self.name = name ? name : "";
 	self.osThreadId = CurrentOsThreadId();
-	CaptureReturnAddresses(self.returnAddresses);
+	LOOM_OR_FATAL("parking a thread",
+		self.name = name ? name : "";
+		CaptureReturnAddresses(self.returnAddresses));
 	std::unique_lock<std::mutex> lock(P.parkMutex);
 	if (!P.parkRequested.load())
 		return; // released before this thread arrived
 	if (who.stop && who.stop->load(std::memory_order_acquire))
 		return; // stopping: it will not be back to be released
 	const uint64_t round = P.parkReleases;
-	P.parked.push_back(std::move(self));
+	LOOM_OR_FATAL("parking a thread", P.parked.push_back(std::move(self)));
 	if (who.parkedRound)
 		*who.parkedRound = round;
 	else
@@ -4477,16 +4529,16 @@ bool ParkAll(uint32_t timeoutMs)
 		assert(!P.parkRequested.load() && "ParkAll while a park is in effect");
 		if (P.parkRequested.load())
 			return false;
+		participants = P.participants; // first: if the copy throws, nothing is requested
 		P.parked.clear();
 		P.parkedOthers = 0;
 		P.parkRequested = true;
 		round = P.parkReleases;
-		participants = P.participants;
 		P.parkWakesInFlight++;
 		P.parkWaker = std::this_thread::get_id();
 	}
 	for (auto& p : participants)
-		p.wake(p.user);
+		LOOM_HOOK("a park participant's wake", p.wake(p.user));
 	{
 		std::lock_guard<std::mutex> lock(P.parkMutex);
 		P.parkWakesInFlight--;
@@ -4841,16 +4893,19 @@ void RunPipeline(const PipelineStage* stages, size_t stageCount, void* const* it
 // Meant for a pool that may be stuck, so it never waits long for a lock: a
 // thread stuck while holding one must not take the dump down with it.
 
-static bool LockBriefly(std::mutex& m)
+// Owns the lock when it got it. A lock that goes with its scope: the dump
+// allocates as it goes, and a throw must not leave a lock of the pool held.
+static std::unique_lock<std::mutex> LockBriefly(std::mutex& m)
 {
 	const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
 	do
 	{
-		if (m.try_lock())
-			return true;
+		std::unique_lock<std::mutex> lock(m, std::try_to_lock);
+		if (lock.owns_lock())
+			return lock;
 		std::this_thread::yield();
 	} while (std::chrono::steady_clock::now() < until);
-	return false;
+	return {};
 }
 
 static constexpr size_t kDebugListMax = 64;
@@ -4908,7 +4963,7 @@ DebugState CaptureDebugState()
 	mainThread.isMain = true;
 	ReadThreadDebug(P, P.mainDebug, now, mainThread);
 	s.threads.push_back(std::move(mainThread));
-	if (LockBriefly(P.statsMutex))
+	if (std::unique_lock<std::mutex> statsLock = LockBriefly(P.statsMutex); statsLock.owns_lock())
 	{
 		for (auto& row : P.threadStats)
 		{
@@ -4918,30 +4973,34 @@ DebugState CaptureDebugState()
 			ReadThreadDebug(P, row->debug, now, t);
 			s.threads.push_back(std::move(t));
 		}
-		P.statsMutex.unlock();
 	}
 	else
 		s.busy = true;
-	if (LockBriefly(P.dedicatedMutex))
+	if (std::unique_lock<std::mutex> registryLock = LockBriefly(P.dedicatedMutex); registryLock.owns_lock())
 	{
 		for (auto& d : P.dedicated)
 		{
-			if (!LockBriefly(d->mutex))
-				continue;
-			const int depth = (int)d->queue.size();
-			d->mutex.unlock();
+			int depth = 0;
+			{
+				std::unique_lock<std::mutex> queueLock = LockBriefly(d->mutex);
+				if (!queueLock.owns_lock())
+				{
+					s.busy = true; // its queue depth is unknown
+					continue;
+				}
+				depth = (int)d->queue.size();
+			}
 			const int index = d->threadIndex.load(std::memory_order_relaxed);
 			for (DebugThread& t : s.threads)
 				if (!t.isMain && t.index == index)
 					t.queueDepth = depth;
 		}
-		P.dedicatedMutex.unlock();
 	}
 	else
 		s.busy = true;
 
 	// Counters, under the table lock so none is created or destroyed midway.
-	if (LockBriefly(P.counterMutex))
+	if (std::unique_lock<std::mutex> countersLock = LockBriefly(P.counterMutex); countersLock.owns_lock())
 	{
 		for (uint32_t i = 0; i < P.counterCount; i++)
 		{
@@ -4954,25 +5013,23 @@ DebugState CaptureDebugState()
 			dc.count = v > 1 ? v - 1 : v;
 			dc.cancelled = c.cancelled.load(std::memory_order_relaxed);
 			dc.failed = c.failed.load(std::memory_order_relaxed);
-			if (LockBriefly(c.mutex))
+			if (std::unique_lock<std::mutex> counterLock = LockBriefly(c.mutex); counterLock.owns_lock())
 			{
 				dc.waitingTotal = (int)c.pending.size();
 				for (size_t k = 0; k < c.pending.size() && k < kDebugListMax; k++)
 					dc.waiting.push_back(DebugTaskOf(P, c.pending[k]));
 				for (const Waiter* w : c.waiters)
 					dc.sleepers.push_back(w->threadIndex);
-				c.mutex.unlock();
 			}
 			else
 				dc.busy = true;
 			s.counters.push_back(std::move(dc));
 		}
-		P.counterMutex.unlock();
 	}
 	else
 		s.busy = true;
 
-	if (LockBriefly(P.limiterMutex))
+	if (std::unique_lock<std::mutex> limitersLock = LockBriefly(P.limiterMutex); limitersLock.owns_lock())
 	{
 		for (uint32_t i = 0; i < P.limiterCount; i++)
 		{
@@ -4983,18 +5040,16 @@ DebugState CaptureDebugState()
 			dl.handle = PackLimiter(i, l.generation.load(std::memory_order_relaxed));
 			dl.limit = l.limit.load(std::memory_order_relaxed);
 			dl.held = UnitsHeld(l);
-			if (LockBriefly(l.mutex))
+			if (std::unique_lock<std::mutex> limiterLock = LockBriefly(l.mutex); limiterLock.owns_lock())
 			{
 				dl.waitingTotal = (int)l.waiting.size();
 				for (size_t k = 0; k < l.waiting.size() && k < kDebugListMax; k++)
 					dl.waiting.push_back(DebugTaskOf(P, l.waiting[k]));
-				l.mutex.unlock();
 			}
 			else
 				dl.busy = true;
 			s.limiters.push_back(std::move(dl));
 		}
-		P.limiterMutex.unlock();
 	}
 	else
 		s.busy = true;
@@ -5003,10 +5058,9 @@ DebugState CaptureDebugState()
 	s.queueDepth = PoolQueueDepth(P);
 	s.highQueueDepth = P.queuedHigh.load(std::memory_order_relaxed);
 	s.lowQueueDepth = P.queuedLow.load(std::memory_order_relaxed);
-	if (LockBriefly(P.mainMutex))
+	if (std::unique_lock<std::mutex> mainLock = LockBriefly(P.mainMutex); mainLock.owns_lock())
 	{
 		s.mainQueueDepth = (int)P.mainQueue.size();
-		P.mainMutex.unlock();
 	}
 	else
 		s.busy = true;

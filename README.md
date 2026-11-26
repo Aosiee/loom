@@ -217,6 +217,7 @@ globals lists those two.
 ```sh
 cmake -S . -B build && cmake --build build
 ./build/loom_tests                 # the suite (doctest, vendored)
+./build/loom_faults                # every allocation of loom's calls failed in turn
 ./build/loom_stress --seconds 60   # random mixes of every feature on random pools
 ./build/loom_bench [tasks] [runs]  # per-task cost and contention by worker count
 ```

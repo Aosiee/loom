@@ -11,7 +11,8 @@
 // The hooks belong to the active pool: install them after the pool is
 // created; they go away with it. Installing a non-null hook with no active
 // pool asserts. They are atomic because the owner may unhook while the
-// workers are still running.
+// workers are still running. A hook must not throw: it runs in the middle of
+// loom's own work, so one that does ends the program, saying which.
 
 #include <cstdint>
 

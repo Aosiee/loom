@@ -48,6 +48,7 @@ jobs:
       - name: Suite
         run: |
           timeout 20m build/loom_tests
+          timeout 10m build/loom_faults
           timeout 5m build/loom_stress --seconds 30 --quiet
 
       - name: Notes from the tag

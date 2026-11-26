@@ -5435,6 +5435,28 @@ TEST_CASE("loom: PoolConfig — the default worker count follows the CPUs this p
 	}, 5000));
 }
 
+// ---- Hooks that throw ---------------------------------------------------------------------
+
+TEST_CASE("loom: hooks — a profiler zone hook or a park wake that throws ends the program, saying which")
+{
+	REQUIRE(!loom::HasActivePool());
+	std::string zoneErr, wakeErr;
+	CHECK(EndsInAbort([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+		loom::SetProfilerZoneHook([](int, uint32_t, uint8_t, const char*, bool, uint64_t) -> uint64_t { throw std::runtime_error("zone"); });
+		loom::ScopedCounter done(1);
+		loom::Submit([] {}, { .signals = done });
+		loom::WaitFor(done);
+	}, zoneErr));
+	CHECK(zoneErr.find("the profiler zone hook threw") != std::string::npos);
+	CHECK(EndsInAbort([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+		loom::RegisterParkParticipant([](void*) { throw std::runtime_error("wake"); }, nullptr);
+		(void)loom::ParkAll(100);
+	}, wakeErr));
+	CHECK(wakeErr.find("a park participant's wake threw") != std::string::npos);
+}
+
 } // namespace
 
 }} // namespace loom::tests

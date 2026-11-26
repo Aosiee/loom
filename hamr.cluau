@@ -70,6 +70,17 @@ for (_, c in configs) {
 		paths = kPaths,
 		findings = hamr.findings.junit(junit),
 	})
+	suite:step(`faults:{c.name}`, {
+		tier = c.tier,
+		needs = { `build:{c.name}` },
+		doc = "Every allocation of loom's calls failed in turn (tests/faults.cpp).",
+		run = { `{dir}/loom_faults` },
+		env = env,
+		resources = { cpu = 4, tags = { c.name } },
+		timeout = 900,
+		budget = if (c.sanitizer != nil) 120 else 20,
+		paths = kPaths,
+	})
 	suite:step(`stress:{c.name}`, {
 		tier = c.tier,
 		needs = { `build:{c.name}` },

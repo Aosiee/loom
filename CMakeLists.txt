@@ -72,6 +72,17 @@ if(LOOM_BUILD_TESTS)
     target_link_libraries(loom_tests PRIVATE loom_test_hooks)
     add_test(NAME loom_tests COMMAND loom_tests)
 
+    # Allocation failure at every point of loom's calls: its own executable,
+    # since it replaces the global operator new. Clang's static thread
+    # sanitizer runtime defines operator new itself, so not there.
+    if(NOT (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND LOOM_SANITIZE STREQUAL "thread"))
+        add_executable(loom_faults tests/faults.cpp)
+        target_include_directories(loom_faults PRIVATE tests/third_party)
+        target_link_libraries(loom_faults PRIVATE loom)
+        add_test(NAME loom_faults COMMAND loom_faults)
+        set_tests_properties(loom_faults PROPERTIES ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp")
+    endif()
+
     add_executable(loom_stress tests/stress.cpp)
     target_link_libraries(loom_stress PRIVATE loom)
     add_test(NAME loom_stress COMMAND loom_stress --seconds 10 --quiet)

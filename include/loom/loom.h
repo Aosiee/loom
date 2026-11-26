@@ -131,7 +131,8 @@ struct PoolConfig
 	uint32_t maxCounters = 2048;
 	uint32_t maxLimiters = 64;
 	// Runs first on every worker and dedicated thread (the engine's crash
-	// handler gives each its alternate signal stack here). Optional.
+	// handler gives each its alternate signal stack here). Optional. Must
+	// not throw: if it does, the program ends, saying so.
 	void (*onThreadStart)() = nullptr;
 	// Shutdown first drains: it runs every task (helping on the calling
 	// thread) until none is live, however long they take. When for this long
@@ -1419,12 +1420,28 @@ void SortPieces(It first, const size_t* bounds, size_t pieces, Comp& comp, int d
 	job.leaf = leaf;
 	ScopedCounter done((int)n);
 	job.done = done.Get();
-	for (size_t k = 0; k < pieces; k++)
+	size_t k = 0;
+#if defined(__cpp_exceptions)
+	try
+#endif
 	{
-		const It b = first + (std::ptrdiff_t)bounds[k], e = first + (std::ptrdiff_t)bounds[k + 1];
-		if (e - b > 0)
-			Submit([&job, b, e, depth] { SortTask(job, b, e, depth); });
+		for (; k < pieces; k++)
+		{
+			const It b = first + (std::ptrdiff_t)bounds[k], e = first + (std::ptrdiff_t)bounds[k + 1];
+			if (e - b > 0)
+				Submit([&job, b, e, depth] { SortTask(job, b, e, depth); }); // may allocate (a large iterator)
+		}
 	}
+#if defined(__cpp_exceptions)
+	catch (...)
+	{
+		// The pieces already queued run on `job`: count the rest out and
+		// let those finish before it goes.
+		Signal(done, (int)(bounds[pieces] - bounds[k]));
+		WaitFor(done, Help::BlockOnly);
+		throw;
+	}
+#endif
 	WaitFor(done);
 #if defined(__cpp_exceptions)
 	if (job.error)
@@ -1503,14 +1520,29 @@ void SampleSort(It first, size_t n, Comp& comp, int depth, size_t leaf)
 		for (size_t i = b; i < e; i++)
 			::new (static_cast<void*>(buf + place[ids[i]]++)) T(std::move(first[i]));
 	});
+	// Every element back in the range and the buffer's destroyed, whatever
+	// happened before: so it allocates nothing (a ParallelFor would), and
+	// cannot fail before it has moved them all.
 	auto moveBack = [&] {
-		ParallelFor(0, n, chunkSize, [&](size_t b, size_t e) {
-			for (size_t i = b; i < e; i++)
-			{
-				first[i] = std::move(buf[i]);
-				buf[i].~T();
-			}
-		});
+		struct Back
+		{
+			It first;
+			T* buf;
+			size_t n, chunk;
+		} back{ first, buf, n, chunkSize };
+		const IsolateWhenDeep isolate;
+		const size_t pieces = (n - 1) / chunkSize + 1;
+		ScopedCounter moved((int)pieces);
+		for (size_t c = 0; c < pieces; c++)
+			Submit([&back, c] {
+				const size_t end = std::min(back.n, (c + 1) * back.chunk);
+				for (size_t i = c * back.chunk; i < end; i++)
+				{
+					back.first[(std::ptrdiff_t)i] = std::move(back.buf[i]);
+					back.buf[i].~T();
+				}
+			}, TaskDesc{ .signals = moved.Get() });
+		WaitFor(moved);
 	};
 #if defined(__cpp_exceptions)
 	try
@@ -2079,6 +2111,7 @@ void UnparkAll();
 // where it calls ParkPoint. Only participants call ParkPoint: their
 // check-ins are counted, not told apart. Unregistering a participant waits
 // for a `wake` call in flight, so `user` may be freed once it returns.
+// `wake` must not throw: if it does, the program ends, saying so.
 // No-ops with no active pool.
 using ParkWakeFn = void (*)(void* user);
 int  RegisterParkParticipant(ParkWakeFn wake, void* user);
