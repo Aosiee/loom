@@ -1113,16 +1113,23 @@ namespace detail {
 	void     EndIsolation(uint16_t outer);
 	// True when the calling thread is inside so many waits (each one running
 	// tasks while it waits, the next wait inside one of those) that a new
-	// fork-join should not add another level to the pile.
+	// fork-join should not add another level to the pile (16 waits). Without
+	// a bound, a ParallelFor in every chunk of another one could nest a
+	// thousand deep on one thread, a counter each. Deep in waits, ParallelFor
+	// (and what is built on it) and the sort run on the calling thread
+	// instead, with no wait of their own (the sort splits its pieces there as
+	// it would into tasks, so its result is the same).
 	bool     DeepInWaits();
-	// loom's own fork-joins (ParallelFor and what is built on it, the sort,
-	// pipelines, graph runs) open one of these: deep in waits, the scope is
-	// an isolated region, so its wait runs only its own tasks and the pile
-	// stops growing. Without it, a ParallelFor in every chunk of another one
-	// could nest a thousand deep on one thread, a counter each.
+	// Pipelines and graph runs cannot run on the calling thread (their steps
+	// may be pinned to other threads). Far deeper still (64 waits), they open
+	// an isolated region, so their wait runs only their own tasks and the
+	// pile stops, unless the thread is in a region already (whose waits are
+	// bounded the same way). Not sooner: an isolated wait helps nobody else,
+	// and work elsewhere (a BlockOnly waiter's, say) may need it to.
+	bool     IsolateNow();
 	struct IsolateWhenDeep
 	{
-		bool     active = DeepInWaits();
+		bool     active = IsolateNow();
 		uint16_t outer = active ? BeginIsolation() : 0;
 		~IsolateWhenDeep() { if (active) EndIsolation(outer); }
 		IsolateWhenDeep() = default;
@@ -1342,6 +1349,7 @@ struct SortJob
 	CounterHandle     done = kInvalidCounter; // elements not yet in their final place
 	size_t            leaf = 0;
 	std::atomic<bool> failed{ false };
+	bool              inlined = false; // deep in waits: every piece on this thread
 	// In every build, for the same layout either way (see FutureStateBase).
 	std::atomic<bool>  errorTaken{ false }; // the first failing piece stores `error`
 	std::exception_ptr error;               // read once `done` is zero
@@ -1384,7 +1392,14 @@ void SortTask(SortJob<Comp>& job, It first, It last, int depth)
 			const It bigFirst = lessLarger ? first : equalEnd, bigLast = lessLarger ? lessLast : last;
 			const It smallFirst = lessLarger ? equalEnd : first, smallLast = lessLarger ? last : lessLast;
 			if (bigLast - bigFirst > 0)
-				Submit([&job, bigFirst, bigLast, depth] { SortTask(job, bigFirst, bigLast, depth); });
+			{
+				// Deep in waits, the same split on this thread: the result is
+				// the same whichever thread sorts a piece.
+				if (job.inlined)
+					SortTask(job, bigFirst, bigLast, depth);
+				else
+					Submit([&job, bigFirst, bigLast, depth] { SortTask(job, bigFirst, bigLast, depth); });
+			}
 			// The equal run is in place; the smaller part is split on here, so
 			// this loop at least halves its piece each time.
 			const int placed = (int)(equalEnd - lessLast);
@@ -1417,10 +1432,10 @@ void SortPieces(It first, const size_t* bounds, size_t pieces, Comp& comp, int d
 	const size_t n = bounds[pieces] - bounds[0];
 	if (n == 0)
 		return;
-	const IsolateWhenDeep isolate;
 	SortJob<Comp> job;
 	job.comp = &comp;
 	job.leaf = leaf;
+	job.inlined = DeepInWaits();
 	ScopedCounter done((int)n);
 	job.done = done.Get();
 	size_t k = 0;
@@ -1432,7 +1447,12 @@ void SortPieces(It first, const size_t* bounds, size_t pieces, Comp& comp, int d
 		{
 			const It b = first + (std::ptrdiff_t)bounds[k], e = first + (std::ptrdiff_t)bounds[k + 1];
 			if (e - b > 0)
-				Submit([&job, b, e, depth] { SortTask(job, b, e, depth); }); // may allocate (a large iterator)
+			{
+				if (job.inlined)
+					SortTask(job, b, e, depth);
+				else
+					Submit([&job, b, e, depth] { SortTask(job, b, e, depth); }); // may allocate (a large iterator)
+			}
 		}
 	}
 #if defined(__cpp_exceptions)
@@ -1533,7 +1553,15 @@ void SampleSort(It first, size_t n, Comp& comp, int depth, size_t leaf)
 			T* buf;
 			size_t n, chunk;
 		} back{ first, buf, n, chunkSize };
-		const IsolateWhenDeep isolate;
+		if (DeepInWaits())
+		{
+			for (size_t i = 0; i < n; i++)
+			{
+				first[(std::ptrdiff_t)i] = std::move(buf[i]);
+				buf[i].~T();
+			}
+			return;
+		}
 		const size_t pieces = (n - 1) / chunkSize + 1;
 		ScopedCounter moved((int)pieces);
 		for (size_t c = 0; c < pieces; c++)

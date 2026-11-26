@@ -401,10 +401,23 @@ wait, so waits pile up on one thread's stack. For a ParallelFor inside the
 chunks of another one that pile has no natural end: each inner wait picks
 up another outer chunk, which starts another inner ParallelFor. One thread
 could reach a thousand levels, each holding a counter and a stack frame.
-Each thread counts the waits it is inside, and from 16 on, loom's own
-fork-joins (ParallelFor and what is built on it, the sort, pipelines, graph
-runs) open an isolated region: their wait runs only their own tasks, so
-the pile stops growing there. The threads further down have plenty to do.
+Each thread counts the waits it is inside, and from 16 on a ParallelFor
+(and what is built on it) runs its pieces on the calling thread, in order,
+with no wait: nothing is added to the pile, and the thread's waits further
+up still help as usual. The threads further down have plenty to do. The
+sort does the same, splitting its pieces on the calling thread exactly as
+it would have split them into tasks, so equal elements come out in the
+same order however deep it was called. Pipelines and graph runs cannot run
+that way (their steps may be pinned to other threads); from 64 waits on
+they open an isolated region instead, whose wait runs only their own tasks,
+unless the thread is in a region already.
+
+Isolating sooner, or the data-parallel fork-joins at all, had a cost. An
+isolated wait helps nobody else: a main thread waiting BlockOnly for work
+that only the helping of a deep worker would have run waited for good, and
+a fresh region for every deep fork-join made a main-thread step that a
+deeper region's work needed not the outer region's, so the main thread,
+waiting isolated in it, never ran it.
 
 ## Parallel loops
 

@@ -2346,7 +2346,25 @@ void ParallelFor(size_t begin, size_t end, size_t chunkSize, ParallelForFn fn, v
 	PoolState& P = ActivePool(); // the no-pool assert even for an empty range
 	if (begin >= end || fn == nullptr)
 		return;
-	const detail::IsolateWhenDeep isolate;
+	// Deep in waits: on this thread, with no wait to add to the pile. The
+	// same pieces with a chunk size, the whole range without.
+	// (Not on a thread that runs no pool work, a lane say: its waits help
+	// with nothing, so they add nothing to a pile.)
+	if (detail::DeepInWaits() && MayRunPoolWork(P))
+	{
+		if (chunkSize == 0)
+		{
+			fn(begin, end, userData);
+			return;
+		}
+		for (size_t at = begin; at < end;)
+		{
+			const size_t pieceEnd = end - at > chunkSize ? at + chunkSize : end;
+			fn(at, pieceEnd, userData);
+			at = pieceEnd;
+		}
+		return;
+	}
 	if (chunkSize == 0)
 		ParallelForAuto(P, begin, end, fn, userData);
 	else
@@ -2991,11 +3009,20 @@ static thread_local int t_WaitDepth = 0;
 
 // Deep enough that each further level costs a counter and a stack frame for
 // little gain: the threads below have plenty to do.
-static constexpr int kIsolateAtWaitDepth = 16;
+static constexpr int kInlineAtWaitDepth = 16;
 
 bool DeepInWaits()
 {
-	return t_WaitDepth >= kIsolateAtWaitDepth;
+	return t_WaitDepth >= kInlineAtWaitDepth;
+}
+
+// Pipelines and graph runs, which cannot run on the calling thread: see
+// IsolateNow in the header.
+static constexpr int kIsolateGraphsAtWaitDepth = 64;
+
+bool IsolateNow()
+{
+	return t_WaitDepth >= kIsolateGraphsAtWaitDepth && t_Isolation == 0;
 }
 
 } // namespace detail

@@ -5555,6 +5555,84 @@ TEST_CASE("loom: dedicated threads — unregistering one that took pool work hel
 	}, 5000));
 }
 
+// ---- Deep in waits -------------------------------------------------------------------------
+
+template <typename F>
+static void WaitsDeep(int n, loom::TaskDesc here, F& fn)
+{
+	if (n == 0)
+	{
+		fn();
+		return;
+	}
+	loom::ScopedCounter c(1);
+	loom::TaskDesc d = here;
+	d.signals = c;
+	loom::Submit([n, here, &fn] { WaitsDeep(n - 1, here, fn); }, d);
+	loom::WaitFor(c);
+}
+
+static loom::DedicatedId s_DeepThread;
+
+TEST_CASE("loom: nesting — a ParallelFor deep in waits still runs main-thread steps its work needs")
+{
+	// 20 waits deep on the main thread, a ParallelFor's piece hands a step to
+	// a dedicated thread, which (20 deep there) runs a ParallelFor whose
+	// piece needs a main-thread step. Isolating the deep fork-joins in fresh
+	// regions stranded that step.
+	REQUIRE(!loom::HasActivePool());
+	CHECK(EndsWithin([] {
+		loom::Pool pool(loom::PoolConfig{ .workerCount = 1 });
+		s_DeepThread = loom::RegisterDedicatedThread({ .name = "deep" });
+		const loom::TaskDesc onMain{ .affinity = loom::Affinity::MainThread };
+		const loom::TaskDesc onD{ .affinity = loom::Affinity::Dedicated, .thread = s_DeepThread };
+		auto outer = [&] {
+			loom::ParallelFor(0, 1, 1, [&](size_t, size_t) {
+				loom::ScopedCounter step(1);
+				loom::TaskDesc d = onD;
+				d.signals = step;
+				loom::Submit([&] {
+					auto inner = [&] {
+						loom::ParallelFor(0, 1, 1, [&](size_t, size_t) {
+							loom::ScopedCounter m(1);
+							loom::TaskDesc md = onMain;
+							md.signals = m;
+							loom::Submit([] {}, md);
+							loom::WaitFor(m);
+						});
+					};
+					WaitsDeep(20, onD, inner);
+				}, d);
+				loom::WaitFor(step);
+			});
+		};
+		WaitsDeep(20, onMain, outer);
+		loom::UnregisterDedicatedThread(s_DeepThread);
+	}, 10000));
+}
+
+TEST_CASE("loom: nesting — a sort deep in waits runs on the calling thread, in the same order")
+{
+	// Equal keys tagged with their position: the order they come out in is
+	// the sort's, and must not depend on how deep in waits it was called.
+	loom::Pool pool(loom::PoolConfig{ .workerCount = 3 });
+	struct Item { int key; int tag; };
+	std::vector<Item> base(300000);
+	for (size_t i = 0; i < base.size(); i++)
+		base[i] = { (int)((i * 7919) % 97), (int)i };
+	const auto byKey = [](const Item& a, const Item& b) { return a.key < b.key; };
+	std::vector<Item> top = base;
+	loom::ParallelSort(top.begin(), top.end(), byKey);
+	std::vector<Item> deep = base;
+	auto sortDeep = [&] { loom::ParallelSort(deep.begin(), deep.end(), byKey); };
+	WaitsDeep(20, loom::TaskDesc{ .affinity = loom::Affinity::MainThread }, sortDeep); // each level on this thread
+	bool same = true;
+	for (size_t i = 0; i < base.size() && same; i++)
+		same = top[i].key == deep[i].key && top[i].tag == deep[i].tag;
+	CHECK(same);
+	CHECK(std::is_sorted(deep.begin(), deep.end(), byKey));
+}
+
 } // namespace
 
 }} // namespace loom::tests

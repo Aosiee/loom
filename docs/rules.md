@@ -126,9 +126,11 @@ waits for it, and the helped task waits for that one), a lock it holds (see
 above), or a result only it will produce. Wait with `Help::BlockOnly`, or
 inside `Isolated`, where a wait helps only with its own region's tasks.
 
-loom's own fork-joins (ParallelFor, the sort, scans, pipelines, graph runs)
-isolate themselves once a thread is 16 waits deep, so nesting them in each
-other stays shallow. A hand-written fork-join that may nest inside itself
+loom's own fork-joins keep that pile shallow once a thread is 16 waits
+deep: a ParallelFor (and the reductions and scans built on it) and the sort
+then run on the calling thread with no wait of their own. Pipelines and
+graph runs, whose steps may be pinned to other threads, open an isolated
+region once a thread is 64 waits deep (unless it is in one already). A hand-written fork-join that may nest inside itself
 many times over (a recursive Submit and WaitFor) should use `Isolated` for
 the same reason.
 
