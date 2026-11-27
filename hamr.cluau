@@ -1,4 +1,4 @@
-// loom's suite for hamr (github.com/Aosiee/hamr): `hamr run` here.
+// loom's suite for hamr (github.com/odd-fish-society/hamr): `hamr run` here.
 //
 // The configurations the CI checks, each built in its own build-hamr-<name>
 // directory: the suite (every test case's time from doctest's JUnit

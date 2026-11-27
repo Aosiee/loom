@@ -1,10 +1,10 @@
 # loom
 
-[![Linux](https://github.com/Aosiee/loom/actions/workflows/linux.yml/badge.svg?branch=dev)](https://github.com/Aosiee/loom/actions/workflows/linux.yml)
+[![Linux](https://github.com/odd-fish-society/loom/actions/workflows/linux.yml/badge.svg?branch=dev)](https://github.com/odd-fish-society/loom/actions/workflows/linux.yml)
 [![Windows: not supported](https://img.shields.io/badge/Windows-not%20supported-lightgrey)](#building)
 [![macOS: not supported](https://img.shields.io/badge/macOS-not%20supported-lightgrey)](#building)
 
-[![Release](https://img.shields.io/github/v/release/Aosiee/loom)](https://github.com/Aosiee/loom/releases/latest)
+[![Release](https://img.shields.io/github/v/release/odd-fish-society/loom)](https://github.com/odd-fish-society/loom/releases/latest)
 
 A task and threading library for C++20: one pool of worker threads,
 dedicated threads and lanes, atomic counters as the only synchronisation
@@ -267,7 +267,7 @@ lets code build against more than one release:
 `#if LOOM_VERSION >= LOOM_MAKE_VERSION(0, 20, 0)`.
 
 The configurations the CI checks also run locally as a
-[hamr](https://github.com/Aosiee/hamr) suite, `hamr.cluau`: `hamr run` builds
+[hamr](https://github.com/odd-fish-society/hamr) suite, `hamr.cluau`: `hamr run` builds
 and tests the GCC release and debug builds and a Clang release, and
 `hamr run --tier nightly` adds the portable sleep, the three sanitizers,
 the no-exceptions embedding and the installed package. Each build lives in
@@ -289,6 +289,9 @@ there by CI; when enough has gathered, `dev` becomes the next release. See
 
 ## Licence
 
-MIT with one condition: a product that includes loom credits it ("Uses loom -
-Copyright (c) 2026 Felipe Lara") in its credits, about box or documentation. No
-logo or splash screen. See [`LICENSE`](LICENSE).
+loom is released under the Odd Fish Society License ([`LICENSE`](LICENSE)), which is MIT
+with one added condition. A product that includes loom credits it in its credits, about
+box or documentation, as "Uses loom - Copyright (c) 2026 Odd Fish Society / Felipe
+Lara". A product that uses several Odd Fish Society libraries can credit them together,
+on one line or several, such as "Uses kiln, cluau and wisp - Copyright (c) 2026 Odd Fish
+Society / Felipe Lara". No logo or splash screen is required.
