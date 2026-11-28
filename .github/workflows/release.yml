@@ -51,11 +51,31 @@ jobs:
           timeout 10m build/loom_faults
           timeout 5m build/loom_stress --seconds 30 --quiet
 
+      # GitHub shows every line break in release notes, so the tag's message,
+      # wrapped for a terminal, has each paragraph and list item joined onto
+      # one line first. Code blocks, headings and tables stay as they are.
       - name: Notes from the tag
+        env:
+          UNWRAP: |
+            import re, sys
+            out, cur, fence = [], None, False
+            for line in sys.stdin.read().replace("\r", "").split("\n"):
+                if re.match(r"\s*(```|~~~)", line):
+                    fence = not fence
+                elif not fence and line.strip() and not re.match(r"\s*(#{1,6}(\s|$)|\||>|<[A-Za-z/!]|(-{3,}|\*{3,}|_{3,}|={3,})\s*$)", line):
+                    if cur is not None and not re.match(r"\s*([-*+]|\d+[.)])\s", line) and not out[cur].endswith(("  ", "\\")):
+                        out[cur] = out[cur].rstrip() + " " + line.strip()
+                    else:
+                        out.append(line)
+                        cur = len(out) - 1
+                    continue
+                out.append(line)
+                cur = None
+            sys.stdout.write("\n".join(out))
         run: |
           git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
           {
-            git tag -l --format='%(contents)' "$TAG"
+            git tag -l --format='%(contents)' "$TAG" | python3 -c "$UNWRAP"
             echo
             echo "Use it from CMake:"
             echo
