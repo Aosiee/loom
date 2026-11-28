@@ -9,8 +9,8 @@
 // CHANGELOG.md), and find_package accepts only the same minor version.
 #define LOOM_VERSION_MAJOR 0
 #define LOOM_VERSION_MINOR 20
-#define LOOM_VERSION_PATCH 4
-#define LOOM_VERSION_STRING "0.20.4"
+#define LOOM_VERSION_PATCH 5
+#define LOOM_VERSION_STRING "0.20.5"
 
 #define LOOM_MAKE_VERSION(major, minor, patch) ((major) * 1000000 + (minor) * 1000 + (patch))
 #define LOOM_VERSION LOOM_MAKE_VERSION(LOOM_VERSION_MAJOR, LOOM_VERSION_MINOR, LOOM_VERSION_PATCH)

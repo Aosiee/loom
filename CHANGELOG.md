@@ -40,6 +40,28 @@ any later version, check these:
   waits (0.20.3 did from 64 deep), and a pump inside Isolated runs only
   that region's main-thread tasks.
 
+## 0.20.5 (2026-11-27): the Odd Fish Society License
+
+No changes to the library. loom is now under the Odd Fish Society
+License, which it shares with kiln, cluau, hamr, wisp, hearth and tmath.
+Like the loom License before it, it is MIT plus a credit line. The credit
+now reads "Uses loom - Copyright (c) 2026 Odd Fish Society / Felipe Lara",
+and a product that uses several of these libraries may credit them all
+in one line, giving the copyright notice once. The license also counts as
+covered a product that one of these libraries builds, compiles, checks or
+tests.
+
+The repository moved to github.com/odd-fish-society/loom; the old address
+redirects there. The README's badges and links and the FetchContent
+snippet in each release's notes use the new one.
+
+The fault-injection tests under ThreadSanitizer now finish in seconds
+instead of about twenty minutes: ThreadSanitizer slept a second at the
+exit of every child process they fork, and they turn that off.
+
+What existing callers may notice: nothing in the API or its behaviour.
+A product's credit for loom can name Odd Fish Society / Felipe Lara.
+
 ## 0.20.4 (2026-11-26): a fuzzer, and what it found in 0.20.3
 
 Fixes only. The ones that could hang:
